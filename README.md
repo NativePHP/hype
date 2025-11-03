@@ -7,166 +7,159 @@
     </a>
 </div>
 
-# Get Hyper
+# ⚡ Get Hyper with Hype ⚡
 
-Hype is a popular general-purpose scripting language that is especially suited to
-web development. Fast, flexible and pragmatic, PHP powers everything from your
-blog to the most popular websites in the world. PHP is distributed under the
-[PHP License v3.01](LICENSE).
+**Hype** is your next-generation scripting language — blazing fast, flexible, and ready for the web. Built on the proven foundations of PHP, Hype powers everything from personal blogs to global web apps with style and speed.
 
-[![Push](https://github.com/php/php-src/actions/workflows/push.yml/badge.svg)](https://github.com/php/php-src/actions/workflows/push.yml)
-[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/php.svg)](https://issues.oss-fuzz.com/issues?q=project:php)
+Hype is released under the **PHP License v3.01**, giving you freedom to explore, modify, and share while giving credit where it’s due.
 
-## Documentation
+---
 
-The PHP manual is available at [php.net/docs](https://www.php.net/docs).
+## 📚 Documentation
 
-## Installation
+Dive into Hype with the PHP manual: [https://php.net/docs](https://php.net/docs). It's your roadmap to mastering Hype!
 
-### Prebuilt packages and binaries
+---
 
-Prebuilt packages and binaries can be used to get up and running fast with PHP.
+## 💾 Installation
 
-For Windows, the PHP binaries can be obtained from
-[windows.php.net](https://windows.php.net). After extracting the archive the
-`*.exe` files are ready to use.
+### Prebuilt Packages & Binaries
 
-For other systems, see the [installation chapter](https://www.php.net/install).
+Get started fast:
 
-### Building PHP source code
+* **Windows**: Grab Hype binaries from [windows.php.net](https://windows.php.net). Extract and run `*.exe` — you’re ready to go!
+* **Other OS**: Follow the *Building Hype from Source* steps below.
 
-*For Windows, see [Build your own PHP on Windows](https://wiki.php.net/internals/windows/stepbystepbuild_sdk_2).*
+---
 
-For a minimal PHP build from Git, you will need autoconf, bison, and re2c. For
-a default build, you will additionally need libxml2 and libsqlite3.
+### Building Hype from Source
 
-On Ubuntu, you can install these using:
+Take full control and customize your Hype experience.
 
-```shell
+#### Requirements
+
+* **Minimal build**: autoconf, bison, re2c
+* **Full build**: libxml2, libsqlite3
+
+**Ubuntu:**
+
+```bash
 sudo apt install -y pkg-config build-essential autoconf bison re2c libxml2-dev libsqlite3-dev
 ```
 
-On Fedora, you can install these using:
+**Fedora:**
 
-```shell
+```bash
 sudo dnf install re2c bison autoconf make libtool ccache libxml2-devel sqlite-devel
 ```
 
-On MacOS, you can install these using `brew`:
+**macOS (Homebrew):**
 
-```shell
+```bash
 brew install autoconf bison re2c libiconv libxml2 sqlite
 ```
 
-or with `MacPorts`:
+**macOS (MacPorts):**
 
-```shell
+```bash
 sudo port install autoconf bison re2c libiconv libxml2 sqlite3
 ```
 
-Generate configure:
+---
 
-```shell
+#### Build Steps
+
+1. Generate configure script:
+
+```bash
 ./buildconf
 ```
 
-Configure your build. `--enable-debug` is recommended for development, see
-`./configure --help` for a full list of options.
+2. Configure your build:
 
-```shell
-# For development
+```bash
+# Development (recommended)
 ./configure --enable-debug
-# For production
+
+# Production
 ./configure
 ```
 
-Build PHP. To speed up the build, specify the maximum number of jobs using the
-`-j` argument:
+3. Compile Hype:
 
-```shell
-make -j4
+```bash
+make -j$(nproc)
 ```
 
-The number of jobs should usually match the number of available cores, which
-can be determined using `nproc`.
+*(Use your CPU cores for maximum speed.)*
 
-## Testing PHP source code
+---
 
-PHP ships with an extensive test suite, the command `make test` is used after
-successful compilation of the sources to run this test suite.
+### 🧪 Testing Hype
 
-It is possible to run tests using multiple cores by setting `-jN` in
-`TEST_PHP_ARGS` or `TESTS`:
+Run the built-in test suite:
 
-```shell
+```bash
+make test
+```
+
+Run with multiple cores:
+
+```bash
 make TEST_PHP_ARGS=-j4 test
 ```
 
-Shall run `make test` with a maximum of 4 concurrent jobs: Generally the maximum
-number of jobs should not exceed the number of cores available.
+Test specific directories:
 
-Use the `TEST_PHP_ARGS` or `TESTS` variable to test only specific directories:
-
-```shell
+```bash
 make TESTS=tests/lang/ test
 ```
 
-The [qa.php.net](https://qa.php.net) site provides more detailed info about
-testing and quality assurance.
+More QA info: [qa.php.net](https://qa.php.net)
 
-## Installing PHP built from source
+---
 
-After a successful build (and test), PHP may be installed with:
+### 🛠 Installing Hype
 
-```shell
+After building and testing:
+
+```bash
 make install
 ```
 
-Depending on your permissions and prefix, `make install` may need superuser
-permissions.
+*May require superuser permissions.*
 
-## PHP extensions
+---
 
-Extensions provide additional functionality on top of PHP. PHP consists of many
-essential bundled extensions. Additional extensions can be found in the PHP
-Extension Community Library - [PECL](https://pecl.php.net).
+### ⚙️ Hype Extensions
 
-## Contributing
+Hype comes packed with essential built-in extensions. Explore more via the **PHP Extension Community Library (PECL)**.
 
-The PHP source code is located in the Git repository at
-[github.com/php/php-src](https://github.com/php/php-src). Contributions are most
-welcome by forking the repository and sending a pull request.
+---
 
-Discussions are done on GitHub, but depending on the topic can also be relayed
-to the official PHP developer mailing list internals@lists.php.net.
+## 🤝 Contributing
 
-New features require an RFC and must be accepted by the developers. See
-[Request for comments - RFC](https://wiki.php.net/rfc) and
-[Voting on PHP features](https://wiki.php.net/rfc/voting) for more information
-on the process.
+Hype thrives with your contributions! Source code: [github.com/php/php-src](https://github.com/php/php-src)
 
-Bug fixes don't require an RFC. If the bug has a GitHub issue, reference it in
-the commit message using `GH-NNNNNN`. Use `#NNNNNN` for tickets in the old
-[bugs.php.net](https://bugs.php.net) bug tracker.
+* Fork, enhance, and submit pull requests.
+* Discuss on GitHub or the PHP internals mailing list: `internals@lists.php.net`.
+* **New features**: RFC required.
+* **Bug fixes**: Reference GitHub issues (e.g., `Fix GH-12345`).
 
-    Fix GH-7815: php_uname doesn't recognise latest Windows versions
-    Fix #55371: get_magic_quotes_gpc() throws deprecation warning
+Contributor resources:
 
-See [Git workflow](https://wiki.php.net/vcs/gitworkflow) for details on how pull
-requests are merged.
+* [Contributing to PHP](https://github.com/php/php-src/blob/master/CONTRIBUTING.md)
+* [PHP Coding Standards](https://github.com/php/php-src/blob/master/CODING-STANDARDS)
+* [Internal Docs](https://github.com/php/php-src/tree/master/docs)
+* [Release Process](https://www.php.net/releases/)
 
-### Guidelines for contributors
+---
 
-See further documents in the repository for more information on how to
-contribute:
+## 🌟 Credits
 
-- [Contributing to PHP](/CONTRIBUTING.md)
-- [PHP coding standards](/CODING_STANDARDS.md)
-- [Internal documentation](https://php.github.io/php-src/)
-- [Mailing list rules](/docs/mailinglist-rules.md)
-- [PHP release process](/docs/release-process.md)
+Hype is powered by PHP. Full list of contributors: [PHP credits](https://www.php.net/credits)
 
-## Credits
+---
 
-For the list of people who've put work into PHP, please see the
-[PHP credits page](https://www.php.net/credits.php).
+**Ready to Get Hyper? Jump in and start coding with Hype today!** ⚡
+
