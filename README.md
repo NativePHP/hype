@@ -2,7 +2,7 @@
     <a href="https://nativephp.com">
         <img
             alt="HYPE"
-            src="https://www.php.net/images/logos/new-php-logo.svg"
+            src="https://chatgpt.com/backend-api/estuary/content?id=file_000000005b9c7230950f8a9f9d4785c1&ts=489500&p=fs&cid=1&sig=5adfd0442118eb87ff978b60d7c7f5aa32cfaa2ab34a7eea6b3f6aca1210cf75&v=0"
             width="300">
     </a>
 </div>
