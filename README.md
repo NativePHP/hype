@@ -2,7 +2,7 @@
     <a href="https://nativephp.com">
         <img
             alt="HYPE"
-            src="https://ibb.co/9mRzyNB1"
+            src="[https://ibb.co/9mRzyNB1](https://i.ibb.co/PsB31NJP/Rainbow-HYPE-Typography-Design.png)"
             width="300">
     </a>
 </div>
