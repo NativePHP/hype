@@ -1,14 +1,12 @@
 /*
   +----------------------------------------------------------------------+
-  | Copyright (c) The PHP Group                                          |
+  | Copyright © The PHP Group and Contributors.                          |
   +----------------------------------------------------------------------+
-  | This source file is subject to version 3.01 of the PHP license,      |
-  | that is bundled with this package in the file LICENSE, and is        |
-  | available through the world-wide-web at the following url:           |
-  | https://www.php.net/license/3_01.txt                                 |
-  | If you did not receive a copy of the PHP license and are unable to   |
-  | obtain it through the world-wide-web, please send a note to          |
-  | license@php.net so we can mail you a copy immediately.               |
+  | This source file is subject to the Modified BSD License that is      |
+  | bundled with this package in the file LICENSE, and is available      |
+  | through the World Wide Web at <https://www.php.net/license/>.        |
+  |                                                                      |
+  | SPDX-License-Identifier: BSD-3-Clause                                |
   +----------------------------------------------------------------------+
   | Authors: Brad Lafountain <rodif_bl@yahoo.com>                        |
   |          Shane Caraveo <shane@caraveo.com>                           |
@@ -16,6 +14,7 @@
   +----------------------------------------------------------------------+
 */
 
+#include <limits.h>
 #include <time.h>
 
 #include "php_soap.h"
@@ -254,11 +253,12 @@ static encodePtr find_encoder_by_type_name(sdlPtr sdl, const char *type)
 {
 	if (sdl && sdl->encoders) {
 		encodePtr enc;
+		size_t type_len = strlen(type);
 
 		ZEND_HASH_FOREACH_PTR(sdl->encoders, enc)  {
 			if (type[0] == '{') {
 				if (enc->details.clark_notation
-					&& strcmp(ZSTR_VAL(enc->details.clark_notation), type) == 0) {
+					&& zend_string_equals_cstr(enc->details.clark_notation, type, type_len)) {
 					return enc;
 				}
 			} else {
@@ -278,7 +278,7 @@ static bool soap_check_zval_ref(zval *data, xmlNodePtr node) {
 		if (Z_TYPE_P(data) == IS_OBJECT) {
 			data = (zval*)Z_OBJ_P(data);
 		}
-		if ((node_ptr = zend_hash_index_find_ptr(SOAP_GLOBAL(ref_map), (zend_ulong)data)) != NULL) {
+		if ((node_ptr = zend_hash_index_find_ptr(SOAP_GLOBAL(ref_map), (zend_ulong)(uintptr_t)data)) != NULL) {
 			xmlAttrPtr attr = node_ptr->properties;
 			char *id;
 			smart_str prefix = {0};
@@ -324,7 +324,7 @@ static bool soap_check_zval_ref(zval *data, xmlNodePtr node) {
 			smart_str_free(&prefix);
 			return true;
 		} else {
-			zend_hash_index_update_ptr(SOAP_GLOBAL(ref_map), (zend_ulong)data, node);
+			zend_hash_index_update_ptr(SOAP_GLOBAL(ref_map), (zend_ulong)(uintptr_t)data, node);
 		}
 	}
 	return false;
@@ -335,7 +335,7 @@ static bool soap_check_xml_ref(zval *data, xmlNodePtr node)
 	zval *data_ptr;
 
 	if (SOAP_GLOBAL(ref_map)) {
-		if ((data_ptr = zend_hash_index_find(SOAP_GLOBAL(ref_map), (zend_ulong)node)) != NULL) {
+		if ((data_ptr = zend_hash_index_find(SOAP_GLOBAL(ref_map), (zend_ulong)(uintptr_t)node)) != NULL) {
 			if (!Z_REFCOUNTED_P(data) ||
 			    !Z_REFCOUNTED_P(data_ptr) ||
 			    Z_COUNTED_P(data) != Z_COUNTED_P(data_ptr)) {
@@ -351,7 +351,8 @@ static bool soap_check_xml_ref(zval *data, xmlNodePtr node)
 static void soap_add_xml_ref(zval *data, xmlNodePtr node)
 {
 	if (SOAP_GLOBAL(ref_map)) {
-		zend_hash_index_update(SOAP_GLOBAL(ref_map), (zend_ulong)node, data);
+		Z_TRY_ADDREF_P(data);
+		zend_hash_index_update(SOAP_GLOBAL(ref_map), (zend_ulong)(uintptr_t)node, data);
 	}
 }
 
@@ -2049,6 +2050,15 @@ static int calc_dimension_12(const char* str)
 	return i;
 }
 
+static void soap_array_position_add_digit(int *position, int digit)
+{
+	if (UNEXPECTED(*position > (INT_MAX - digit) / 10)) {
+		soap_error0(E_ERROR, "Encoding: array index out of range");
+	}
+
+	*position = (*position * 10) + digit;
+}
+
 static int* get_position_12(int dimension, const char* str)
 {
 	int *pos;
@@ -2069,7 +2079,7 @@ static int* get_position_12(int dimension, const char* str)
 				i++;
 				flag = 1;
 			}
-			pos[i] = (pos[i]*10)+(*str-'0');
+			soap_array_position_add_digit(&pos[i], *str - '0');
 		} else if (*str == '*') {
 			soap_error0(E_ERROR, "Encoding: '*' may only be first arraySize value in list");
 		} else {
@@ -2099,7 +2109,7 @@ static void get_position_ex(int dimension, const char* str, int** pos)
 	memset(*pos,0,sizeof(int)*dimension);
 	while (*str != ']' && *str != '\0' && i < dimension) {
 		if (*str >= '0' && *str <= '9') {
-			(*pos)[i] = ((*pos)[i]*10)+(*str-'0');
+			soap_array_position_add_digit(&(*pos)[i], *str - '0');
 		} else if (*str == ',') {
 			i++;
 		}
@@ -2439,13 +2449,7 @@ iterator_failed_to_get:
 		if (style == SOAP_ENCODED) {
 			if (soap_version == SOAP_1_1) {
 				smart_str_0(&array_type);
-#if defined(__GNUC__) && __GNUC__ >= 11
-				ZEND_DIAGNOSTIC_IGNORED_START("-Wstringop-overread")
-#endif
-				bool is_xsd_any_type = strcmp(ZSTR_VAL(array_type.s),"xsd:anyType") == 0;
-#if defined(__GNUC__) && __GNUC__ >= 11
-				ZEND_DIAGNOSTIC_IGNORED_END
-#endif
+				bool is_xsd_any_type = zend_string_equals_literal(array_type.s, "xsd:anyType");
 				if (is_xsd_any_type) {
 					smart_str_free(&array_type);
 					smart_str_appendl(&array_type,"xsd:ur-type",sizeof("xsd:ur-type")-1);
@@ -2529,19 +2533,20 @@ static zval *to_zval_array(zval *ret, encodeTypePtr type, xmlNodePtr data)
 		xmlNsPtr nsptr;
 
 		parse_namespace(attr->children->content, &type, &ns);
+		char *type_dup = estrdup(type);
 		nsptr = xmlSearchNs(attr->doc, attr->parent, BAD_CAST(ns));
 
-		end = strrchr(type,'[');
+		end = strrchr(type_dup,'[');
 		if (end) {
 			*end = '\0';
 			dimension = calc_dimension(end+1);
 			dims = get_position(dimension, end+1);
 		}
 		if (nsptr != NULL) {
-			enc = get_encoder(SOAP_GLOBAL(sdl), (char*)nsptr->href, type);
+			enc = get_encoder(SOAP_GLOBAL(sdl), (char*)nsptr->href, type_dup);
 		}
 		if (ns) {efree(ns);}
-
+		if (type_dup) efree(type_dup);
 	} else if ((attr = get_soap_enc_attribute(data->properties,"itemType")) &&
 	    attr->children &&
 	    attr->children->content) {
@@ -2691,16 +2696,20 @@ static zval *to_zval_array(zval *ret, encodeTypePtr type, xmlNodePtr data)
 			/* Increment position */
 			i = dimension;
 			while (i > 0) {
-			  i--;
-			  pos[i]++;
-				if (pos[i] >= dims[i]) {
-					if (i > 0) {
-						pos[i] = 0;
-					} else {
-						/* TODO: Array index overflow */
-					}
-				} else {
-				  break;
+				i--;
+				if (UNEXPECTED(pos[i] == INT_MAX)) {
+					efree(dims);
+					efree(pos);
+					zval_ptr_dtor(ret);
+					ZVAL_UNDEF(ret);
+					soap_error0(E_ERROR, "Encoding: array index out of range");
+				}
+				pos[i]++;
+				if (pos[i] < dims[i]) {
+					break;
+				}
+				if (i > 0) {
+					pos[i] = 0;
 				}
 			}
 		}
@@ -2790,7 +2799,7 @@ static zval *to_zval_map(zval *ret, encodeTypePtr type, xmlNodePtr data)
 			}
 
 			xmlValue = get_node(item->children, "value");
-			if (!xmlKey) {
+			if (!xmlValue) {
 				soap_error0(E_ERROR,  "Encoding: Can't decode apache map, missing value");
 			}
 
@@ -2953,9 +2962,9 @@ static xmlNodePtr to_xml_datetime_ex(encodeTypePtr type, zval *data, char *forma
 			labs(ta->tm_gmtoff / 3600), labs( (ta->tm_gmtoff % 3600) / 60 ));
 #else
 # if defined(__CYGWIN__) || (defined(PHP_WIN32) && defined(_MSC_VER))
-		snprintf(tzbuf, sizeof(tzbuf), "%c%02d:%02d", ((ta->tm_isdst ? _timezone - 3600:_timezone)>0)?'-':'+', abs((ta->tm_isdst ? _timezone - 3600 : _timezone) / 3600), abs(((ta->tm_isdst ? _timezone - 3600 : _timezone) % 3600) / 60));
+		snprintf(tzbuf, sizeof(tzbuf), "%c%02ld:%02ld", ((ta->tm_isdst ? _timezone - 3600:_timezone)>0)?'-':'+', labs((ta->tm_isdst ? _timezone - 3600 : _timezone) / 3600), labs(((ta->tm_isdst ? _timezone - 3600 : _timezone) % 3600) / 60));
 # else
-		snprintf(tzbuf, sizeof(tzbuf), "%c%02d:%02d", ((ta->tm_isdst ? timezone - 3600:timezone)>0)?'-':'+', abs((ta->tm_isdst ? timezone - 3600 : timezone) / 3600), abs(((ta->tm_isdst ? timezone - 3600 : timezone) % 3600) / 60));
+		snprintf(tzbuf, sizeof(tzbuf), "%c%02ld:%02ld", ((ta->tm_isdst ? timezone - 3600:timezone)>0)?'-':'+', labs((ta->tm_isdst ? timezone - 3600 : timezone) / 3600), labs(((ta->tm_isdst ? timezone - 3600 : timezone) % 3600) / 60));
 # endif
 #endif
 		if (strcmp(tzbuf,"+00:00") == 0) {
@@ -3527,7 +3536,7 @@ void encode_reset_ns(void)
 	} else {
 		SOAP_GLOBAL(ref_map) = emalloc(sizeof(HashTable));
 	}
-	zend_hash_init(SOAP_GLOBAL(ref_map), 0, NULL, NULL, 0);
+	zend_hash_init(SOAP_GLOBAL(ref_map), 0, NULL, ZVAL_PTR_DTOR, 0);
 }
 
 void encode_finish(void)

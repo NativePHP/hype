@@ -2,15 +2,13 @@
 <?php
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Ilia Alshanetsky <iliaa@php.net>                            |
    |          Preston L. Bannister <pbannister@php.net>                   |
@@ -275,6 +273,7 @@ function main(): void
         'fatal_error_backtraces=Off',
         'display_errors=1',
         'display_startup_errors=1',
+        'error_include_args=0',
         'log_errors=0',
         'html_errors=0',
         'track_errors=0',
@@ -304,6 +303,7 @@ function main(): void
         'zend.exception_ignore_args=0',
         'zend.exception_string_param_max_len=15',
         'short_open_tag=0',
+        'date.timezone=UTC',
     ];
 
     $no_file_cache = '-d opcache.file_cache= -d opcache.file_cache_only=0';
@@ -701,7 +701,8 @@ function main(): void
     write_information($user_tests, $phpdbg);
 
     if ($test_cnt) {
-        putenv('NO_INTERACTION=1');
+        $exts_tested = [];
+        $exts_skipped = [];
         usort($test_files, "test_sort");
         $start_time = hrtime(true);
 
@@ -780,7 +781,7 @@ function main(): void
         show_end($start_timestamp, $start_time, $end_time);
         show_summary();
 
-        save_results($output_file, /* prompt_to_save_results: */ true);
+        save_results($output_file, /* prompt_to_save_results: */ !$just_save_results);
     }
 
     $junit->saveXML();
@@ -858,7 +859,7 @@ More .INIs  : " , (function_exists(\'php_ini_scanned_files\') ? str_replace("\n"
         $exts = get_loaded_extensions();
         $ext_dir = ini_get('extension_dir');
         foreach (scandir($ext_dir) as $file) {
-            if (preg_match('/^(?:php_)?([_a-zA-Z0-9]+)\.(?:so|dll)$/', $file, $matches)) {
+            if (preg_match('/^(?:php_)?([_a-zA-Z0-9]+)\.(?:' . PHP_SHLIB_SUFFIX . ')$/', $file, $matches)) {
                 if (!extension_loaded($matches[1])) {
                     $exts[] = $matches[1];
                 }
@@ -906,7 +907,7 @@ function save_results(string $output_file, bool $prompt_to_save_results): void
 {
     global $sum_results, $failed_test_summary, $PHP_FAILED_TESTS, $php;
 
-    if (getenv('NO_INTERACTION')) {
+    if (getenv('NO_INTERACTION') && $prompt_to_save_results) {
         return;
     }
 
@@ -1821,8 +1822,8 @@ function run_test(string $php, $file, array $env): string
         $skipCache = new SkipCache($enableSkipCache, $cfg['keep']['skip']);
     }
 
-    $orig_php = $php;
     $php = escapeshellarg($php);
+    $orig_php = $php;
 
     $retried = false;
 retry:

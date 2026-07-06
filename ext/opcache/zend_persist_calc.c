@@ -2,15 +2,13 @@
    +----------------------------------------------------------------------+
    | Zend OPcache                                                         |
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Andi Gutmans <andi@php.net>                                 |
    |          Zeev Suraski <zeev@php.net>                                 |
@@ -92,7 +90,9 @@ static void zend_persist_ast_calc(zend_ast *ast)
 		ZVAL_PTR(&z, zend_ast_get_op_array(ast)->op_array);
 		zend_persist_op_array_calc(&z);
 	} else if (ast->kind == ZEND_AST_CALLABLE_CONVERT) {
+		zend_ast_fcc *fcc_ast = (zend_ast_fcc*)ast;
 		ADD_SIZE(sizeof(zend_ast_fcc));
+		zend_persist_ast_calc(fcc_ast->args);
 	} else if (zend_ast_is_decl(ast)) {
 		/* Not implemented. */
 		ZEND_UNREACHABLE();
@@ -304,6 +304,9 @@ static void zend_persist_op_array_calc_ex(zend_op_array *op_array)
 				ADD_INTERNED_STRING(arg_info[i].name);
 			}
 			zend_persist_type_calc(&arg_info[i].type);
+			if (arg_info[i].doc_comment) {
+				ADD_INTERNED_STRING(arg_info[i].doc_comment);
+			}
 		}
 	}
 

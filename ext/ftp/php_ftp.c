@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Andrew Skalski <askalski@chek.com>                          |
    |          Stefan Esser <sesser@php.net> (resume functions)            |
@@ -40,9 +38,7 @@ static zend_class_entry *php_ftp_ce = NULL;
 static zend_object_handlers ftp_object_handlers;
 
 zend_module_entry php_ftp_module_entry = {
-	STANDARD_MODULE_HEADER_EX,
-	NULL,
-	NULL,
+	STANDARD_MODULE_HEADER,
 	"ftp",
 	ext_functions,
 	PHP_MINIT(ftp),
@@ -103,7 +99,7 @@ PHP_MINIT_FUNCTION(ftp)
 	php_ftp_ce->create_object = ftp_object_create;
 
 	memcpy(&ftp_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-	ftp_object_handlers.offset = XtOffsetOf(php_ftp_object, std);
+	ftp_object_handlers.offset = offsetof(php_ftp_object, std);
 	ftp_object_handlers.get_constructor = ftp_object_get_constructor;
 	ftp_object_handlers.free_obj = ftp_object_destroy;
 	ftp_object_handlers.clone_obj = NULL;
@@ -147,8 +143,15 @@ PHP_FUNCTION(ftp_connect)
 		RETURN_THROWS();
 	}
 
+	const uint64_t timeoutmax = (uint64_t)((double) PHP_TIMEOUT_ULL_MAX / 1000000.0);
+
 	if (timeout_sec <= 0) {
 		zend_argument_value_error(3, "must be greater than 0");
+		RETURN_THROWS();
+	}
+
+	if (timeout_sec >= timeoutmax) {
+		zend_argument_value_error(3, "must be less than " ZEND_ULONG_FMT, timeoutmax);
 		RETURN_THROWS();
 	}
 
@@ -673,11 +676,8 @@ PHP_FUNCTION(ftp_pasv)
 	}
 	GET_FTPBUF(ftp, z_ftp);
 
-	if (!ftp_pasv(ftp, pasv ? 1 : 0)) {
-		RETURN_FALSE;
-	}
+	RETURN_BOOL(ftp_pasv(ftp, pasv ? 1 : 0));
 
-	RETURN_TRUE;
 }
 /* }}} */
 
@@ -1262,7 +1262,6 @@ PHP_FUNCTION(ftp_set_option)
 			}
 			ftp->timeout_sec = Z_LVAL_P(z_value);
 			RETURN_TRUE;
-			break;
 		case PHP_FTP_OPT_AUTOSEEK:
 			if (Z_TYPE_P(z_value) != IS_TRUE && Z_TYPE_P(z_value) != IS_FALSE) {
 				zend_argument_type_error(3, "must be of type bool for the FTP_AUTOSEEK option, %s given", zend_zval_value_name(z_value));
@@ -1270,7 +1269,6 @@ PHP_FUNCTION(ftp_set_option)
 			}
 			ftp->autoseek = Z_TYPE_P(z_value) == IS_TRUE ? 1 : 0;
 			RETURN_TRUE;
-			break;
 		case PHP_FTP_OPT_USEPASVADDRESS:
 			if (Z_TYPE_P(z_value) != IS_TRUE && Z_TYPE_P(z_value) != IS_FALSE) {
 				zend_argument_type_error(3, "must be of type bool for the FTP_USEPASVADDRESS option, %s given", zend_zval_value_name(z_value));
@@ -1278,11 +1276,9 @@ PHP_FUNCTION(ftp_set_option)
 			}
 			ftp->usepasvaddress = Z_TYPE_P(z_value) == IS_TRUE ? 1 : 0;
 			RETURN_TRUE;
-			break;
 		default:
 			zend_argument_value_error(2, "must be one of FTP_TIMEOUT_SEC, FTP_AUTOSEEK, or FTP_USEPASVADDRESS");
 			RETURN_THROWS();
-			break;
 	}
 }
 /* }}} */
@@ -1302,13 +1298,10 @@ PHP_FUNCTION(ftp_get_option)
 	switch (option) {
 		case PHP_FTP_OPT_TIMEOUT_SEC:
 			RETURN_LONG(ftp->timeout_sec);
-			break;
 		case PHP_FTP_OPT_AUTOSEEK:
 			RETURN_BOOL(ftp->autoseek);
-			break;
 		case PHP_FTP_OPT_USEPASVADDRESS:
 			RETURN_BOOL(ftp->usepasvaddress);
-			break;
 		default:
 			zend_argument_value_error(2, "must be one of FTP_TIMEOUT_SEC, FTP_AUTOSEEK, or FTP_USEPASVADDRESS");
 			RETURN_THROWS();

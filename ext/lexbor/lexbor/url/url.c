@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023-2024 Alexander Borisov
+ * Copyright (C) 2023-2026 Alexander Borisov
  *
  * Author: Alexander Borisov <borisov@lexbor.com>
  */
@@ -14,14 +14,14 @@
 #include "lexbor/core/swar.h"
 #include "lexbor/unicode/idna.h"
 
-#define LEXBOR_STR_RES_MAP_LOWERCASE
-#define LEXBOR_STR_RES_ALPHANUMERIC_CHARACTER
-#define LEXBOR_STR_RES_ALPHA_CHARACTER
-#define LEXBOR_STR_RES_CHAR_TO_TWO_HEX_VALUE
-#define LEXBOR_STR_RES_MAP_HEX
-#define LEXBOR_STR_RES_MAP_NUM
-#include "lexbor/core/str_res.h"
-
+#ifndef LEXBOR_DISABLE_INTERNAL_EXTERN
+    LXB_EXTERN const lxb_char_t lexbor_str_res_map_lowercase[256];
+    LXB_EXTERN const size_t     lexbor_str_res_alphanumeric_character[256];
+    LXB_EXTERN const size_t     lexbor_str_res_alpha_character[256];
+    LXB_EXTERN const char       *lexbor_str_res_char_to_two_hex_value[257];
+    LXB_EXTERN const lxb_char_t lexbor_str_res_map_num[256];
+    LXB_EXTERN const lxb_char_t lexbor_str_res_map_hex[256];
+#endif
 
 #define LXB_URL_BUFFER_SIZE 4096
 #define LXB_URL_BUFFER_NUM_SIZE 128
@@ -499,6 +499,7 @@ lxb_url_scheme_length = sizeof(lxb_url_scheme_res) / sizeof(lxb_url_scheme_data_
             if (tmp == NULL) {                                                \
                 return NULL;                                                  \
             }                                                                 \
+            memcpy(tmp, (sbuf_begin), offset);                                \
         }                                                                     \
         else {                                                                \
             tmp = lexbor_realloc((sbuf_begin), new_len);                      \
@@ -509,7 +510,7 @@ lxb_url_scheme_length = sizeof(lxb_url_scheme_res) / sizeof(lxb_url_scheme_data_
         }                                                                     \
                                                                               \
         (sbuf) = tmp + offset;                                                \
-        (last) = sbuf + lst;                                                  \
+        (last) = tmp + lst;                                                   \
         (sbuf_begin) = tmp;                                                   \
         (sbuf_end) = tmp + new_len;                                           \
     }                                                                         \
@@ -860,7 +861,7 @@ lxb_url_is_url_codepoint(lxb_codepoint_t cp)
     return lxb_url_codepoint_alphanumeric[(lxb_char_t) cp] != 0xFF;
 }
 
-lxb_inline bool
+bool
 lxb_url_is_special(const lxb_url_t *url)
 {
     return url->scheme.type != LXB_URL_SCHEMEL_TYPE__UNKNOWN;
@@ -1029,27 +1030,34 @@ lxb_url_path_append_wo_slash(lxb_url_t *url,
 static lxb_status_t
 lxb_url_path_append(lxb_url_t *url, const lxb_char_t *data, size_t length)
 {
-    size_t len;
-    lxb_char_t *p;
+    lxb_char_t *p, *begin;
     lexbor_str_t *str;
 
     str = &url->path.str;
 
     if (str->data == NULL) {
         p = lexbor_str_init(str, url->mraw, length + 1);
-        if (p == NULL) {
-            return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
-        }
+    }
+    else {
+        /* + 2 == begin '/' and end '\0' */
+        p = lexbor_str_check_size(str, url->mraw, length + 2);
     }
 
-    len = str->length;
-    str->length += 1;
+    if (p == NULL) {
+        return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    }
 
-    p = lexbor_str_append(&url->path.str, url->mraw, data, length);
+    begin = &str->data[str->length];
+    begin[0] = '/';
 
-    str->data[len] = '/';
+    if (length > 0) {
+        memcpy(&begin[1], data, sizeof(lxb_char_t) * length);
+    }
 
-    return (p != NULL) ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    str->length += length + 1;
+    str->data[str->length] = '\0';
+
+    return LXB_STATUS_OK;
 }
 
 static lxb_status_t
@@ -1106,13 +1114,15 @@ lxb_url_host_copy(const lxb_url_host_t *src, lxb_url_host_t *dst,
         }
     }
 
+    dst->type = src->type;
+
+    if (src->type == LXB_URL_HOST_TYPE__UNDEF
+        || src->type == LXB_URL_HOST_TYPE_EMPTY)
+    {
+        return LXB_STATUS_OK;
+    }
+
     if (src->type <= LXB_URL_HOST_TYPE_OPAQUE) {
-        dst->type = src->type;
-
-        if (src->type == LXB_URL_HOST_TYPE__UNDEF) {
-            return LXB_STATUS_OK;
-        }
-
         return lxb_url_str_copy(&src->u.domain,
                                 &dst->u.domain, dst_mraw);
     }
@@ -1143,6 +1153,24 @@ lxb_url_host_set_empty(lxb_url_host_t *host, lexbor_mraw_t *mraw)
     lxb_url_host_destroy(host, mraw);
 
     host->type = LXB_URL_HOST_TYPE_EMPTY;
+}
+
+lxb_inline bool
+lxb_url_host_is_empty(const lxb_url_host_t *host)
+{
+    if (host->type == LXB_URL_HOST_TYPE_EMPTY) {
+        return true;
+    }
+
+    if (host->type == LXB_URL_HOST_TYPE_DOMAIN) {
+        return host->u.domain.length == 0;
+    }
+
+    if (host->type == LXB_URL_HOST_TYPE_OPAQUE) {
+        return host->u.opaque.length == 0;
+    }
+
+    return false;
 }
 
 static bool
@@ -1244,7 +1272,7 @@ lxb_url_normalized_windows_drive_letter(const lxb_char_t *data,
 static bool
 lxb_url_cannot_have_user_pass_port(lxb_url_t *url)
 {
-    return url->host.type == LXB_URL_HOST_TYPE_EMPTY
+    return lxb_url_host_is_empty(&url->host)
     || url->host.type == LXB_URL_HOST_TYPE__UNDEF
     || url->scheme.type == LXB_URL_SCHEMEL_TYPE_FILE;
 }
@@ -1810,7 +1838,6 @@ again:
         if (override_state != LXB_URL_STATE__UNDEF
             && url->scheme.type == LXB_URL_SCHEMEL_TYPE_FILE)
         {
-            p -= 1;
             state = LXB_URL_STATE_FILE_HOST_STATE;
             goto again;
         }
@@ -3971,6 +3998,11 @@ lxb_url_opaque_host_parse(lxb_url_parser_t *parser, const lxb_char_t *data,
     lxb_char_t c;
     lxb_status_t status;
     const lxb_char_t *p;
+
+    if (data == end) {
+        lxb_url_host_set_empty(host, mraw);
+        return LXB_STATUS_OK;
+    }
 
     p = data;
 

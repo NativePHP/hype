@@ -2,15 +2,14 @@
    +----------------------------------------------------------------------+
    | Zend Engine                                                          |
    +----------------------------------------------------------------------+
-   | Copyright (c) Zend Technologies Ltd. (http://www.zend.com)           |
+   | Copyright © Zend Technologies Ltd., a subsidiary company of          |
+   |     Perforce Software, Inc., and Contributors.                       |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 2.00 of the Zend license,     |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | http://www.zend.com/license/2_00.txt.                                |
-   | If you did not receive a copy of the Zend license and are unable to  |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@zend.com so we can mail you a copy immediately.              |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Andi Gutmans <andi@php.net>                                 |
    |          Zeev Suraski <zeev@php.net>                                 |
@@ -198,7 +197,7 @@ typedef zend_mm_bitset zend_mm_page_map[ZEND_MM_PAGE_MAP_LEN];     /* 64B */
 #define ZEND_MM_SRUN_BIN_NUM_MASK        0x0000001f
 #define ZEND_MM_SRUN_BIN_NUM_OFFSET      0
 
-#define ZEND_MM_SRUN_FREE_COUNTER_MASK   0x01ff0000
+#define ZEND_MM_SRUN_FREE_COUNTER_MASK   0x03ff0000
 #define ZEND_MM_SRUN_FREE_COUNTER_OFFSET 16
 
 #define ZEND_MM_NRUN_OFFSET_MASK         0x01ff0000
@@ -1480,7 +1479,6 @@ static zend_always_inline void *zend_mm_alloc_heap(zend_mm_heap *heap, size_t si
 	size = ZEND_MM_ALIGNED_SIZE(size) + ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info));
 	if (UNEXPECTED(size < real_size)) {
 		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu + %zu)", ZEND_MM_ALIGNED_SIZE(real_size), ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info)));
-		return NULL;
 	}
 #endif
 	if (EXPECTED(size <= ZEND_MM_MAX_SMALL_SIZE)) {
@@ -2616,7 +2614,8 @@ typedef struct _zend_alloc_globals {
 #ifdef ZTS
 static int alloc_globals_id;
 static size_t alloc_globals_offset;
-# define AG(v) ZEND_TSRMG_FAST(alloc_globals_offset, zend_alloc_globals *, v)
+# define ZEND_AG_OFFSET (ZEND_SCNG_OFFSET - (ptrdiff_t) TSRM_ALIGNED_SIZE(sizeof(zend_alloc_globals)))
+# define AG(v) ZEND_TSRMG_FAST(ZEND_AG_OFFSET, zend_alloc_globals *, v)
 #else
 # define AG(v) (alloc_globals.v)
 static zend_alloc_globals alloc_globals;
@@ -3337,7 +3336,8 @@ ZEND_API void start_memory_manager(void)
 #  endif
 #endif
 #ifdef ZTS
-	ts_allocate_fast_id(&alloc_globals_id, &alloc_globals_offset, sizeof(zend_alloc_globals), (ts_allocate_ctor) alloc_globals_ctor, (ts_allocate_dtor) alloc_globals_dtor);
+	ts_allocate_fast_id_at(&alloc_globals_id, &alloc_globals_offset, ZEND_AG_OFFSET, sizeof(zend_alloc_globals), (ts_allocate_ctor) alloc_globals_ctor, (ts_allocate_dtor) alloc_globals_dtor);
+	ZEND_ASSERT(alloc_globals_offset == ZEND_AG_OFFSET);
 #else
 	alloc_globals_ctor(&alloc_globals);
 #endif
@@ -3466,12 +3466,14 @@ ZEND_API zend_mm_heap *zend_mm_startup(void)
 ZEND_API zend_mm_heap *zend_mm_startup_ex(const zend_mm_handlers *handlers, void *data, size_t data_size)
 {
 #if ZEND_MM_STORAGE
-	zend_mm_storage tmp_storage, *storage;
+	zend_mm_storage *storage;
+	zend_mm_storage tmp_storage = {
+		.handlers = *handlers,
+		.data = data,
+	};
 	zend_mm_chunk *chunk;
 	zend_mm_heap *heap;
 
-	memcpy((zend_mm_handlers*)&tmp_storage.handlers, handlers, sizeof(zend_mm_handlers));
-	tmp_storage.data = data;
 	chunk = (zend_mm_chunk*)handlers->chunk_alloc(&tmp_storage, ZEND_MM_CHUNK_SIZE, ZEND_MM_CHUNK_SIZE);
 	if (UNEXPECTED(chunk == NULL)) {
 #if ZEND_MM_ERROR

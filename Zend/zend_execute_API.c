@@ -2,15 +2,14 @@
    +----------------------------------------------------------------------+
    | Zend Engine                                                          |
    +----------------------------------------------------------------------+
-   | Copyright (c) Zend Technologies Ltd. (http://www.zend.com)           |
+   | Copyright © Zend Technologies Ltd., a subsidiary company of          |
+   |     Perforce Software, Inc., and Contributors.                       |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 2.00 of the Zend license,     |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | http://www.zend.com/license/2_00.txt.                                |
-   | If you did not receive a copy of the Zend license and are unable to  |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@zend.com so we can mail you a copy immediately.              |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Andi Gutmans <andi@php.net>                                 |
    |          Zeev Suraski <zeev@php.net>                                 |
@@ -145,7 +144,6 @@ void init_executor(void) /* {{{ */
 	EG(function_table) = CG(function_table);
 	EG(class_table) = CG(class_table);
 
-	EG(in_autoload) = NULL;
 	EG(error_handling) = EH_NORMAL;
 	EG(flags) = EG_FLAGS_INITIAL;
 
@@ -156,6 +154,7 @@ void init_executor(void) /* {{{ */
 	zend_llist_apply(&zend_extensions, (llist_apply_func_t) zend_extension_activator);
 
 	zend_hash_init(&EG(included_files), 8, NULL, NULL, 0);
+	zend_hash_init(&EG(autoload_current_classnames), 8, NULL, NULL, 0);
 
 	EG(ticks_count) = 0;
 
@@ -176,7 +175,6 @@ void init_executor(void) /* {{{ */
 	ZEND_ATOMIC_BOOL_INIT(&EG(timed_out), false);
 
 	EG(exception) = NULL;
-	EG(prev_exception) = NULL;
 
 	EG(fake_scope) = NULL;
 	EG(trampoline).common.function_name = NULL;
@@ -193,8 +191,7 @@ void init_executor(void) /* {{{ */
 	EG(get_gc_buffer).start = EG(get_gc_buffer).end = EG(get_gc_buffer).cur = NULL;
 
 	EG(record_errors) = false;
-	EG(num_errors) = 0;
-	EG(errors) = NULL;
+	memset(&EG(errors), 0, sizeof(EG(errors)));
 
 	EG(filename_override) = NULL;
 	EG(lineno_override) = -1;
@@ -504,16 +501,13 @@ void shutdown_executor(void) /* {{{ */
 		}
 
 		zend_hash_destroy(&EG(included_files));
+		zend_hash_destroy(&EG(autoload_current_classnames));
 
 		zend_stack_destroy(&EG(user_error_handlers_error_reporting));
 		zend_stack_destroy(&EG(user_error_handlers));
 		zend_stack_destroy(&EG(user_exception_handlers));
 		zend_lazy_objects_destroy(&EG(lazy_objects_store));
 		zend_objects_store_destroy(&EG(objects_store));
-		if (EG(in_autoload)) {
-			zend_hash_destroy(EG(in_autoload));
-			FREE_HASHTABLE(EG(in_autoload));
-		}
 
 		if (EG(ht_iterators) != EG(ht_iterators_slots)) {
 			efree(EG(ht_iterators));
@@ -652,11 +646,7 @@ ZEND_API const char *get_function_arg_name(const zend_function *func, uint32_t a
 		return NULL;
 	}
 
-	if (func->type == ZEND_USER_FUNCTION || (func->common.fn_flags & ZEND_ACC_USER_ARG_INFO)) {
-		return ZSTR_VAL(func->common.arg_info[arg_num - 1].name);
-	} else {
-		return ((zend_internal_arg_info*) func->common.arg_info)[arg_num - 1].name;
-	}
+	return ZSTR_VAL(func->common.arg_info[arg_num - 1].name);
 }
 /* }}} */
 
@@ -805,6 +795,7 @@ zend_result _call_user_function_impl(zval *object, zval *function_name, zval *re
 	fci.param_count = param_count;
 	fci.params = params;
 	fci.named_params = named_params;
+	fci.consumed_args = 0;
 
 	return zend_call_function(&fci, NULL);
 }
@@ -872,6 +863,9 @@ zend_result zend_call_function(zend_fcall_info *fci, zend_fcall_info_cache *fci_
 
 	call = zend_vm_stack_push_call_frame(call_info,
 		func, fci->param_count, object_or_called_scope);
+	uint32_t consumed_args = fci->param_count ? fci->consumed_args : 0;
+
+	ZEND_ASSERT((consumed_args & (consumed_args - 1)) == 0);
 
 	for (uint32_t i = 0; i < fci->param_count; i++) {
 		zval *param = ZEND_CALL_ARG(call, i+1);
@@ -913,7 +907,15 @@ cleanup_args:
 		}
 
 		if (EXPECTED(!must_wrap)) {
-			ZVAL_COPY(param, arg);
+			if (EXPECTED(consumed_args == 0)
+					|| !zend_fci_is_consumed_arg(consumed_args, i)
+					|| Z_ISREF_P(arg)
+					|| arg != &fci->params[i]) {
+				ZVAL_COPY(param, arg);
+			} else {
+				ZVAL_COPY_VALUE(param, arg);
+				ZVAL_UNDEF(arg);
+			}
 		} else {
 			Z_TRY_ADDREF_P(arg);
 			ZVAL_NEW_REF(param, arg);
@@ -1034,10 +1036,13 @@ cleanup_args:
 			if (should_throw) {
 				zend_internal_call_arginfo_violation(call->func);
 			}
-			ZEND_ASSERT(!(call->func->common.fn_flags & ZEND_ACC_HAS_RETURN_TYPE) ||
-				zend_verify_internal_return_type(call->func, fci->retval));
+			if (call->func->common.fn_flags & ZEND_ACC_HAS_RETURN_TYPE) {
+				bool result = zend_verify_internal_return_type(call->func, fci->retval);
+				ZEND_ASSERT(result);
+			}
 			ZEND_ASSERT((call->func->common.fn_flags & ZEND_ACC_RETURN_REFERENCE)
 				? Z_ISREF_P(fci->retval) : !Z_ISREF_P(fci->retval));
+			ZEND_ASSERT(!(call->func->common.fn_flags2 & ZEND_ACC2_FORBID_DYN_CALLS));
 		}
 #endif
 		ZEND_OBSERVER_FCALL_END(call, fci->retval);
@@ -1099,6 +1104,7 @@ ZEND_API void zend_call_known_function(
 	fci.param_count = param_count;
 	fci.params = params;
 	fci.named_params = named_params;
+	fci.consumed_args = 0;
 	ZVAL_UNDEF(&fci.function_name); /* Unused */
 
 	fcic.function_handler = fn;
@@ -1215,7 +1221,7 @@ ZEND_API zend_class_entry *zend_lookup_class_ex(zend_string *name, zend_string *
 					ALLOC_HASHTABLE(CG(unlinked_uses));
 					zend_hash_init(CG(unlinked_uses), 0, NULL, NULL, 0);
 				}
-				zend_hash_index_add_empty_element(CG(unlinked_uses), (zend_long)(uintptr_t)ce);
+				zend_hash_index_add_empty_element(CG(unlinked_uses), (zend_ulong)(uintptr_t)ce);
 				return ce;
 			}
 			return NULL;
@@ -1250,12 +1256,7 @@ ZEND_API zend_class_entry *zend_lookup_class_ex(zend_string *name, zend_string *
 		return NULL;
 	}
 
-	if (EG(in_autoload) == NULL) {
-		ALLOC_HASHTABLE(EG(in_autoload));
-		zend_hash_init(EG(in_autoload), 8, NULL, NULL, 0);
-	}
-
-	if (zend_hash_add_empty_element(EG(in_autoload), lc_name) == NULL) {
+	if (zend_hash_add_empty_element(&EG(autoload_current_classnames), lc_name) == NULL) {
 		if (!key) {
 			zend_string_release_ex(lc_name, 0);
 		}
@@ -1272,14 +1273,12 @@ ZEND_API zend_class_entry *zend_lookup_class_ex(zend_string *name, zend_string *
 	zend_long previous_lineno = EG(lineno_override);
 	EG(filename_override) = NULL;
 	EG(lineno_override) = -1;
-	zend_exception_save();
 	ce = zend_autoload(autoload_name, lc_name);
-	zend_exception_restore();
 	EG(filename_override) = previous_filename;
 	EG(lineno_override) = previous_lineno;
 
 	zend_string_release_ex(autoload_name, 0);
-	zend_hash_del(EG(in_autoload), lc_name);
+	zend_hash_del(&EG(autoload_current_classnames), lc_name);
 
 	if (!key) {
 		zend_string_release_ex(lc_name, 0);
@@ -1569,7 +1568,6 @@ static void zend_set_timeout_ex(zend_long seconds, bool reset_signals) /* {{{ */
 		if (!DeleteTimerQueueTimer(NULL, tq_timer, INVALID_HANDLE_VALUE)) {
 			tq_timer = NULL;
 			zend_error_noreturn(E_ERROR, "Could not delete queued timer");
-			return;
 		}
 		tq_timer = NULL;
 	}
@@ -1579,7 +1577,6 @@ static void zend_set_timeout_ex(zend_long seconds, bool reset_signals) /* {{{ */
 	if (!CreateTimerQueueTimer(&tq_timer, NULL, (WAITORTIMERCALLBACK)tq_timer_cb, (VOID*)eg, seconds*1000, 0, WT_EXECUTEONLYONCE)) {
 		tq_timer = NULL;
 		zend_error_noreturn(E_ERROR, "Could not queue new timer");
-		return;
 	}
 #elif defined(ZEND_MAX_EXECUTION_TIMERS)
 	if (seconds > 0) {
@@ -1666,7 +1663,6 @@ void zend_unset_timeout(void) /* {{{ */
 			zend_atomic_bool_store_ex(&EG(timed_out), false);
 			tq_timer = NULL;
 			zend_error_noreturn(E_ERROR, "Could not delete queued timer");
-			return;
 		}
 		tq_timer = NULL;
 	}
@@ -1783,7 +1779,7 @@ zend_class_entry *zend_fetch_class_with_scope(
 		case 0:
 			break;
 		/* Other fetch types are not supported by this function. */
-		EMPTY_SWITCH_DEFAULT_CASE()
+		default: ZEND_UNREACHABLE();
 	}
 
 	ce = zend_lookup_class_ex(class_name, NULL, fetch_type);

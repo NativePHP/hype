@@ -148,6 +148,12 @@ bool ir_check(const ir_ctx *ctx)
 	bool ok = 1;
 	ir_check_ctx check_ctx;
 
+	if (ctx->insns_count < 1 || ctx->ir_base[1].op != IR_START) {
+		fprintf(stderr, "ir_base[1].op invalid opcode (%d)\n",
+			(ctx->insns_count < 1) ? IR_NOP : ctx->ir_base[0].op);
+		ok = 0;
+	}
+
 	check_ctx.arena = NULL;
 	check_ctx.use_set = NULL;
 	check_ctx.input_set = NULL;
@@ -297,6 +303,14 @@ bool ir_check(const ir_ctx *ctx)
 								ok = 0;
 							}
 							break;
+						case IR_OPND_CONTROL_GUARD:
+							if (!(ir_op_flags[use_insn->op] & IR_OP_FLAG_BB_START)
+							 && use_insn->op != IR_GUARD
+							 && use_insn->op != IR_GUARD_NOT) {
+								fprintf(stderr, "ir_base[%d].ops[%d] reference (%d) must be BB_START or GUARD\n", i, j, use);
+								ok = 0;
+							}
+							break;
 						default:
 							fprintf(stderr, "ir_base[%d].ops[%d] reference (%d) of unsupported kind\n", i, j, use);
 							ok = 0;
@@ -306,6 +320,8 @@ bool ir_check(const ir_ctx *ctx)
 				/* pass (function returns void) */
 			} else if (insn->op == IR_BEGIN && j == 1) {
 				/* pass (start of unreachable basic block) */
+			} else if (IR_OPND_KIND(flags, j) == IR_OPND_CONTROL_GUARD) {
+				/* reference to control guard is optional */
 			} else if (IR_OPND_KIND(flags, j) != IR_OPND_CONTROL_REF
 					&& (insn->op != IR_SNAPSHOT || j == 1)) {
 				fprintf(stderr, "ir_base[%d].ops[%d] missing reference (%d)\n", i, j, use);
@@ -328,7 +344,9 @@ bool ir_check(const ir_ctx *ctx)
 				}
 				break;
 			case IR_LOAD:
+			case IR_LOAD_v:
 			case IR_STORE:
+			case IR_STORE_v:
 				type = ctx->ir_base[insn->op2].type;
 				if (type != IR_ADDR
 				 && (!IR_IS_TYPE_INT(type) || ir_type_size[type] != ir_type_size[IR_ADDR])) {
@@ -338,7 +356,9 @@ bool ir_check(const ir_ctx *ctx)
 				}
 				break;
 			case IR_VLOAD:
+			case IR_VLOAD_v:
 			case IR_VSTORE:
+			case IR_VSTORE_v:
 				if (ctx->ir_base[insn->op2].op != IR_VAR) {
 					fprintf(stderr, "ir_base[%d].op2 must be 'VAR' (%s)\n",
 						i, ir_op_name[ctx->ir_base[insn->op2].op]);
@@ -408,6 +428,9 @@ bool ir_check(const ir_ctx *ctx)
 							ok = 0;
 						}
 						break;
+					case IR_IGOTO:
+					case IR_ASM_GOTO:
+						break;
 					default:
 						/* skip data references */
 						count = n = use_list->count;
@@ -458,6 +481,10 @@ bool ir_check(const ir_ctx *ctx)
 //	if (!ok) {
 //		ir_dump_codegen(ctx, stderr);
 //	}
+
+#ifndef IR_CHECK_NO_ABORT
 	IR_ASSERT(ok);
+#endif
+
 	return ok;
 }

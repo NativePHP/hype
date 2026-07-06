@@ -2,15 +2,13 @@
    +----------------------------------------------------------------------+
    | Zend Engine, SCCP - Sparse Conditional Constant Propagation          |
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Nikita Popov <nikic@php.net>                                |
    |          Dmitry Stogov <dmitry@php.net>                              |
@@ -363,8 +361,7 @@ static inline zend_result zval_to_string_offset(zend_long *result, zval *op) {
 static inline zend_result fetch_array_elem(zval **result, zval *op1, zval *op2) {
 	switch (Z_TYPE_P(op2)) {
 		case IS_NULL:
-			*result = zend_hash_find(Z_ARR_P(op1), ZSTR_EMPTY_ALLOC());
-			return SUCCESS;
+			return FAILURE;
 		case IS_FALSE:
 			*result = zend_hash_index_find(Z_ARR_P(op1), 0);
 			return SUCCESS;
@@ -403,7 +400,7 @@ static inline zend_result ct_eval_fetch_dim(zval *result, zval *op1, zval *op2, 
 			return FAILURE;
 		}
 		if (index >= 0 && index < Z_STRLEN_P(op1)) {
-			ZVAL_STR(result, zend_string_init(&Z_STRVAL_P(op1)[index], 1, 0));
+			ZVAL_CHAR(result, Z_STRVAL_P(op1)[index]);
 			return SUCCESS;
 		}
 	}
@@ -969,7 +966,7 @@ static void sccp_visit_instr(scdf_ctx *scdf, zend_op *opline, zend_ssa_op *ssa_o
 					SET_RESULT(op1, &zv);
 				} else if (ct_eval_assign_dim(&zv, data, op2) == SUCCESS) {
 					/* Mark array containing partial array as partial */
-					if (IS_PARTIAL_ARRAY(data)) {
+					if (IS_PARTIAL_ARRAY(data) || IS_PARTIAL_OBJECT(data)) {
 						MAKE_PARTIAL_ARRAY(&zv);
 					}
 					SET_RESULT(result, data);
@@ -1174,7 +1171,7 @@ static void sccp_visit_instr(scdf_ctx *scdf, zend_op *opline, zend_ssa_op *ssa_o
 						/* We can't add NEXT element into partial array (skip it) */
 						SET_RESULT(result, &zv);
 					} else if (ct_eval_add_array_elem(&zv, op1, op2) == SUCCESS) {
-						if (IS_PARTIAL_ARRAY(op1)) {
+						if (IS_PARTIAL_ARRAY(op1) || IS_PARTIAL_OBJECT(op1)) {
 							MAKE_PARTIAL_ARRAY(&zv);
 						}
 						SET_RESULT(result, &zv);
@@ -1597,7 +1594,7 @@ static void sccp_visit_instr(scdf_ctx *scdf, zend_op *opline, zend_ssa_op *ssa_o
 				case ZEND_SHORT_CIRCUITING_CHAIN_EMPTY:
 					ZVAL_TRUE(&zv);
 					break;
-				EMPTY_SWITCH_DEFAULT_CASE()
+				default: ZEND_UNREACHABLE();
 			}
 			SET_RESULT(result, &zv);
 			break;
@@ -1833,7 +1830,7 @@ static void sccp_mark_feasible_successors(
 		zend_op *opline, zend_ssa_op *ssa_op) {
 	sccp_ctx *ctx = (sccp_ctx *) scdf;
 	zval *op1, zv;
-	int s;
+	uint32_t s;
 
 	/* We can't determine the branch target at compile-time for these */
 	switch (opline->opcode) {
@@ -2050,7 +2047,6 @@ static void sccp_visit_phi(scdf_ctx *scdf, const zend_ssa_phi *phi) {
 		zend_basic_block *block = &ssa->cfg.blocks[phi->block];
 		int *predecessors = &ssa->cfg.predecessors[block->predecessor_offset];
 
-		int i;
 		zval result;
 		MAKE_TOP(&result);
 #if SCP_DEBUG
@@ -2062,7 +2058,7 @@ static void sccp_visit_phi(scdf_ctx *scdf, const zend_ssa_phi *phi) {
 				join_phi_values(&result, &ctx->values[phi->sources[0]], ssa->vars[phi->ssa_var].escape_state != ESCAPE_STATE_NO_ESCAPE);
 			}
 		} else {
-			for (i = 0; i < block->predecessors_count; i++) {
+			for (uint32_t i = 0; i < block->predecessors_count; i++) {
 				ZEND_ASSERT(phi->sources[i] >= 0);
 				if (scdf_is_edge_feasible(scdf, predecessors[i], phi->block)) {
 #if SCP_DEBUG

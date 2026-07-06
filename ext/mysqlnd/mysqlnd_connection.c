@@ -1,14 +1,12 @@
 /*
   +----------------------------------------------------------------------+
-  | Copyright (c) The PHP Group                                          |
+  | Copyright © The PHP Group and Contributors.                          |
   +----------------------------------------------------------------------+
-  | This source file is subject to version 3.01 of the PHP license,      |
-  | that is bundled with this package in the file LICENSE, and is        |
-  | available through the world-wide-web at the following url:           |
-  | https://www.php.net/license/3_01.txt                                 |
-  | If you did not receive a copy of the PHP license and are unable to   |
-  | obtain it through the world-wide-web, please send a note to          |
-  | license@php.net so we can mail you a copy immediately.               |
+  | This source file is subject to the Modified BSD License that is      |
+  | bundled with this package in the file LICENSE, and is available      |
+  | through the World Wide Web at <https://www.php.net/license/>.        |
+  |                                                                      |
+  | SPDX-License-Identifier: BSD-3-Clause                                |
   +----------------------------------------------------------------------+
   | Authors: Andrey Hristov <andrey@php.net>                             |
   |          Ulf Wendel <uw@php.net>                                     |
@@ -548,13 +546,24 @@ MYSQLND_METHOD(mysqlnd_conn_data, get_scheme)(MYSQLND_CONN_DATA * conn, MYSQLND_
 			port = 3306;
 		}
 
-		/* ipv6 addresses are in the format [address]:port */
 		if (hostname.s[0] != '[' && mysqlnd_fast_is_ipv6_address(hostname.s)) {
+			/* IPv6 without square brackets so without port */
 			transport.l = mnd_sprintf(&transport.s, 0, "tcp://[%s]:%u", hostname.s, port);
 		} else {
-			/* Not ipv6, but could already contain a port number, in which case we should not add an extra port.
+			const char *p;
+
+			/* IPv6 addresses are in the format [address]:port */
+			if (hostname.s[0] == '[') { /* IPv6 */
+				p = strchr(hostname.s, ']');
+				if (p && p[1] != ':') {
+					p = NULL;
+				}
+			} else { /* IPv4 or name */
+				p = strchr(hostname.s, ':');
+			}
+			/* Could already contain a port number, in which case we should not add an extra port.
 			 * See GH-8978. In a port doubling scenario, the first port would be used so we do the same to keep BC. */
-			if (strchr(hostname.s, ':')) {
+			if (p) {
 				/* TODO: Ideally we should be able to get rid of this workaround in the future. */
 				transport.l = mnd_sprintf(&transport.s, 0, "tcp://%s", hostname.s);
 			} else {
@@ -1375,7 +1384,7 @@ MYSQLND_METHOD(mysqlnd_conn_data, change_user)(MYSQLND_CONN_DATA * const conn,
 	/* XXX: passwords that have \0 inside work during auth, but in this case won't work with change user */
 	ret = mysqlnd_run_authentication(conn, user, passwd, passwd_len, db, strlen(db),
 									 conn->authentication_plugin_data, conn->options->auth_protocol,
-									0 /*charset not used*/, conn->options, conn->server_capabilities, silent, TRUE/*is_change*/);
+									0 /*charset not used*/, conn->server_capabilities, silent, TRUE/*is_change*/);
 
 	/*
 	  Here we should close all statements. Unbuffered queries should not be a
@@ -1548,17 +1557,14 @@ MYSQLND_METHOD(mysqlnd_conn_data, set_client_option_2d)(MYSQLND_CONN_DATA * cons
 				zval attrz;
 				zend_string *str;
 
+				str = zend_string_init(key, strlen(key), conn->persistent);
+				ZVAL_NEW_STR(&attrz, zend_string_init(value, strlen(value), conn->persistent));
 				if (conn->persistent) {
-					str = zend_string_init(key, strlen(key), 1);
 					GC_MAKE_PERSISTENT_LOCAL(str);
-					ZVAL_NEW_STR(&attrz, zend_string_init(value, strlen(value), 1));
 					GC_MAKE_PERSISTENT_LOCAL(Z_COUNTED(attrz));
-				} else {
-					str = zend_string_init(key, strlen(key), 0);
-					ZVAL_NEW_STR(&attrz, zend_string_init(value, strlen(value), 0));
 				}
 				zend_hash_update(conn->options->connect_attr, str, &attrz);
-				zend_string_release_ex(str, 1);
+				zend_string_release_ex(str, conn->persistent);
 			}
 			break;
 		default:

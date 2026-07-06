@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Shane Caraveo <shane@php.net>                               |
    |          Wez Furlong <wez@thebrainroom.com>                          |
@@ -35,7 +33,6 @@
 #include <libxml/uri.h>
 #include <libxml/xmlerror.h>
 #include <libxml/xmlsave.h>
-#include <libxml/xmlerror.h>
 #include <libxml/entities.h>
 #ifdef LIBXML_SCHEMAS_ENABLED
 #include <libxml/relaxng.h>
@@ -526,6 +523,7 @@ static int php_libxml_streams_IO_close(void *context)
 	return php_stream_close((php_stream*)context);
 }
 
+/* TODO: This needs to be replaced by context-specific APIs in the future! */
 static xmlParserInputBufferPtr
 php_libxml_input_buffer_create_filename(const char *URI, xmlCharEncoding enc)
 {
@@ -560,13 +558,10 @@ php_libxml_input_buffer_create_filename(const char *URI, xmlCharEncoding enc)
 	}
 
 	/* Allocate the Input buffer front-end. */
-	ret = xmlAllocParserInputBuffer(enc);
-	if (ret != NULL) {
-		ret->context = context;
-		ret->readcallback = php_libxml_streams_IO_read;
-		ret->closecallback = php_libxml_streams_IO_close;
-	} else
+	ret = xmlParserInputBufferCreateIO(php_libxml_streams_IO_read, php_libxml_streams_IO_close, context, enc);
+	if (ret == NULL) {
 		php_libxml_streams_IO_close(context);
+	}
 
 	return ret;
 }
@@ -615,11 +610,10 @@ php_libxml_output_buffer_create_filename(const char *URI,
 	}
 
 	/* Allocate the Output buffer front-end. */
-	ret = xmlAllocOutputBuffer(encoder);
-	if (ret != NULL) {
-		ret->context = context;
-		ret->writecallback = php_libxml_streams_IO_write;
-		ret->closecallback = php_libxml_streams_IO_close;
+	ret = xmlOutputBufferCreateIO(php_libxml_streams_IO_write, php_libxml_streams_IO_close, context, encoder);
+	if (ret == NULL) {
+		php_libxml_streams_IO_close(context);
+		goto err;
 	}
 
 	return ret;
@@ -806,6 +800,7 @@ is_string:
 				zend_string_release(callable_name);
 				zval_ptr_dtor(&callable);
 			} else {
+#if LIBXML_VERSION < 21400
 				/* TODO: allow storing the encoding in the stream context? */
 				xmlCharEncoding enc = XML_CHAR_ENCODING_NONE;
 				xmlParserInputBufferPtr pib = xmlAllocParserInputBuffer(enc);
@@ -815,15 +810,24 @@ is_string:
 				} else {
 					/* make stream not being closed when the zval is freed */
 					GC_ADDREF(stream->res);
+
+					ZEND_DIAGNOSTIC_IGNORED_START("-Wdeprecated-declarations")
 					pib->context = stream;
 					pib->readcallback = php_libxml_streams_IO_read;
 					pib->closecallback = php_libxml_streams_IO_close;
+					ZEND_DIAGNOSTIC_IGNORED_END
 
 					ret = xmlNewIOInputStream(context, pib, enc);
 					if (ret == NULL) {
 						xmlFreeParserInputBuffer(pib);
 					}
 				}
+#else
+				/* make stream not being closed when the zval is freed */
+				GC_ADDREF(stream->res);
+				ret = xmlNewInputFromIO(NULL, php_libxml_streams_IO_read, php_libxml_streams_IO_close, stream, 0);
+				/* Note: if ret == NULL, the close operation will be executed, so don't DELREF stream->res upon failure! */
+#endif
 			}
 		} else if (Z_TYPE(retval) != IS_NULL) {
 			/* retval not string nor resource nor null; convert to string */

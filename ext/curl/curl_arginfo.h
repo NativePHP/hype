@@ -1,5 +1,5 @@
-/* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 2a2772e99deea07c0bc148e9715e6a960230cf4d */
+/* This is a generated file, edit curl.stub.php instead.
+ * Stub hash: 1ecf692ba8494e7b486986c0170686c33768deb5 */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_curl_close, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, handle, CurlHandle, 0)
@@ -49,7 +49,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_curl_init, 0, 0, CurlHandle,
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, url, IS_STRING, 1, "null")
 ZEND_END_ARG_INFO()
 
-#if LIBCURL_VERSION_NUM >= 0x073E00 /* Available since 7.62.0 */
+#if LIBCURL_VERSION_NUM >= 0x073e00 /* Available since 7.62.0 */
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_curl_upkeep, 0, 1, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, handle, CurlHandle, 0)
 ZEND_END_ARG_INFO()
@@ -157,7 +157,7 @@ ZEND_FUNCTION(curl_exec);
 ZEND_FUNCTION(curl_file_create);
 ZEND_FUNCTION(curl_getinfo);
 ZEND_FUNCTION(curl_init);
-#if LIBCURL_VERSION_NUM >= 0x073E00 /* Available since 7.62.0 */
+#if LIBCURL_VERSION_NUM >= 0x073e00 /* Available since 7.62.0 */
 ZEND_FUNCTION(curl_upkeep);
 #endif
 ZEND_FUNCTION(curl_multi_add_handle);
@@ -196,7 +196,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(curl_file_create, arginfo_curl_file_create)
 	ZEND_FE(curl_getinfo, arginfo_curl_getinfo)
 	ZEND_FE(curl_init, arginfo_curl_init)
-#if LIBCURL_VERSION_NUM >= 0x073E00 /* Available since 7.62.0 */
+#if LIBCURL_VERSION_NUM >= 0x073e00 /* Available since 7.62.0 */
 	ZEND_FE(curl_upkeep, arginfo_curl_upkeep)
 #endif
 	ZEND_FE(curl_multi_add_handle, arginfo_curl_multi_add_handle)
@@ -831,10 +831,13 @@ static void register_curl_symbols(int module_number)
 #if LIBCURL_VERSION_NUM >= 0x080200 /* Available since 8.2.0 */
 	REGISTER_LONG_CONSTANT("CURLINFO_CONN_ID", CURLINFO_CONN_ID, CONST_PERSISTENT);
 #endif
+#if LIBCURL_VERSION_NUM >= 0x081400 /* Available since 8.20.0 */
+	REGISTER_LONG_CONSTANT("CURLINFO_SIZE_DELIVERED", CURLINFO_SIZE_DELIVERED, CONST_PERSISTENT);
+#endif
 	REGISTER_LONG_CONSTANT("CURLOPT_DISALLOW_USERNAME_IN_URL", CURLOPT_DISALLOW_USERNAME_IN_URL, CONST_PERSISTENT);
 	REGISTER_LONG_CONSTANT("CURLOPT_PROXY_TLS13_CIPHERS", CURLOPT_PROXY_TLS13_CIPHERS, CONST_PERSISTENT);
 	REGISTER_LONG_CONSTANT("CURLOPT_TLS13_CIPHERS", CURLOPT_TLS13_CIPHERS, CONST_PERSISTENT);
-#if LIBCURL_VERSION_NUM >= 0x073E00 /* Available since 7.62.0 */
+#if LIBCURL_VERSION_NUM >= 0x073e00 /* Available since 7.62.0 */
 	REGISTER_LONG_CONSTANT("CURLOPT_DOH_URL", CURLOPT_DOH_URL, CONST_PERSISTENT);
 	REGISTER_LONG_CONSTANT("CURLOPT_UPKEEP_INTERVAL_MS", CURLOPT_UPKEEP_INTERVAL_MS, CONST_PERSISTENT);
 	REGISTER_LONG_CONSTANT("CURLOPT_UPLOAD_BUFFERSIZE", CURLOPT_UPLOAD_BUFFERSIZE, CONST_PERSISTENT);

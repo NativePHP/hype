@@ -2,15 +2,14 @@
    +----------------------------------------------------------------------+
    | Zend Engine                                                          |
    +----------------------------------------------------------------------+
-   | Copyright (c) Zend Technologies Ltd. (http://www.zend.com)           |
+   | Copyright © Zend Technologies Ltd., a subsidiary company of          |
+   |     Perforce Software, Inc., and Contributors.                       |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 2.00 of the Zend license,     |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | http://www.zend.com/license/2_00.txt.                                |
-   | If you did not receive a copy of the Zend license and are unable to  |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@zend.com so we can mail you a copy immediately.              |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Ilija Tovilo <ilutov@php.net>                               |
    +----------------------------------------------------------------------+
@@ -121,7 +120,7 @@ skip_property:
 			if (Z_TYPE_P(prop_value) == IS_INDIRECT) {
 				continue;
 			}
-			zval *tmp = _zend_hash_append(properties, prop_name, prop_value);
+			zval *tmp = zend_hash_add_new(properties, prop_name, prop_value);
 			Z_TRY_ADDREF_P(tmp);
 		} ZEND_HASH_FOREACH_END();
 	}

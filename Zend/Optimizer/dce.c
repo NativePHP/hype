@@ -2,15 +2,13 @@
    +----------------------------------------------------------------------+
    | Zend Engine, DCE - Dead Code Elimination                             |
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Nikita Popov <nikic@php.net>                                |
    |          Dmitry Stogov <dmitry@php.net>                              |
@@ -162,10 +160,16 @@ static inline bool may_have_side_effects(
 		case ZEND_EXT_FCALL_END:
 		case ZEND_TICKS:
 		case ZEND_YIELD:
-		case ZEND_YIELD_FROM:
 		case ZEND_VERIFY_NEVER_TYPE:
 			/* Intrinsic side effects */
 			return true;
+		case ZEND_YIELD_FROM: {
+			uint32_t t1 = OP1_INFO();
+			if ((t1 & (MAY_BE_ANY|MAY_BE_UNDEF)) == MAY_BE_ARRAY && MAY_BE_EMPTY_ONLY(t1)) {
+				return false;
+			}
+			return true;
+		}
 		case ZEND_DO_FCALL:
 		case ZEND_DO_FCALL_BY_NAME:
 		case ZEND_DO_ICALL:
@@ -565,7 +569,7 @@ int dce_optimize_op_array(zend_op_array *op_array, zend_optimizer_ctx *optimizer
 	} FOREACH_PHI_END();
 
 	/* Mark reachable instruction without side effects as dead */
-	int b = ssa->cfg.blocks_count;
+	uint32_t b = ssa->cfg.blocks_count;
 	while (b > 0) {
 		int	op_data = -1;
 

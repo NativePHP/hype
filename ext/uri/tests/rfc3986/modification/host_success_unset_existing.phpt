@@ -1,7 +1,5 @@
 --TEST--
 Test Uri\Rfc3986\Uri component modification - host - unsetting existing
---EXTENSIONS--
-uri
 --FILE--
 <?php
 
@@ -18,6 +16,6 @@ var_dump($uri2->toString());
 --EXPECT--
 string(11) "example.com"
 NULL
-string(7) "https:/"
+string(6) "https:"
 NULL
-string(7) "https:/"
+string(6) "https:"

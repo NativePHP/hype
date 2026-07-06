@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Original design:  Shane Caraveo <shane@caraveo.com>                  |
    | Authors: Andi Gutmans <andi@php.net>                                 |
@@ -191,7 +189,7 @@ SAPI_API void sapi_read_post_data(void)
 				*p = 0;
 				break;
 			default:
-				*p = tolower(*p);
+				*p = tolower((unsigned char)*p);
 				break;
 		}
 	}
@@ -601,7 +599,7 @@ static void sapi_update_response_code(int ncode)
  * since zend_llist_del_element only removes one matched item once,
  * we should remove them manually
  */
-static void sapi_remove_header(zend_llist *l, char *name, size_t len, size_t header_len)
+static void sapi_remove_header(zend_llist *l, char *name, size_t len, size_t prefix_len)
 {
 	sapi_header_struct *header;
 	zend_llist_element *next;
@@ -610,8 +608,13 @@ static void sapi_remove_header(zend_llist *l, char *name, size_t len, size_t hea
 	while (current) {
 		header = (sapi_header_struct *)(current->data);
 		next = current->next;
-		if (header->header_len > header_len
-				&& (header->header[header_len] == ':' || len > header_len)
+		/*
+		 * prefix_len is set for DELETE_PREFIX (used for deleting i.e.
+		 * "Set-Cookie: PHPSESSID=", where we need more than just key)
+		 * look for the : otherwise
+		 */
+		if (header->header_len > len
+				&& (header->header[len] == ':' || (prefix_len && len > prefix_len))
 				&& !strncasecmp(header->header, name, len)) {
 			if (current->prev) {
 				current->prev->next = next;
@@ -728,10 +731,10 @@ SAPI_API int sapi_header_op(sapi_header_op_enum op, void *arg)
 	}
 
 	/* cut off trailing spaces, linefeeds and carriage-returns */
-	if (header_line_len && isspace(header_line[header_line_len-1])) {
+	if (header_line_len && isspace((unsigned char)header_line[header_line_len - 1])) {
 		do {
 			header_line_len--;
-		} while(header_line_len && isspace(header_line[header_line_len-1]));
+		} while(header_line_len && isspace((unsigned char)header_line[header_line_len - 1]));
 		header_line[header_line_len]='\0';
 	}
 

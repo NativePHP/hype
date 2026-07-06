@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Christian Stocker <chregu@php.net>                          |
    |          Rob Richards <rrichards@php.net>                            |
@@ -414,11 +412,6 @@ zval *dom_write_property(zend_object *object, zend_string *name, zval *value, vo
 	const dom_prop_handler *hnd = dom_get_prop_handler(obj, name, cache_slot);
 
 	if (hnd) {
-		if (UNEXPECTED(!hnd->write_func)) {
-			zend_readonly_property_modification_error_ex(ZSTR_VAL(object->ce->name), ZSTR_VAL(name));
-			return &EG(error_zval);
-		}
-
 		zend_property_info *prop = NULL;
 		if (cache_slot) {
 			ZEND_ASSERT(*cache_slot == obj->prop_handler);
@@ -429,6 +422,16 @@ zval *dom_write_property(zend_object *object, zend_string *name, zval *value, vo
 			if (cache_slot) {
 				*(cache_slot + 2) = prop;
 			}
+		}
+
+		if (UNEXPECTED(!hnd->write_func)) {
+			if (prop && (prop->flags & ZEND_ACC_PPP_SET_MASK) &&
+			    !zend_asymmetric_property_has_set_access(prop)) {
+				zend_asymmetric_visibility_property_modification_error(prop, "modify");
+			} else {
+				zend_readonly_property_modification_error_ex(ZSTR_VAL(object->ce->name), ZSTR_VAL(name));
+			}
+			return &EG(error_zval);
 		}
 
 		ZEND_ASSERT(prop && ZEND_TYPE_IS_SET(prop->type));
@@ -714,15 +717,17 @@ static zend_object *dom_object_namespace_node_clone_obj(zend_object *zobject)
 	zend_object *clone = dom_objects_namespace_node_new(intern->dom.std.ce);
 	dom_object_namespace_node *clone_intern = php_dom_namespace_node_obj_from_obj(clone);
 
-	xmlNodePtr original_node = dom_object_get_node(&intern->dom);
-	ZEND_ASSERT(original_node->type == XML_NAMESPACE_DECL);
-	xmlNodePtr cloned_node = php_dom_create_fake_namespace_decl_node_ptr(original_node->parent, original_node->ns);
-
 	if (intern->parent_intern) {
 		clone_intern->parent_intern = intern->parent_intern;
 		GC_ADDREF(&clone_intern->parent_intern->std);
 	}
-	dom_update_refcount_after_clone(&intern->dom, original_node, &clone_intern->dom, cloned_node);
+
+	xmlNodePtr original_node = dom_object_get_node(&intern->dom);
+	if (original_node != NULL) {
+		ZEND_ASSERT(original_node->type == XML_NAMESPACE_DECL);
+		xmlNodePtr cloned_node = php_dom_create_fake_namespace_decl_node_ptr(original_node->parent, original_node->ns);
+		dom_update_refcount_after_clone(&intern->dom, original_node, &clone_intern->dom, cloned_node);
+	}
 
 	zend_objects_clone_members(clone, &intern->dom.std);
 	return clone;
@@ -787,7 +792,7 @@ HashTable *dom_xpath_get_gc(zend_object *object, zval **table, int *n);
 PHP_MINIT_FUNCTION(dom)
 {
 	memcpy(&dom_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-	dom_object_handlers.offset = XtOffsetOf(dom_object, std);
+	dom_object_handlers.offset = offsetof(dom_object, std);
 	dom_object_handlers.free_obj = dom_objects_free_storage;
 	dom_object_handlers.read_property = dom_read_property;
 	dom_object_handlers.write_property = dom_write_property;
@@ -832,12 +837,12 @@ PHP_MINIT_FUNCTION(dom)
 	dom_html_collection_object_handlers.get_gc = dom_html_collection_get_gc;
 
 	memcpy(&dom_object_namespace_node_handlers, &dom_object_handlers, sizeof(zend_object_handlers));
-	dom_object_namespace_node_handlers.offset = XtOffsetOf(dom_object_namespace_node, dom.std);
+	dom_object_namespace_node_handlers.offset = offsetof(dom_object_namespace_node, dom.std);
 	dom_object_namespace_node_handlers.free_obj = dom_object_namespace_node_free_storage;
 	dom_object_namespace_node_handlers.clone_obj = dom_object_namespace_node_clone_obj;
 
 	memcpy(&dom_token_list_object_handlers, &dom_object_handlers, sizeof(zend_object_handlers));
-	dom_token_list_object_handlers.offset = XtOffsetOf(dom_token_list_object, dom.std);
+	dom_token_list_object_handlers.offset = offsetof(dom_token_list_object, dom.std);
 	dom_token_list_object_handlers.free_obj = dom_token_list_free_obj;
 	/* The Web IDL (Web Interface Description Language - https://webidl.spec.whatwg.org) has the [SameObject] constraint
 	 * for this object, which is incompatible with cloning because it imposes that there is only one instance
@@ -897,12 +902,12 @@ PHP_MINIT_FUNCTION(dom)
 	zend_hash_init(&dom_modern_node_prop_handlers, 0, NULL, NULL, true);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "nodeType", dom_node_node_type_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "nodeName", dom_node_node_name_read, NULL);
-	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "baseURI", dom_node_base_uri_read, NULL);
+	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "baseURI", dom_modern_node_base_uri_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "isConnected", dom_node_is_connected_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "ownerDocument", dom_node_owner_document_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "parentNode", dom_node_parent_node_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "parentElement", dom_node_parent_element_read, NULL);
-	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "childNodes", dom_node_child_nodes_read, NULL);
+	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "childNodes", dom_modern_node_child_nodes_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "firstChild", dom_node_first_child_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "lastChild", dom_node_last_child_read, NULL);
 	DOM_REGISTER_PROP_HANDLER(&dom_modern_node_prop_handlers, "previousSibling", dom_node_previous_sibling_read, NULL);
@@ -1303,7 +1308,7 @@ PHP_MINIT_FUNCTION(dom)
 	DOM_OVERWRITE_PROP_HANDLER(&dom_modern_entity_reference_prop_handlers, "firstChild", dom_entity_reference_child_read, NULL);
 	DOM_OVERWRITE_PROP_HANDLER(&dom_modern_entity_reference_prop_handlers, "lastChild", dom_entity_reference_child_read, NULL);
 	DOM_OVERWRITE_PROP_HANDLER(&dom_modern_entity_reference_prop_handlers, "textContent", dom_entity_reference_text_content_read, NULL);
-	DOM_OVERWRITE_PROP_HANDLER(&dom_modern_entity_reference_prop_handlers, "childNodes", dom_entity_reference_child_nodes_read, NULL);
+	DOM_OVERWRITE_PROP_HANDLER(&dom_modern_entity_reference_prop_handlers, "childNodes", dom_modern_entity_reference_child_nodes_read, NULL);
 	zend_hash_add_new_ptr(&classes, dom_modern_entityreference_class_entry->name, &dom_modern_entity_reference_prop_handlers);
 
 	dom_processinginstruction_class_entry = register_class_DOMProcessingInstruction(dom_node_class_entry);
@@ -1328,7 +1333,7 @@ PHP_MINIT_FUNCTION(dom)
 
 #ifdef LIBXML_XPATH_ENABLED
 	memcpy(&dom_xpath_object_handlers, &dom_object_handlers, sizeof(zend_object_handlers));
-	dom_xpath_object_handlers.offset = XtOffsetOf(dom_xpath_object, dom) + XtOffsetOf(dom_object, std);
+	dom_xpath_object_handlers.offset = offsetof(dom_xpath_object, dom) + offsetof(dom_object, std);
 	dom_xpath_object_handlers.free_obj = dom_xpath_objects_free_storage;
 	dom_xpath_object_handlers.get_gc = dom_xpath_get_gc;
 	dom_xpath_object_handlers.clone_obj = NULL;
@@ -1481,7 +1486,13 @@ void dom_objects_free_storage(zend_object *object)
 	if (ptr != NULL && ptr->node != NULL) {
 		xmlNodePtr node = ptr->node;
 
-		if (node->type != XML_DOCUMENT_NODE && node->type != XML_HTML_DOCUMENT_NODE) {
+		if (node->type == XML_NOTATION_NODE) {
+			unsigned int refcount = php_libxml_decrement_node_ptr((php_libxml_node_object *) intern);
+			php_libxml_decrement_doc_ref((php_libxml_node_object *) intern);
+			if (refcount == 0) {
+				dom_free_notation((xmlEntityPtr) node);
+			}
+		} else if (node->type != XML_DOCUMENT_NODE && node->type != XML_HTML_DOCUMENT_NODE) {
 			php_libxml_node_decrement_resource((php_libxml_node_object *) intern);
 		} else {
 			php_libxml_decrement_node_ptr((php_libxml_node_object *) intern);
@@ -1494,7 +1505,7 @@ void dom_objects_free_storage(zend_object *object)
 
 static void dom_objects_set_class_ex(zend_class_entry *class_type, dom_object *intern)
 {
-	zend_class_entry *base_class = class_type;
+	const zend_class_entry *base_class = class_type;
 	while ((base_class->type != ZEND_INTERNAL_CLASS || base_class->info.internal.module->module_number != dom_module_entry.module_number) && base_class->parent != NULL) {
 		base_class = base_class->parent;
 	}
@@ -1559,7 +1570,7 @@ zend_object *dom_xpath_objects_new(zend_class_entry *class_type)
 
 /* The char pointer MUST refer to the char* of a zend_string struct */
 static void dom_zend_string_release_from_char_pointer(xmlChar *ptr) {
-	zend_string_release((zend_string*) (ptr - XtOffsetOf(zend_string, val)));
+	zend_string_release((zend_string*) (ptr - offsetof(zend_string, val)));
 }
 
 void dom_nnodemap_objects_free_storage(zend_object *object) /* {{{ */
@@ -2265,7 +2276,7 @@ static bool dom_nodemap_or_nodelist_process_offset_as_named(zval *offset, zend_l
 		if (0 == (is_numeric_string_type = is_numeric_string(Z_STRVAL_P(offset), Z_STRLEN_P(offset), lval, &dval, true))) {
 			return true;
 		} else if (is_numeric_string_type == IS_DOUBLE) {
-			*lval = zend_dval_to_lval_cap(dval, Z_STR_P(offset));
+			*lval = zend_dval_to_lval_cap(dval);
 		}
 	} else {
 		*lval = zval_get_long(offset);

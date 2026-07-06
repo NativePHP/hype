@@ -3,15 +3,14 @@
    +----------------------------------------------------------------------+
    | Zend Engine                                                          |
    +----------------------------------------------------------------------+
-   | Copyright (c) Zend Technologies Ltd. (http://www.zend.com)           |
+   | Copyright © Zend Technologies Ltd., a subsidiary company of          |
+   |     Perforce Software, Inc., and Contributors.                       |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 2.00 of the Zend license,     |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | http://www.zend.com/license/2_00.txt.                                |
-   | If you did not receive a copy of the Zend license and are unable to  |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@zend.com so we can mail you a copy immediately.              |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Andi Gutmans <andi@php.net>                                 |
    |          Zeev Suraski <zeev@php.net>                                 |
@@ -379,7 +378,7 @@ attribute_group:
 ;
 
 attribute:
-		T_ATTRIBUTE attribute_group possible_comma ']'	{ $$ = $2; }
+		T_ATTRIBUTE backup_doc_comment attribute_group possible_comma ']'	{ $$ = $3; CG(doc_comment) = $2; }
 ;
 
 attributes:
@@ -821,9 +820,9 @@ parameter:
 			{ $$ = zend_ast_create_ex(ZEND_AST_PARAM, $1 | $3 | $4, $2, $5, NULL,
 					NULL, $6 ? zend_ast_create_zval_from_str($6) : NULL, $7); }
 	|	optional_cpp_modifiers optional_type_without_static
-		is_reference is_variadic T_VARIABLE backup_doc_comment '=' expr optional_property_hook_list
-			{ $$ = zend_ast_create_ex(ZEND_AST_PARAM, $1 | $3 | $4, $2, $5, $8,
-					NULL, $6 ? zend_ast_create_zval_from_str($6) : NULL, $9); }
+		is_reference is_variadic T_VARIABLE '=' expr backup_doc_comment optional_property_hook_list
+			{ $$ = zend_ast_create_ex(ZEND_AST_PARAM, $1 | $3 | $4, $2, $5, $7,
+					NULL, $8 ? zend_ast_create_zval_from_str($8) : NULL, $9); }
 ;
 
 optional_type_without_static:
@@ -901,16 +900,15 @@ return_type:
 ;
 
 argument_list:
-		'(' ')'	{ $$ = zend_ast_create_list(0, ZEND_AST_ARG_LIST); }
+		'(' ')'	{ $$ = zend_ast_create_arg_list(0, ZEND_AST_ARG_LIST); }
 	|	'(' non_empty_argument_list possible_comma ')' { $$ = $2; }
-	|	'(' T_ELLIPSIS ')' { $$ = zend_ast_create_fcc(); }
 ;
 
 non_empty_argument_list:
 		argument
-			{ $$ = zend_ast_create_list(1, ZEND_AST_ARG_LIST, $1); }
+			{ $$ = zend_ast_create_arg_list(1, ZEND_AST_ARG_LIST, $1); }
 	|	non_empty_argument_list ',' argument
-			{ $$ = zend_ast_list_add($1, $3); }
+			{ $$ = zend_ast_arg_list_add($1, $3); }
 ;
 
 /* `clone_argument_list` is necessary to resolve a parser ambiguity (shift-reduce conflict)
@@ -923,25 +921,31 @@ non_empty_argument_list:
  * syntax.
  */
 clone_argument_list:
-		'(' ')'	{ $$ = zend_ast_create_list(0, ZEND_AST_ARG_LIST); }
+		'(' ')'	{ $$ = zend_ast_create_arg_list(0, ZEND_AST_ARG_LIST); }
 	|	'(' non_empty_clone_argument_list possible_comma ')' { $$ = $2; }
-	|	'(' expr ',' ')' { $$ = zend_ast_create_list(1, ZEND_AST_ARG_LIST, $2); }
-	|	'(' T_ELLIPSIS ')' { $$ = zend_ast_create_fcc(); }
+	|	'(' expr ',' ')' { $$ = zend_ast_create_arg_list(1, ZEND_AST_ARG_LIST, $2); }
 ;
 
 non_empty_clone_argument_list:
 		expr ',' argument
-			{ $$ = zend_ast_create_list(2, ZEND_AST_ARG_LIST, $1, $3); }
+			{ $$ = zend_ast_create_arg_list(2, ZEND_AST_ARG_LIST, $1, $3); }
 	|	argument_no_expr
-			{ $$ = zend_ast_create_list(1, ZEND_AST_ARG_LIST, $1); }
+			{ $$ = zend_ast_create_arg_list(1, ZEND_AST_ARG_LIST, $1); }
 	|	non_empty_clone_argument_list ',' argument
-			{ $$ = zend_ast_list_add($1, $3); }
+			{ $$ = zend_ast_arg_list_add($1, $3); }
 ;
 
 argument_no_expr:
 		identifier ':' expr
 			{ $$ = zend_ast_create(ZEND_AST_NAMED_ARG, $1, $3); }
-	|	T_ELLIPSIS expr	{ $$ = zend_ast_create(ZEND_AST_UNPACK, $2); }
+	|	T_ELLIPSIS
+			{ $$ = zend_ast_create_ex(ZEND_AST_PLACEHOLDER_ARG, ZEND_PLACEHOLDER_VARIADIC); }
+	|	'?'
+			{ $$ = zend_ast_create(ZEND_AST_PLACEHOLDER_ARG); }
+	|	identifier ':' '?'
+			{ $$ = zend_ast_create(ZEND_AST_NAMED_ARG, $1, zend_ast_create(ZEND_AST_PLACEHOLDER_ARG)); }
+	|	T_ELLIPSIS expr
+			{ $$ = zend_ast_create(ZEND_AST_UNPACK, $2); }
 ;
 
 argument:
@@ -1054,13 +1058,13 @@ trait_alias:
 
 trait_method_reference:
 		identifier
-			{ $$ = zend_ast_create(ZEND_AST_METHOD_REFERENCE, NULL, $1); }
+			{ $$ = zend_ast_create(ZEND_AST_TRAIT_METHOD_REFERENCE, NULL, $1); }
 	|	absolute_trait_method_reference { $$ = $1; }
 ;
 
 absolute_trait_method_reference:
 	class_name T_PAAMAYIM_NEKUDOTAYIM identifier
-		{ $$ = zend_ast_create(ZEND_AST_METHOD_REFERENCE, $1, $3); }
+		{ $$ = zend_ast_create(ZEND_AST_TRAIT_METHOD_REFERENCE, $1, $3); }
 ;
 
 method_body:

@@ -26,6 +26,7 @@ const PHP_82_VERSION_ID = 80200;
 const PHP_83_VERSION_ID = 80300;
 const PHP_84_VERSION_ID = 80400;
 const PHP_85_VERSION_ID = 80500;
+const PHP_86_VERSION_ID = 80600;
 const ALL_PHP_VERSION_IDS = [
     PHP_70_VERSION_ID,
     PHP_80_VERSION_ID,
@@ -34,6 +35,7 @@ const ALL_PHP_VERSION_IDS = [
     PHP_83_VERSION_ID,
     PHP_84_VERSION_ID,
     PHP_85_VERSION_ID,
+    PHP_86_VERSION_ID,
 ];
 
 // file_put_contents() but with a success message printed after saving
@@ -41,6 +43,35 @@ function reportFilePutContents(string $filename, string $content): void {
     if (file_put_contents($filename, $content)) {
         echo "Saved $filename\n";
     }
+}
+
+if (!function_exists('array_any')) {
+    function array_any(array $array, callable $callback): bool {
+        foreach ($array as $key => $value) {
+            if ($callback($value, $key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+if (function_exists('clone')) {
+    // Replace (\clone)(...) with \clone(...) once the minimally
+    // supported PHP version is 8.5.
+    define('clone', \clone(...));
+} else {
+    define(
+        'clone',
+        /**
+         * @template T
+         * @param T $o
+         * @return T
+         */
+        function (object $o): object {
+            return clone $o;
+        }
+    );
 }
 
 /**
@@ -54,7 +85,7 @@ function processDirectory(string $dir, Context $context): array {
     );
     foreach ($it as $file) {
         $pathName = $file->getPathName();
-        if (substr($pathName, -9) === '.stub.php') {
+        if (str_ends_with($pathName, '.stub.php')) {
             $pathNames[] = $pathName;
         }
     }
@@ -82,11 +113,22 @@ function processStubFile(string $stubFile, Context $context, bool $includeOnly =
             $stubFilenameWithoutExtension = str_replace(".stub.php", "", $stubFile);
             $arginfoFile = "{$stubFilenameWithoutExtension}_arginfo.h";
             $legacyFile = "{$stubFilenameWithoutExtension}_legacy_arginfo.h";
+            $declFile = "{$stubFilenameWithoutExtension}_decl.h";
 
+            /* Check if the stub file changed, by checking that the hash stored
+             * in the generated arginfo.h matches.
+             * Also check that the decl.h file has the same hash. At this point
+             * we don't know if a decl.h file is supposed to exist, so extract
+             * this information (whether a decl file should exist) from the
+             * arginfo.h file. */
             $stubCode = file_get_contents($stubFile);
             $stubHash = sha1(str_replace("\r\n", "\n", $stubCode));
             $oldStubHash = extractStubHash($arginfoFile);
-            if ($stubHash === $oldStubHash && !$context->forceParse) {
+            $hasDeclHeader = extractHasDeclHeader($arginfoFile);
+            $oldStubHashDecl = extractStubHash($declFile);
+            $generatedFilesUpToDate = $stubHash === $oldStubHash
+                    && ($hasDeclHeader ? $stubHash === $oldStubHashDecl : $oldStubHashDecl === null);
+            if ($generatedFilesUpToDate && !$context->forceParse) {
                 /* Stub file did not change, do not regenerate. */
                 return null;
             }
@@ -122,26 +164,29 @@ function processStubFile(string $stubFile, Context $context, bool $includeOnly =
             return $fileInfo;
         }
 
-        $arginfoCode = generateArgInfoCode(
+        [$arginfoCode, $declCode] = $fileInfo->generateArgInfoCode(
             basename($stubFilenameWithoutExtension),
-            $fileInfo,
             $context->allConstInfos,
             $stubHash
         );
-        if ($context->forceRegeneration || $stubHash !== $oldStubHash) {
+        if ($context->forceRegeneration || !$generatedFilesUpToDate) {
             reportFilePutContents($arginfoFile, $arginfoCode);
+            if ($declCode !== '') {
+                reportFilePutContents($declFile, $declCode);
+            } else if (file_exists($declFile)) {
+                unlink($declFile);
+            }
         }
 
         if ($fileInfo->shouldGenerateLegacyArginfo()) {
             $legacyFileInfo = $fileInfo->getLegacyVersion();
 
-            $arginfoCode = generateArgInfoCode(
+            [$arginfoCode] = $legacyFileInfo->generateArgInfoCode(
                 basename($stubFilenameWithoutExtension),
-                $legacyFileInfo,
                 $context->allConstInfos,
                 $stubHash
             );
-            if ($context->forceRegeneration || $stubHash !== $oldStubHash) {
+            if ($context->forceRegeneration || !$generatedFilesUpToDate) {
                 reportFilePutContents($legacyFile, $arginfoCode);
             }
         }
@@ -159,11 +204,20 @@ function extractStubHash(string $arginfoFile): ?string {
     }
 
     $arginfoCode = file_get_contents($arginfoFile);
-    if (!preg_match('/\* Stub hash: ([0-9a-f]+) \*/', $arginfoCode, $matches)) {
+    if (!preg_match('/\* Stub hash: ([0-9a-f]+)/', $arginfoCode, $matches)) {
         return null;
     }
 
     return $matches[1];
+}
+
+function extractHasDeclHeader(string $arginfoFile): bool {
+    if (!file_exists($arginfoFile)) {
+        return false;
+    }
+
+    $arginfoCode = file_get_contents($arginfoFile);
+    return str_contains($arginfoCode, '* Has decl header: yes *');
 }
 
 class Context {
@@ -176,20 +230,17 @@ class Context {
 }
 
 class ArrayType extends SimpleType {
-    private /* readonly */ Type $keyType;
-    private /* readonly */ Type $valueType;
+
+    public function __construct(
+        private readonly Type $keyType,
+        private readonly Type $valueType,
+    ) {
+        parent::__construct("array", true);
+    }
 
     public static function createGenericArray(): self
     {
         return new ArrayType(Type::fromString("int|string"), Type::fromString("mixed|ref"));
-    }
-
-    public function __construct(Type $keyType, Type $valueType)
-    {
-        parent::__construct("array", true);
-
-        $this->keyType = $keyType;
-        $this->valueType = $valueType;
     }
 
     public function toOptimizerTypeMask(): string {
@@ -215,8 +266,11 @@ class ArrayType extends SimpleType {
 }
 
 class SimpleType {
-    public /* readonly */ string $name;
-    public /* readonly */ bool $isBuiltin;
+
+    protected function __construct(
+        public readonly string $name,
+        public readonly bool $isBuiltin,
+    ) {}
 
     public static function fromNode(Node $node): SimpleType {
         if ($node instanceof Node\Name) {
@@ -295,34 +349,21 @@ class SimpleType {
      */
     public static function fromValue($value): SimpleType
     {
-        switch (gettype($value)) {
-            case "NULL":
-                return SimpleType::null();
-            case "boolean":
-                return new SimpleType("bool", true);
-            case "integer":
-                return new SimpleType("int", true);
-            case "double":
-                return new SimpleType("float", true);
-            case "string":
-                return new SimpleType("string", true);
-            case "array":
-                return new SimpleType("array", true);
-            case "object":
-                return new SimpleType("object", true);
-            default:
-                throw new Exception("Type \"" . gettype($value) . "\" cannot be inferred based on value");
-        }
+        return match (gettype($value)) {
+            "NULL" => SimpleType::null(),
+            "boolean" => new SimpleType("bool", true),
+            "integer" => new SimpleType("int", true),
+            "double" => new SimpleType("float", true),
+            "string" => new SimpleType("string", true),
+            "array" => new SimpleType("array", true),
+            "object" => new SimpleType("object", true),
+            default => throw new Exception("Type \"" . gettype($value) . "\" cannot be inferred based on value"),
+        };
     }
 
     public static function null(): SimpleType
     {
         return new SimpleType("null", true);
-    }
-
-    protected function __construct(string $name, bool $isBuiltin) {
-        $this->name = $name;
-        $this->isBuiltin = $isBuiltin;
     }
 
     public function isScalar(): bool {
@@ -360,38 +401,23 @@ class SimpleType {
     private function toTypeInfo(): array {
         assert($this->isBuiltin);
 
-        switch ($this->name) {
-            case "null":
-                return ["IS_NULL", "MAY_BE_NULL"];
-            case "false":
-                return ["IS_FALSE", "MAY_BE_FALSE"];
-            case "true":
-                return ["IS_TRUE", "MAY_BE_TRUE"];
-            case "bool":
-                return ["_IS_BOOL", "MAY_BE_BOOL"];
-            case "int":
-                return ["IS_LONG", "MAY_BE_LONG"];
-            case "float":
-                return ["IS_DOUBLE", "MAY_BE_DOUBLE"];
-            case "string":
-                return ["IS_STRING", "MAY_BE_STRING"];
-            case "array":
-                return ["IS_ARRAY", "MAY_BE_ARRAY"];
-            case "object":
-                return ["IS_OBJECT", "MAY_BE_OBJECT"];
-            case "callable":
-                return ["IS_CALLABLE", "MAY_BE_CALLABLE"];
-            case "mixed":
-                return ["IS_MIXED", "MAY_BE_ANY"];
-            case "void":
-                return ["IS_VOID", "MAY_BE_VOID"];
-            case "static":
-                return ["IS_STATIC", "MAY_BE_STATIC"];
-            case "never":
-                return ["IS_NEVER", "MAY_BE_NEVER"];
-            default:
-                throw new Exception("Not implemented: $this->name");
-        }
+        return match ($this->name) {
+            "null" => ["IS_NULL", "MAY_BE_NULL"],
+            "false" => ["IS_FALSE", "MAY_BE_FALSE"],
+            "true" => ["IS_TRUE", "MAY_BE_TRUE"],
+            "bool" => ["_IS_BOOL", "MAY_BE_BOOL"],
+            "int" => ["IS_LONG", "MAY_BE_LONG"],
+            "float" => ["IS_DOUBLE", "MAY_BE_DOUBLE"],
+            "string" => ["IS_STRING", "MAY_BE_STRING"],
+            "array" => ["IS_ARRAY", "MAY_BE_ARRAY"],
+            "object" => ["IS_OBJECT", "MAY_BE_OBJECT"],
+            "callable" => ["IS_CALLABLE", "MAY_BE_CALLABLE"],
+            "mixed" => ["IS_MIXED", "MAY_BE_ANY"],
+            "void" => ["IS_VOID", "MAY_BE_VOID"],
+            "static" => ["IS_STATIC", "MAY_BE_STATIC"],
+            "never" => ["IS_NEVER", "MAY_BE_NEVER"],
+            default => throw new Exception("Not implemented: $this->name"),
+        };
     }
 
     public function toTypeCode(): string {
@@ -405,14 +431,11 @@ class SimpleType {
     public function toOptimizerTypeMaskForArrayKey(): string {
         assert($this->isBuiltin);
 
-        switch ($this->name) {
-            case "int":
-                return "MAY_BE_ARRAY_KEY_LONG";
-            case "string":
-                return "MAY_BE_ARRAY_KEY_STRING";
-            default:
-                throw new Exception("Type $this->name cannot be an array key");
-        }
+        return match ($this->name) {
+            "int" => "MAY_BE_ARRAY_KEY_LONG",
+            "string" => "MAY_BE_ARRAY_KEY_STRING",
+            default => throw new Exception("Type $this->name cannot be an array key"),
+        };
     }
 
     public function toOptimizerTypeMaskForArrayValue(): string {
@@ -420,34 +443,21 @@ class SimpleType {
             return "MAY_BE_ARRAY_OF_OBJECT";
         }
 
-        switch ($this->name) {
-            case "null":
-                return "MAY_BE_ARRAY_OF_NULL";
-            case "false":
-                return "MAY_BE_ARRAY_OF_FALSE";
-            case "true":
-                return "MAY_BE_ARRAY_OF_TRUE";
-            case "bool":
-                return "MAY_BE_ARRAY_OF_FALSE|MAY_BE_ARRAY_OF_TRUE";
-            case "int":
-                return "MAY_BE_ARRAY_OF_LONG";
-            case "float":
-                return "MAY_BE_ARRAY_OF_DOUBLE";
-            case "string":
-                return "MAY_BE_ARRAY_OF_STRING";
-            case "array":
-                return "MAY_BE_ARRAY_OF_ARRAY";
-            case "object":
-                return "MAY_BE_ARRAY_OF_OBJECT";
-            case "resource":
-                return "MAY_BE_ARRAY_OF_RESOURCE";
-            case "mixed":
-                return "MAY_BE_ARRAY_OF_ANY";
-            case "ref":
-                return "MAY_BE_ARRAY_OF_REF";
-            default:
-                throw new Exception("Type $this->name cannot be an array value");
-        }
+        return match ($this->name) {
+            "null" => "MAY_BE_ARRAY_OF_NULL",
+            "false" => "MAY_BE_ARRAY_OF_FALSE",
+            "true" => "MAY_BE_ARRAY_OF_TRUE",
+            "bool" => "MAY_BE_ARRAY_OF_FALSE|MAY_BE_ARRAY_OF_TRUE",
+            "int" => "MAY_BE_ARRAY_OF_LONG",
+            "float" => "MAY_BE_ARRAY_OF_DOUBLE",
+            "string" => "MAY_BE_ARRAY_OF_STRING",
+            "array" => "MAY_BE_ARRAY_OF_ARRAY",
+            "object" => "MAY_BE_ARRAY_OF_OBJECT",
+            "resource" => "MAY_BE_ARRAY_OF_RESOURCE",
+            "mixed" => "MAY_BE_ARRAY_OF_ANY",
+            "ref" => "MAY_BE_ARRAY_OF_REF",
+            default => throw new Exception("Type $this->name cannot be an array value"),
+        };
     }
 
     public function toOptimizerTypeMask(): string {
@@ -455,18 +465,13 @@ class SimpleType {
             return "MAY_BE_OBJECT";
         }
 
-        switch ($this->name) {
-            case "resource":
-                return "MAY_BE_RESOURCE";
-            case "callable":
-                return "MAY_BE_STRING|MAY_BE_ARRAY|MAY_BE_ARRAY_KEY_LONG|MAY_BE_ARRAY_OF_STRING|MAY_BE_ARRAY_OF_OBJECT|MAY_BE_OBJECT";
-            case "iterable":
-                return "MAY_BE_ARRAY|MAY_BE_ARRAY_KEY_ANY|MAY_BE_ARRAY_OF_ANY|MAY_BE_OBJECT";
-            case "mixed":
-                return "MAY_BE_ANY|MAY_BE_ARRAY_KEY_ANY|MAY_BE_ARRAY_OF_ANY";
-        }
-
-        return $this->toTypeMask();
+        return match ($this->name) {
+            "resource" => "MAY_BE_RESOURCE",
+            "callable" => "MAY_BE_STRING|MAY_BE_ARRAY|MAY_BE_ARRAY_KEY_LONG|MAY_BE_ARRAY_OF_STRING|MAY_BE_ARRAY_OF_OBJECT|MAY_BE_OBJECT",
+            "iterable" => "MAY_BE_ARRAY|MAY_BE_ARRAY_KEY_ANY|MAY_BE_ARRAY_OF_ANY|MAY_BE_OBJECT",
+            "mixed" => "MAY_BE_ANY|MAY_BE_ARRAY_KEY_ANY|MAY_BE_ARRAY_OF_ANY",
+            default => $this->toTypeMask(),
+        };
     }
 
     public function toEscapedName(): string {
@@ -490,13 +495,18 @@ class SimpleType {
 // Instances of Type are immutable and do not need to be cloned
 // when held by an object that is cloned
 class Type {
-    /** @var SimpleType[] */
-    public /* readonly */ array $types;
-    public /* readonly */ bool $isIntersection;
+
+    /**
+     * @param SimpleType[] $types
+     */
+    private function __construct(
+        public readonly array $types,
+        public readonly bool $isIntersection
+    ) {}
 
     public static function fromNode(Node $node): Type {
         if ($node instanceof Node\UnionType || $node instanceof Node\IntersectionType) {
-            $nestedTypeObjects = array_map(['Type', 'fromNode'], $node->types);
+            $nestedTypeObjects = array_map(Type::fromNode(...), $node->types);
             $types = [];
             foreach ($nestedTypeObjects as $typeObject) {
                 array_push($types, ...$typeObject->types);
@@ -565,32 +575,12 @@ class Type {
         return new Type($simpleTypes, $isIntersection);
     }
 
-    /**
-     * @param SimpleType[] $types
-     */
-    private function __construct(array $types, bool $isIntersection) {
-        $this->types = $types;
-        $this->isIntersection = $isIntersection;
-    }
-
     public function isScalar(): bool {
-        foreach ($this->types as $type) {
-            if (!$type->isScalar()) {
-                return false;
-            }
-        }
-
-        return true;
+        return !array_any($this->types, static fn (SimpleType $type): bool => !$type->isScalar());
     }
 
     public function isNullable(): bool {
-        foreach ($this->types as $type) {
-            if ($type->isNull()) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any($this->types, static fn (SimpleType $type): bool => $type->isNull());
     }
 
     public function tryToSimpleType(): ?SimpleType {
@@ -700,19 +690,15 @@ class Type {
 }
 
 class ArginfoType {
-    /** @var SimpleType[] $classTypes */
-    public /* readonly */ array $classTypes;
-    /** @var SimpleType[] $builtinTypes */
-    private /* readonly */ array $builtinTypes;
 
     /**
      * @param SimpleType[] $classTypes
      * @param SimpleType[] $builtinTypes
      */
-    public function __construct(array $classTypes, array $builtinTypes) {
-        $this->classTypes = $classTypes;
-        $this->builtinTypes = $builtinTypes;
-    }
+    public function __construct(
+        public readonly array $classTypes,
+        private readonly array $builtinTypes,
+    ) {}
 
     public function hasClassType(): bool {
         return !empty($this->classTypes);
@@ -739,35 +725,18 @@ class ArgInfo {
     public const SEND_BY_REF = "1";
     public const SEND_PREFER_REF = "ZEND_SEND_PREFER_REF";
 
-    public /* readonly */ string $name;
-    public /* readonly */ string $sendBy;
-    public /* readonly */ bool $isVariadic;
-    public ?Type $type;
-    private /* readonly */ ?Type $phpDocType;
-    public ?string $defaultValue;
-    /** @var AttributeInfo[] */
-    public array $attributes;
-
     /**
      * @param AttributeInfo[] $attributes
      */
     public function __construct(
-        string $name,
-        string $sendBy,
-        bool $isVariadic,
-        ?Type $type,
-        ?Type $phpDocType,
-        ?string $defaultValue,
-        array $attributes
-    ) {
-        $this->name = $name;
-        $this->sendBy = $sendBy;
-        $this->isVariadic = $isVariadic;
-        $this->type = $type;
-        $this->phpDocType = $phpDocType;
-        $this->defaultValue = $defaultValue;
-        $this->attributes = $attributes;
-    }
+        public readonly string $name,
+        public readonly string $sendBy,
+        public readonly bool $isVariadic,
+        public ?Type $type,
+        private readonly ?Type $phpDocType,
+        public ?string $defaultValue,
+        public array $attributes,
+    ) {}
 
     public function equals(ArgInfo $other): bool {
         return $this->name === $other->name
@@ -802,16 +771,11 @@ class ArgInfo {
     }
 
     public function getDefaultValueAsMethodSynopsisString(): ?string {
-        switch ($this->defaultValue) {
-            case 'UNKNOWN':
-                return null;
-            case 'false':
-            case 'true':
-            case 'null':
-                return "&{$this->defaultValue};";
-        }
-
-        return $this->defaultValue;
+        return match ($this->defaultValue) {
+            'UNKNOWN' => null,
+            'false' | 'true' | 'null' => "&{$this->defaultValue};",
+            default => $this->defaultValue,
+        };
     }
 
     public function toZendInfo(): string {
@@ -873,7 +837,7 @@ abstract class AbstractConstName implements VariableLikeName
 }
 
 class ConstName extends AbstractConstName {
-    private /* readonly */ string $const;
+    private readonly string $const;
 
     public function __construct(?Name $namespace, string $const)
     {
@@ -904,14 +868,11 @@ class ConstName extends AbstractConstName {
 }
 
 class ClassConstName extends AbstractConstName {
-    public /* readonly */ Name $class;
-    private /* readonly */ string $const;
 
-    public function __construct(Name $class, string $const)
-    {
-        $this->class = $class;
-        $this->const = $const;
-    }
+    public function __construct(
+        public readonly Name $class,
+        private readonly string $const,
+    ) {}
 
     public function __toString(): string
     {
@@ -925,14 +886,11 @@ class ClassConstName extends AbstractConstName {
 }
 
 class PropertyName implements VariableLikeName {
-    public /* readonly */ Name $class;
-    private /* readonly */ string $property;
 
-    public function __construct(Name $class, string $property)
-    {
-        $this->class = $class;
-        $this->property = $property;
-    }
+    public function __construct(
+        public readonly Name $class,
+        private readonly string $property
+    ) {}
 
     public function __toString(): string
     {
@@ -942,6 +900,19 @@ class PropertyName implements VariableLikeName {
     public function getDeclarationName(): string
     {
         return $this->property;
+    }
+}
+
+class EnumCaseName {
+    public function __construct(
+        public readonly Name $enum,
+        public readonly string $case
+    ) {
+    }
+
+    public function __toString(): string
+    {
+        return "$this->enum::$this->case";
     }
 }
 
@@ -956,11 +927,10 @@ interface FunctionOrMethodName {
 }
 
 class FunctionName implements FunctionOrMethodName {
-    private /* readonly */ Name $name;
 
-    public function __construct(Name $name) {
-        $this->name = $name;
-    }
+    public function __construct(
+        private readonly Name $name,
+    ) {}
 
     public function getNamespace(): ?string {
         if ($this->name->isQualified()) {
@@ -1020,13 +990,11 @@ class FunctionName implements FunctionOrMethodName {
 }
 
 class MethodName implements FunctionOrMethodName {
-    public /* readonly */ Name $className;
-    public /* readonly */ string $methodName;
 
-    public function __construct(Name $className, string $methodName) {
-        $this->className = $className;
-        $this->methodName = $methodName;
-    }
+    public function __construct(
+        public readonly Name $className,
+        public readonly string $methodName,
+    ) {}
 
     public function getDeclarationClassName(): string {
         return implode('_', $this->className->getParts());
@@ -1074,18 +1042,16 @@ class ReturnInfo {
         self::REFCOUNT_N,
     ];
 
-    private /* readonly */ bool $byRef;
-    // NOT readonly - gets removed when discarding info for older PHP versions
-    public ?Type $type;
-    public /* readonly */ ?Type $phpDocType;
-    public /* readonly */ bool $tentativeReturnType;
-    public /* readonly */ string $refcount;
+    public readonly string $refcount;
 
-    public function __construct(bool $byRef, ?Type $type, ?Type $phpDocType, bool $tentativeReturnType, ?string $refcount) {
-        $this->byRef = $byRef;
-        $this->type = $type;
-        $this->phpDocType = $phpDocType;
-        $this->tentativeReturnType = $tentativeReturnType;
+    public function __construct(
+        private readonly bool $byRef,
+        // NOT readonly - gets removed when discarding info for older PHP versions
+        public ?Type $type,
+        public readonly ?Type $phpDocType,
+        public readonly bool $tentativeReturnType,
+        ?string $refcount
+    ) {
         $this->setRefcount($refcount);
     }
 
@@ -1212,12 +1178,36 @@ class VersionFlags {
     }
 
     public function isEmpty(): bool {
-        foreach (ALL_PHP_VERSION_IDS as $version) {
-            if ($this->flagsByVersion[$version] !== []) {
-                return false;
+        return !array_any(
+            ALL_PHP_VERSION_IDS,
+            fn (int $version): bool => $this->flagsByVersion[$version] !== []
+        );
+    }
+
+    /**
+     * If we have ZEND_ACC2_ flags, represent as 'ZEND_FENTRY_FLAGS(flags1, flags2)'.
+     * Otherwise, represent as just 'flags1' (backwards compatible).
+     */
+    private function formatFlags(array $flags): string {
+        $flags1 = [];
+        $flags2 = [];
+        foreach ($flags as $flag) {
+            if (str_starts_with($flag, 'ZEND_ACC2_')) {
+                $flags2[] = $flag;
+            } else {
+                $flags1[] = $flag;
             }
         }
-        return true;
+
+        if ($flags2 !== []) {
+            return sprintf(
+                'ZEND_FENTRY_FLAGS(%s, %s)',
+                $flags1 === [] ? 0 : implode("|", $flags1),
+                implode("|", $flags2),
+            );
+        }
+
+        return implode("|", $flags1);
     }
 
     public function generateVersionDependentFlagCode(
@@ -1235,7 +1225,7 @@ class VersionFlags {
             if (empty($flagsByPhpVersions[$currentPhpVersion])) {
                 return '';
             }
-            return sprintf($codeTemplate, implode("|", $flagsByPhpVersions[$currentPhpVersion]));
+            return sprintf($codeTemplate, $this->formatFlags($flagsByPhpVersions[$currentPhpVersion]));
         }
 
         ksort($flagsByPhpVersions);
@@ -1276,7 +1266,7 @@ class VersionFlags {
             reset($flagsByPhpVersions);
             $firstVersion = key($flagsByPhpVersions);
             if ($firstVersion === $phpVersionIdMinimumCompatibility) {
-                return sprintf($codeTemplate, implode("|", reset($flagsByPhpVersions)));
+                return sprintf($codeTemplate, $this->formatFlags(reset($flagsByPhpVersions)));
             }
         }
 
@@ -1289,7 +1279,7 @@ class VersionFlags {
 
             $code .= "$if (PHP_VERSION_ID >= $version)\n";
 
-            $code .= sprintf($codeTemplate, implode("|", $versionFlags));
+            $code .= sprintf($codeTemplate, $this->formatFlags($versionFlags));
             $code .= $endif;
 
             $i++;
@@ -1300,26 +1290,6 @@ class VersionFlags {
 }
 
 class FuncInfo {
-    public /* readonly */ FunctionOrMethodName $name;
-    private /* readonly */ int $classFlags;
-    public int $flags;
-    public /* readonly */ ?string $aliasType;
-    public ?FunctionOrMethodName $alias;
-    private /* readonly */ bool $isDeprecated;
-    private bool $supportsCompileTimeEval;
-    public /* readonly */ bool $verify;
-    /** @var ArgInfo[] */
-    public /* readonly */ array $args;
-    public /* readonly */ ReturnInfo $return;
-    private /* readonly */ int $numRequiredArgs;
-    public /* readonly */ ?string $cond;
-    public bool $isUndocumentable;
-    private ?int $minimumPhpVersionIdCompatibility;
-    /** @var AttributeInfo[] */
-    public array $attributes;
-    /** @var FramelessFunctionInfo[] */
-    private array $framelessFunctionInfos;
-    private ?ExposedDocComment $exposedDocComment;
 
     /**
      * @param ArgInfo[] $args
@@ -1327,41 +1297,25 @@ class FuncInfo {
      * @param FramelessFunctionInfo[] $framelessFunctionInfos
      */
     public function __construct(
-        FunctionOrMethodName $name,
-        int $classFlags,
-        int $flags,
-        ?string $aliasType,
-        ?FunctionOrMethodName $alias,
-        bool $isDeprecated,
-        bool $supportsCompileTimeEval,
-        bool $verify,
-        array $args,
-        ReturnInfo $return,
-        int $numRequiredArgs,
-        ?string $cond,
-        bool $isUndocumentable,
-        ?int $minimumPhpVersionIdCompatibility,
-        array $attributes,
-        array $framelessFunctionInfos,
-        ?ExposedDocComment $exposedDocComment
+        public readonly FunctionOrMethodName $name,
+        private readonly int $classFlags,
+        public int $flags,
+        public readonly ?string $aliasType,
+        public ?FunctionOrMethodName $alias,
+        private readonly bool $isDeprecated,
+        private bool $supportsCompileTimeEval,
+        private bool $forbidDynamicCalls,
+        public readonly bool $verify,
+        public /* readonly */ array $args,
+        public /* readonly */ ReturnInfo $return,
+        private readonly int $numRequiredArgs,
+        public readonly ?string $cond,
+        public bool $isUndocumentable,
+        private ?int $minimumPhpVersionIdCompatibility,
+        public array $attributes,
+        private array $framelessFunctionInfos,
+        private ?ExposedDocComment $exposedDocComment,
     ) {
-        $this->name = $name;
-        $this->classFlags = $classFlags;
-        $this->flags = $flags;
-        $this->aliasType = $aliasType;
-        $this->alias = $alias;
-        $this->isDeprecated = $isDeprecated;
-        $this->supportsCompileTimeEval = $supportsCompileTimeEval;
-        $this->verify = $verify;
-        $this->args = $args;
-        $this->return = $return;
-        $this->numRequiredArgs = $numRequiredArgs;
-        $this->cond = $cond;
-        $this->isUndocumentable = $isUndocumentable;
-        $this->minimumPhpVersionIdCompatibility = $minimumPhpVersionIdCompatibility;
-        $this->attributes = $attributes;
-        $this->framelessFunctionInfos = $framelessFunctionInfos;
-        $this->exposedDocComment = $exposedDocComment;
         if ($return->tentativeReturnType && $this->isFinalMethod()) {
             throw new Exception("Tentative return inapplicable for final method");
         }
@@ -1414,13 +1368,10 @@ class FuncInfo {
 
     private function hasParamWithUnknownDefaultValue(): bool
     {
-        foreach ($this->args as $arg) {
-            if ($arg->defaultValue && !$arg->hasProperDefaultValue()) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any(
+            $this->args,
+            static fn (ArgInfo $arg): bool => $arg->defaultValue && !$arg->hasProperDefaultValue()
+        );
     }
 
     private function equalsApartFromNameAndRefcount(FuncInfo $other): bool {
@@ -1641,12 +1592,11 @@ class FuncInfo {
             $flags[] = "ZEND_ACC_DEPRECATED";
         }
 
-        foreach ($this->attributes as $attr) {
-            switch ($attr->class) {
-                case "Deprecated":
-                    $flags[] = "ZEND_ACC_DEPRECATED";
-                    break;
-            }
+        if (array_any(
+            $this->attributes,
+            static fn (AttributeInfo $attr): bool => $attr->class === "Deprecated"
+        )) {
+            $flags[] = "ZEND_ACC_DEPRECATED";
         }
 
         $flags = new VersionFlags($flags);
@@ -1655,12 +1605,15 @@ class FuncInfo {
             $flags->addForVersionsAbove("ZEND_ACC_COMPILE_TIME_EVAL", PHP_82_VERSION_ID);
         }
 
-        foreach ($this->attributes as $attr) {
-            switch ($attr->class) {
-                case "NoDiscard":
-                    $flags->addForVersionsAbove("ZEND_ACC_NODISCARD", PHP_85_VERSION_ID);
-                    break;
-            }
+        if (array_any(
+            $this->attributes,
+            static fn (AttributeInfo $attr): bool => $attr->class === "NoDiscard"
+        )) {
+            $flags->addForVersionsAbove("ZEND_ACC_NODISCARD", PHP_85_VERSION_ID);
+        }
+
+        if ($this->forbidDynamicCalls) {
+            $flags->addForVersionsAbove("ZEND_ACC2_FORBID_DYN_CALLS", PHP_86_VERSION_ID);
         }
 
         return $flags;
@@ -1678,7 +1631,7 @@ class FuncInfo {
     }
 
     public function getMethodSynopsisDocument(): ?string {
-        $REFSEC1_SEPERATOR = "\n\n ";
+        $REFSEC1_SEPARATOR = "\n\n ";
 
         $doc = new DOMDocument("1.0", "utf-8");
         $doc->formatOutput = true;
@@ -1688,7 +1641,7 @@ class FuncInfo {
 
         if ($this->isMethod()) {
             assert($this->name instanceof MethodName);
-            /* Namespaces are seperated by '-', '_' must be converted to '-' too.
+            /* Namespaces are separated by '-', '_' must be converted to '-' too.
              * Trim away the __ for magic methods */
             $id = strtolower(
                 str_replace('\\', '-', $this->name->className->__toString())
@@ -1717,7 +1670,7 @@ class FuncInfo {
         $refnamediv->appendChild($refpurpose);
 
         $refnamediv->appendChild(new DOMText("\n "));
-        $refentry->append($refnamediv, $REFSEC1_SEPERATOR);
+        $refentry->append($refnamediv, $REFSEC1_SEPARATOR);
 
         /* Creation of <refsect1 role="description"> */
         $descriptionRefSec = $this->generateRefSect1($doc, 'description');
@@ -1736,16 +1689,16 @@ class FuncInfo {
         $descriptionRefSec->appendChild($returnDescriptionPara);
 
         $descriptionRefSec->appendChild(new DOMText("\n "));
-        $refentry->append($descriptionRefSec, $REFSEC1_SEPERATOR);
+        $refentry->append($descriptionRefSec, $REFSEC1_SEPARATOR);
 
         /* Creation of <refsect1 role="parameters"> */
         $parametersRefSec = $this->getParameterSection($doc);
-        $refentry->append($parametersRefSec, $REFSEC1_SEPERATOR);
+        $refentry->append($parametersRefSec, $REFSEC1_SEPARATOR);
 
         /* Creation of <refsect1 role="returnvalues"> */
         if (!$this->name->isConstructor() && !$this->name->isDestructor()) {
             $returnRefSec = $this->getReturnValueSection($doc);
-            $refentry->append($returnRefSec, $REFSEC1_SEPERATOR);
+            $refentry->append($returnRefSec, $REFSEC1_SEPARATOR);
         }
 
         /* Creation of <refsect1 role="errors"> */
@@ -1765,14 +1718,14 @@ class FuncInfo {
         $errorsRefSec->appendChild($errorsDescriptionPara);
         $errorsRefSec->appendChild(new DOMText("\n "));
 
-        $refentry->append($errorsRefSec, $REFSEC1_SEPERATOR);
+        $refentry->append($errorsRefSec, $REFSEC1_SEPARATOR);
 
         /* Creation of <refsect1 role="changelog"> */
         $changelogRefSec = $this->getChangelogSection($doc);
-        $refentry->append($changelogRefSec, $REFSEC1_SEPERATOR);
+        $refentry->append($changelogRefSec, $REFSEC1_SEPARATOR);
 
         $exampleRefSec = $this->getExampleSection($doc, $id);
-        $refentry->append($exampleRefSec, $REFSEC1_SEPERATOR);
+        $refentry->append($exampleRefSec, $REFSEC1_SEPARATOR);
 
         /* Creation of <refsect1 role="notes"> */
         $notesRefSec = $this->generateRefSect1($doc, 'notes');
@@ -1785,7 +1738,7 @@ class FuncInfo {
         $noteTag->append("\n   ", $noteTagSimara, "\n  ");
         $notesRefSec->append($noteTag, "\n ");
 
-        $refentry->append($notesRefSec, $REFSEC1_SEPERATOR);
+        $refentry->append($notesRefSec, $REFSEC1_SEPARATOR);
 
         /* Creation of <refsect1 role="seealso"> */
         $seeAlsoRefSec = $this->generateRefSect1($doc, 'seealso');
@@ -1857,56 +1810,56 @@ ENDCOMMENT
             $noParamEntity = $doc->createEntityReference('no.function.parameters');
             $parametersRefSec->appendChild($noParamEntity);
             return $parametersRefSec;
-        } else {
-            $parametersContainer = $doc->createDocumentFragment();
-
-            $parametersContainer->appendChild(new DOMText("\n  "));
-            $parametersList = $doc->createElement('variablelist');
-            $parametersContainer->appendChild($parametersList);
-
-            /*
-            <varlistentry>
-             <term><parameter>name</parameter></term>
-             <listitem>
-              <simpara>
-               Description.
-              </simpara>
-             </listitem>
-            </varlistentry>
-            */
-            foreach ($this->args as $arg) {
-                $parameter = $doc->createElement('parameter', $arg->name);
-                $parameterTerm = $doc->createElement('term');
-                $parameterTerm->appendChild($parameter);
-
-                $listItemPara = $doc->createElement('simpara');
-                $listItemPara->append(
-                    "\n      ",
-                    "Description.",
-                    "\n     ",
-                );
-
-                $parameterEntryListItem = $doc->createElement('listitem');
-                $parameterEntryListItem->append(
-                    "\n     ",
-                    $listItemPara,
-                    "\n    ",
-                );
-
-                $parameterEntry = $doc->createElement('varlistentry');
-                $parameterEntry->append(
-                    "\n    ",
-                    $parameterTerm,
-                    "\n    ",
-                    $parameterEntryListItem,
-                    "\n   ",
-                );
-
-                $parametersList->appendChild(new DOMText("\n   "));
-                $parametersList->appendChild($parameterEntry);
-            }
-            $parametersList->appendChild(new DOMText("\n  "));
         }
+        $parametersContainer = $doc->createDocumentFragment();
+
+        $parametersContainer->appendChild(new DOMText("\n  "));
+        $parametersList = $doc->createElement('variablelist');
+        $parametersContainer->appendChild($parametersList);
+
+        /*
+        <varlistentry>
+            <term><parameter>name</parameter></term>
+            <listitem>
+            <simpara>
+            Description.
+            </simpara>
+            </listitem>
+        </varlistentry>
+        */
+        foreach ($this->args as $arg) {
+            $parameter = $doc->createElement('parameter', $arg->name);
+            $parameterTerm = $doc->createElement('term');
+            $parameterTerm->appendChild($parameter);
+
+            $listItemPara = $doc->createElement('simpara');
+            $listItemPara->append(
+                "\n      ",
+                "Description.",
+                "\n     ",
+            );
+
+            $parameterEntryListItem = $doc->createElement('listitem');
+            $parameterEntryListItem->append(
+                "\n     ",
+                $listItemPara,
+                "\n    ",
+            );
+
+            $parameterEntry = $doc->createElement('varlistentry');
+            $parameterEntry->append(
+                "\n    ",
+                $parameterTerm,
+                "\n    ",
+                $parameterEntryListItem,
+                "\n   ",
+            );
+
+            $parametersList->appendChild(new DOMText("\n   "));
+            $parametersList->appendChild($parameterEntry);
+        }
+        $parametersList->appendChild(new DOMText("\n  "));
+
         $parametersContainer->appendChild(new DOMText("\n "));
         $parametersRefSec->appendChild($parametersContainer);
         $parametersRefSec->appendChild(new DOMText("\n "));
@@ -1925,20 +1878,12 @@ ENDCOMMENT
         } else if (count($returnType->types) === 1) {
             $type = $returnType->types[0];
 
-            switch ($type->name) {
-                case 'void':
-                    $descriptionNode = $doc->createEntityReference('return.void');
-                    break;
-                case 'true':
-                    $descriptionNode = $doc->createEntityReference('return.true.always');
-                    break;
-                case 'bool':
-                    $descriptionNode = $doc->createEntityReference('return.success');
-                    break;
-                default:
-                    $descriptionNode = new DOMText("Description.");
-                    break;
-            }
+            $descriptionNode = match ($type->name) {
+                'void' => $doc->createEntityReference('return.void'),
+                'true' => $doc->createEntityReference('return.true.always'),
+                'bool' => $doc->createEntityReference('return.success'),
+                default => new DOMText("Description."),
+            };
             $returnDescriptionPara->appendChild($descriptionNode);
         } else {
             $returnDescriptionPara->appendChild(new DOMText("Description."));
@@ -2184,7 +2129,7 @@ OUPUT_EXAMPLE
                 $defaultValue = $arg->getDefaultValueAsMethodSynopsisString();
                 if ($defaultValue !== null) {
                     $initializer = $doc->createElement('initializer');
-                    if (preg_match('/^[a-zA-Z_][a-zA-Z_0-9]*$/', $defaultValue)) {
+                    if (preg_match('/^[a-zA-Z_][a-zA-Z_0-9\:\\\\]*$/', $defaultValue)) {
                         $constant = $doc->createElement('constant', $defaultValue);
                         $initializer->appendChild($constant);
                     } else {
@@ -2209,38 +2154,41 @@ OUPUT_EXAMPLE
         return null;
     }
 
-    public function toArgInfoCode(?int $minPHPCompatability): string {
+    public function toArgInfoCode(?int $minPHPCompatibility): string {
         $code = $this->return->beginArgInfo(
             $this->getArgInfoName(),
             $this->numRequiredArgs,
-            $minPHPCompatability === null || $minPHPCompatability >= PHP_81_VERSION_ID
+            $minPHPCompatibility === null || $minPHPCompatibility >= PHP_81_VERSION_ID
         );
-    
+
         foreach ($this->args as $argInfo) {
             $code .= $argInfo->toZendInfo();
         }
-    
+
         $code .= "ZEND_END_ARG_INFO()";
         return $code . "\n";
     }
 
     public function __clone()
     {
-        foreach ($this->args as $key => $argInfo) {
-            $this->args[$key] = clone $argInfo;
-        }
+        $this->args = array_map((\clone)(...), $this->args);
         $this->return = clone $this->return;
     }
 }
 
 class EvaluatedValue
 {
-    public /* readonly */ mixed $value;
-    public SimpleType $type;
-    public Expr $expr;
-    public bool $isUnknownConstValue;
-    /** @var ConstInfo[] */
-    public array $originatingConsts;
+
+    /**
+     * @param ConstInfo[] $originatingConsts
+     */
+    private function __construct(
+        public readonly mixed $value,
+        public SimpleType $type,
+        public Expr $expr,
+        public array $originatingConsts,
+        public bool $isUnknownConstValue,
+    ) {}
 
     /**
      * @param array<string, ConstInfo> $allConstInfos
@@ -2252,14 +2200,11 @@ class EvaluatedValue
         {
             /** @var iterable<ConstInfo> */
             public array $visitedConstants = [];
-            /** @var array<string, ConstInfo> */
-            public array $allConstInfos;
 
             /** @param array<string, ConstInfo> $allConstInfos */
-            public function __construct(array $allConstInfos)
-            {
-                $this->allConstInfos = $allConstInfos;
-            }
+            public function __construct(
+                public array $allConstInfos,
+            ) {}
 
             /** @return Node|null */
             public function enterNode(Node $expr)
@@ -2348,19 +2293,6 @@ class EvaluatedValue
         return new self(null, SimpleType::null(), new Expr\ConstFetch(new Node\Name('null')), [], false);
     }
 
-    /**
-     * @param mixed $value
-     * @param ConstInfo[] $originatingConsts
-     */
-    private function __construct($value, SimpleType $type, Expr $expr, array $originatingConsts, bool $isUnknownConstValue)
-    {
-        $this->value = $value;
-        $this->type = $type;
-        $this->expr = $expr;
-        $this->originatingConsts = $originatingConsts;
-        $this->isUnknownConstValue = $isUnknownConstValue;
-    }
-
     public function initializeZval(string $zvalName, bool $alreadyExists = false, string $forStringDef = ''): string
     {
         $cExpr = $this->getCExpr();
@@ -2412,9 +2344,28 @@ class EvaluatedValue
         // $this->expr has all its PHP constants replaced by C constants
         $prettyPrinter = new Standard;
         $expr = $prettyPrinter->prettyPrintExpr($this->expr);
-        // PHP single-quote to C double-quote string
         if ($this->type->isString()) {
-            $expr = preg_replace("/(^'|'$)/", '"', $expr);
+            // The string in $expr has had the octal, hex, and unicode
+            // backslash sequences already applied for double-quoted strings,
+            // but not the other sequences.
+            //
+            // PHP has single quote strings, C doesn't (they're one char).
+            // Single-quoted strings need handling to replace their escapes
+            // with the double-quoted equivalent; namely single quote escapes.
+            //
+            // Double-quoted strings have similar escape sequences as C does,
+            // so we can pass them through directly. However, C does *not*
+            // support the \$ escape sequence (in ""), so strip that. Variable
+            // interpolation shouldn't be possible in a stub, so we don't need
+            // to worry about mangling such a case.
+            if (preg_match("/(^'|'$)/", $expr)) {
+                $expr = substr($expr, 1, -1); // strip quotes, readd later
+                $expr = str_replace("\\'", "'", $expr);
+                $expr = addcslashes($expr, "\\\"");
+                $expr = "\"$expr\"";
+            } else {
+                $expr = str_replace('\$', "$", $expr);
+            }
         }
         return $expr[0] == '"' ? $expr : preg_replace('(\bnull\b)', 'NULL', str_replace('\\', '', $expr));
     }
@@ -2422,35 +2373,18 @@ class EvaluatedValue
 
 abstract class VariableLike
 {
-    protected int $flags;
-    public ?Type $type;
-    public /* readonly */ ?Type $phpDocType;
-    private /* readonly */ ?string $link;
-    protected ?int $phpVersionIdMinimumCompatibility;
-    /** @var AttributeInfo[] */
-    public array $attributes;
-    protected /* readonly */ ?ExposedDocComment $exposedDocComment;
-
     /**
      * @param AttributeInfo[] $attributes
      */
     public function __construct(
-        int $flags,
-        ?Type $type,
-        ?Type $phpDocType,
-        ?string $link,
-        ?int $phpVersionIdMinimumCompatibility,
-        array $attributes,
-        ?ExposedDocComment $exposedDocComment
-    ) {
-        $this->flags = $flags;
-        $this->type = $type;
-        $this->phpDocType = $phpDocType;
-        $this->link = $link;
-        $this->phpVersionIdMinimumCompatibility = $phpVersionIdMinimumCompatibility;
-        $this->attributes = $attributes;
-        $this->exposedDocComment = $exposedDocComment;
-    }
+        protected int $flags,
+        public ?Type $type,
+        public readonly ?Type $phpDocType,
+        private readonly ?string $link,
+        protected ?int $phpVersionIdMinimumCompatibility,
+        public array $attributes,
+        protected readonly ?ExposedDocComment $exposedDocComment,
+    ) {}
 
     abstract protected function getVariableTypeName(): string;
 
@@ -2472,14 +2406,22 @@ abstract class VariableLike
             $flags = "ZEND_ACC_PRIVATE";
         }
 
-        return new VersionFlags([$flags]);
+        $versionFlags = new VersionFlags([$flags]);
+
+        if ($this->flags & Modifiers::PUBLIC_SET) {
+            $versionFlags->addForVersionsAbove("ZEND_ACC_PUBLIC_SET", PHP_84_VERSION_ID);
+        } elseif ($this->flags & Modifiers::PROTECTED_SET) {
+            $versionFlags->addForVersionsAbove("ZEND_ACC_PROTECTED_SET", PHP_84_VERSION_ID);
+        } elseif ($this->flags & Modifiers::PRIVATE_SET) {
+            $versionFlags->addForVersionsAbove("ZEND_ACC_PRIVATE_SET", PHP_84_VERSION_ID);
+        }
+
+        return $versionFlags;
     }
 
     protected function getTypeCode(string $variableLikeName, string &$code): string
     {
         $variableLikeType = $this->getVariableTypeName();
-
-        $typeCode = "";
         if ($this->type) {
             $arginfoType = $this->type->toArginfoType();
             if ($arginfoType->hasClassType()) {
@@ -2495,8 +2437,8 @@ abstract class VariableLike
                     $code .= "\t{$variableLikeType}_{$variableLikeName}_type_list->num_types = $classTypeCount;\n";
 
                     foreach ($arginfoType->classTypes as $k => $classType) {
-                        $escapedClassName = $classType->toEscapedName();
-                        $code .= "\t{$variableLikeType}_{$variableLikeName}_type_list->types[$k] = (zend_type) ZEND_TYPE_INIT_CLASS({$variableLikeType}_{$variableLikeName}_class_{$escapedClassName}, 0, 0);\n";
+                        $varEscapedClassName = $classType->toVarEscapedName();
+                        $code .= "\t{$variableLikeType}_{$variableLikeName}_type_list->types[$k] = (zend_type) ZEND_TYPE_INIT_CLASS({$variableLikeType}_{$variableLikeName}_class_{$varEscapedClassName}, 0, 0);\n";
                     }
 
                     $typeMaskCode = $this->type->toArginfoType()->toTypeMask();
@@ -2506,34 +2448,31 @@ abstract class VariableLike
                     } else {
                         $code .= "\tzend_type {$variableLikeType}_{$variableLikeName}_type = ZEND_TYPE_INIT_UNION({$variableLikeType}_{$variableLikeName}_type_list, $typeMaskCode);\n";
                     }
-                    $typeCode = "{$variableLikeType}_{$variableLikeName}_type";
-                } else {
-                    $escapedClassName = $arginfoType->classTypes[0]->toEscapedName();
-                    $varEscapedClassName = $arginfoType->classTypes[0]->toVarEscapedName();
-                    $code .= "\tzend_string *{$variableLikeType}_{$variableLikeName}_class_{$varEscapedClassName} = zend_string_init(\"{$escapedClassName}\", sizeof(\"{$escapedClassName}\")-1, 1);\n";
-
-                    $typeCode = "(zend_type) ZEND_TYPE_INIT_CLASS({$variableLikeType}_{$variableLikeName}_class_{$varEscapedClassName}, 0, " . $arginfoType->toTypeMask() . ")";
+                    return "{$variableLikeType}_{$variableLikeName}_type";
                 }
-            } else {
-                $typeCode = "(zend_type) ZEND_TYPE_INIT_MASK(" . $arginfoType->toTypeMask() . ")";
-            }
-        } else {
-            $typeCode = "(zend_type) ZEND_TYPE_INIT_NONE(0)";
-        }
+                $escapedClassName = $arginfoType->classTypes[0]->toEscapedName();
+                $varEscapedClassName = $arginfoType->classTypes[0]->toVarEscapedName();
+                $code .= "\tzend_string *{$variableLikeType}_{$variableLikeName}_class_{$varEscapedClassName} = zend_string_init(\"{$escapedClassName}\", sizeof(\"{$escapedClassName}\")-1, 1);\n";
 
-        return $typeCode;
+                return "(zend_type) ZEND_TYPE_INIT_CLASS({$variableLikeType}_{$variableLikeName}_class_{$varEscapedClassName}, 0, " . $arginfoType->toTypeMask() . ")";
+            }
+            return "(zend_type) ZEND_TYPE_INIT_MASK(" . $arginfoType->toTypeMask() . ")";
+        }
+        return "(zend_type) ZEND_TYPE_INIT_NONE(0)";
     }
 
     /** @param array<string, ConstInfo> $allConstInfos */
-    public function getFieldSynopsisElement(DOMDocument $doc, array $allConstInfos): DOMElement
+    public function getFieldSynopsisElement(DOMDocument $doc, array $allConstInfos, int $indentationLevel): DOMElement
     {
+        $indentation = str_repeat(" ", $indentationLevel);
+
         $fieldsynopsisElement = $doc->createElement("fieldsynopsis");
 
-        $this->addModifiersToFieldSynopsis($doc, $fieldsynopsisElement);
+        $this->addModifiersToFieldSynopsis($doc, $fieldsynopsisElement, $indentationLevel + 1);
 
         $type = $this->phpDocType ?? $this->type;
         if ($type) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation "));
             $fieldsynopsisElement->appendChild($type->getTypeForDoc($doc));
         }
 
@@ -2544,32 +2483,45 @@ abstract class VariableLike
             $varnameElement->setAttribute("linkend", $this->getFieldSynopsisDefaultLinkend());
         }
 
-        $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+        $fieldsynopsisElement->appendChild(new DOMText("\n$indentation "));
         $fieldsynopsisElement->appendChild($varnameElement);
 
         $valueString = $this->getFieldSynopsisValueString($allConstInfos);
         if ($valueString) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation "));
             $initializerElement = $doc->createElement("initializer",  $valueString);
             $fieldsynopsisElement->appendChild($initializerElement);
         }
 
-        $fieldsynopsisElement->appendChild(new DOMText("\n    "));
+        $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
 
         return $fieldsynopsisElement;
     }
 
-    protected function addModifiersToFieldSynopsis(DOMDocument $doc, DOMElement $fieldsynopsisElement): void
+    protected function addModifiersToFieldSynopsis(DOMDocument $doc, DOMElement $fieldsynopsisElement, int $indentationLevel): void
     {
+        $indentation = str_repeat(" ", $indentationLevel);
+
         if ($this->flags & Modifiers::PUBLIC) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "public"));
         } elseif ($this->flags & Modifiers::PROTECTED) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "protected"));
         } elseif ($this->flags & Modifiers::PRIVATE) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "private"));
+        }
+
+        if ($this->flags & Modifiers::PUBLIC_SET) {
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
+            $fieldsynopsisElement->appendChild($doc->createElement("modifier", "public(set)"));
+        } elseif ($this->flags & Modifiers::PROTECTED_SET) {
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
+            $fieldsynopsisElement->appendChild($doc->createElement("modifier", "protected(set)"));
+        } elseif ($this->flags & Modifiers::PRIVATE_SET) {
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
+            $fieldsynopsisElement->appendChild($doc->createElement("modifier", "private(set)"));
         }
     }
 
@@ -2577,50 +2529,34 @@ abstract class VariableLike
 
 class ConstInfo extends VariableLike
 {
-    public /* readonly */ AbstractConstName $name;
-    public /* readonly */ Expr $value;
-    private bool $isDeprecated;
-    private /* readonly */ ?string $valueString;
-    public /* readonly */ ?string $cond;
-    public /* readonly */ ?string $cValue;
-    public /* readonly */ bool $isUndocumentable;
-    private /* readonly */ bool $isFileCacheAllowed;
 
     /**
      * @param AttributeInfo[] $attributes
      */
     public function __construct(
-        AbstractConstName $name,
+        public readonly AbstractConstName $name,
         int $flags,
-        Expr $value,
-        ?string $valueString,
+        public readonly Expr $value,
+        private readonly ?string $valueString,
         ?Type $type,
         ?Type $phpDocType,
-        bool $isDeprecated,
-        ?string $cond,
-        ?string $cValue,
-        bool $isUndocumentable,
+        private bool $isDeprecated,
+        public readonly ?string $cond,
+        public readonly ?string $cValue,
+        public readonly bool $isUndocumentable,
         ?string $link,
         ?int $phpVersionIdMinimumCompatibility,
         array $attributes,
         ?ExposedDocComment $exposedDocComment,
-        bool $isFileCacheAllowed
+        private readonly bool $isFileCacheAllowed,
     ) {
-        foreach ($attributes as $attr) {
-            if ($attr->class === "Deprecated") {
-                $isDeprecated = true;
-                break;
-            }
+        if (array_any(
+            $attributes,
+            static fn (AttributeInfo $attr): bool => $attr->class === "Deprecated"
+        )) {
+            $this->isDeprecated = true;
         }
 
-        $this->name = $name;
-        $this->value = $value;
-        $this->valueString = $valueString;
-        $this->isDeprecated = $isDeprecated;
-        $this->cond = $cond;
-        $this->cValue = $cValue;
-        $this->isUndocumentable = $isUndocumentable;
-        $this->isFileCacheAllowed = $isFileCacheAllowed;
         parent::__construct($flags, $type, $phpDocType, $link, $phpVersionIdMinimumCompatibility, $attributes, $exposedDocComment);
     }
 
@@ -2730,7 +2666,7 @@ class ConstInfo extends VariableLike
         // Condition will be added by generateCodeWithConditions()
 
         if ($this->name instanceof ClassConstName) {
-            $code = $this->getClassConstDeclaration($value, $allConstInfos);
+            $code = $this->getClassConstDeclaration($value);
         } else {
             $code = $this->getGlobalConstDeclaration($value);
         }
@@ -2791,12 +2727,10 @@ class ConstInfo extends VariableLike
         throw new Exception("Unimplemented constant type");
     }
 
-    /** @param array<string, ConstInfo> $allConstInfos */
-    private function getClassConstDeclaration(EvaluatedValue $value, array $allConstInfos): string
+    private function getClassConstDeclaration(EvaluatedValue $value): string
     {
         $constName = $this->name->getDeclarationName();
 
-        // TODO $allConstInfos is unused
         $zvalCode = $value->initializeZval("const_{$constName}_value");
 
         $code = "\n" . $zvalCode;
@@ -2912,16 +2846,18 @@ class ConstInfo extends VariableLike
         return $flags;
     }
 
-    protected function addModifiersToFieldSynopsis(DOMDocument $doc, DOMElement $fieldsynopsisElement): void
+    protected function addModifiersToFieldSynopsis(DOMDocument $doc, DOMElement $fieldsynopsisElement, int $indentationLevel): void
     {
-        parent::addModifiersToFieldSynopsis($doc, $fieldsynopsisElement);
+        parent::addModifiersToFieldSynopsis($doc, $fieldsynopsisElement, $indentationLevel);
+
+        $indentation = str_repeat(" ", $indentationLevel);
 
         if ($this->flags & Modifiers::FINAL) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "final"));
         }
 
-        $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+        $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
         $fieldsynopsisElement->appendChild($doc->createElement("modifier", "const"));
     }
 }
@@ -3037,6 +2973,12 @@ class StringBuilder {
         '8.5' => 'ZEND_STR_8_DOT_5',
     ];
 
+    // NEW in 8.6
+    private const PHP_86_KNOWN = [
+        "arguments" => "ZEND_STR_ARGUMENTS",
+        "NoDiscard" => "ZEND_STR_NODISCARD",
+    ];
+
     /**
      * Get an array of three strings:
      *   - declaration of zend_string, if needed, or empty otherwise
@@ -3075,6 +3017,10 @@ class StringBuilder {
         }
         $include = self::PHP_80_KNOWN;
         switch ($minPhp) {
+            case PHP_86_VERSION_ID:
+                $include = array_merge($include, self::PHP_86_KNOWN);
+                // Intentional fall through
+
             case PHP_85_VERSION_ID:
                 $include = array_merge($include, self::PHP_85_KNOWN);
                 // Intentional fall through
@@ -3106,37 +3052,25 @@ class StringBuilder {
 
 class PropertyInfo extends VariableLike
 {
-    private /* readonly */ int $classFlags;
-    public /* readonly */ PropertyName $name;
-    private /* readonly */ ?Expr $defaultValue;
-    private /* readonly */ ?string $defaultValueString;
-    private /* readonly */ bool $isDocReadonly;
-    private /* readonly */ bool $isVirtual;
 
     /**
      * @param AttributeInfo[] $attributes
      */
     public function __construct(
-        PropertyName $name,
-        int $classFlags,
+        public readonly PropertyName $name,
+        private readonly int $classFlags,
         int $flags,
         ?Type $type,
         ?Type $phpDocType,
-        ?Expr $defaultValue,
-        ?string $defaultValueString,
-        bool $isDocReadonly,
-        bool $isVirtual,
+        private readonly ?Expr $defaultValue,
+        private readonly ?string $defaultValueString,
+        private readonly bool $isDocReadonly,
+        private readonly bool $isVirtual,
         ?string $link,
         ?int $phpVersionIdMinimumCompatibility,
         array $attributes,
         ?ExposedDocComment $exposedDocComment
     ) {
-        $this->name = $name;
-        $this->classFlags = $classFlags;
-        $this->defaultValue = $defaultValue;
-        $this->defaultValueString = $defaultValueString;
-        $this->isDocReadonly = $isDocReadonly;
-        $this->isVirtual = $isVirtual;
         parent::__construct($flags, $type, $phpDocType, $link, $phpVersionIdMinimumCompatibility, $attributes, $exposedDocComment);
     }
 
@@ -3256,65 +3190,110 @@ class PropertyInfo extends VariableLike
         return $flags;
     }
 
-    protected function addModifiersToFieldSynopsis(DOMDocument $doc, DOMElement $fieldsynopsisElement): void
+    protected function addModifiersToFieldSynopsis(DOMDocument $doc, DOMElement $fieldsynopsisElement, int $indentationLevel): void
     {
-        parent::addModifiersToFieldSynopsis($doc, $fieldsynopsisElement);
+        parent::addModifiersToFieldSynopsis($doc, $fieldsynopsisElement, $indentationLevel);
+
+        $indentation = str_repeat(" ", $indentationLevel);
 
         if ($this->flags & Modifiers::STATIC) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "static"));
         }
 
         if ($this->flags & Modifiers::FINAL) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "final"));
         }
 
         if ($this->flags & Modifiers::READONLY || $this->isDocReadonly) {
-            $fieldsynopsisElement->appendChild(new DOMText("\n     "));
+            $fieldsynopsisElement->appendChild(new DOMText("\n$indentation"));
             $fieldsynopsisElement->appendChild($doc->createElement("modifier", "readonly"));
         }
     }
 }
 
 class EnumCaseInfo {
-    private /* readonly */ string $name;
-    private /* readonly */ ?Expr $value;
-
-    public function __construct(string $name, ?Expr $value) {
-        $this->name = $name;
-        $this->value = $value;
-    }
+    public function __construct(
+        public readonly EnumCaseName $name,
+        private readonly ?Expr $value,
+        private readonly ?string $valueString
+    ) {}
 
     /** @param array<string, ConstInfo> $allConstInfos */
     public function getDeclaration(array $allConstInfos): string {
-        $escapedName = addslashes($this->name);
+        $escapedName = addslashes($this->name->case);
         if ($this->value === null) {
-            $code = "\n\tzend_enum_add_case_cstr(class_entry, \"$escapedName\", NULL);\n";
-        } else {
-            $value = EvaluatedValue::createFromExpression($this->value, null, null, $allConstInfos);
-
-            $zvalName = "enum_case_{$escapedName}_value";
-            $code = "\n" . $value->initializeZval($zvalName);
-            $code .= "\tzend_enum_add_case_cstr(class_entry, \"$escapedName\", &$zvalName);\n";
+            return "\n\tzend_enum_add_case_cstr(class_entry, \"$escapedName\", NULL);\n";
         }
+        $value = EvaluatedValue::createFromExpression($this->value, null, null, $allConstInfos);
+
+        $zvalName = "enum_case_{$escapedName}_value";
+        $code = "\n" . $value->initializeZval($zvalName);
+        $code .= "\tzend_enum_add_case_cstr(class_entry, \"$escapedName\", &$zvalName);\n";
 
         return $code;
+    }
+
+    /** @param array<string, ConstInfo> $allConstInfos */
+    public function getEnumSynopsisItemElement(DOMDocument $doc, array $allConstInfos, int $indentationLevel): DOMElement
+    {
+        $indentation = str_repeat(" ", $indentationLevel);
+
+        $itemElement = $doc->createElement("enumitem");
+
+        $identifierElement = $doc->createElement("enumidentifier", $this->name->case);
+
+        $itemElement->appendChild(new DOMText("\n$indentation "));
+        $itemElement->appendChild($identifierElement);
+
+        $valueString = $this->getEnumSynopsisValueString($allConstInfos);
+        if ($valueString) {
+            $itemElement->appendChild(new DOMText("\n$indentation "));
+            $valueElement = $doc->createElement("enumvalue",  $valueString);
+            $itemElement->appendChild($valueElement);
+        }
+
+        $descriptionElement = $doc->createElement("enumitemdescription", "Description.");
+        $itemElement->appendChild(new DOMText("\n$indentation "));
+        $itemElement->appendChild($descriptionElement);
+
+        $itemElement->appendChild(new DOMText("\n$indentation"));
+
+        return $itemElement;
+    }
+
+    /** @param array<string, ConstInfo> $allConstInfos */
+    public function getEnumSynopsisValueString(array $allConstInfos): ?string
+    {
+        if ($this->value === null) {
+            return null;
+        }
+
+        $value = EvaluatedValue::createFromExpression($this->value, null, null, $allConstInfos);
+        if ($value->isUnknownConstValue) {
+            return null;
+        }
+
+        if ($value->originatingConsts) {
+            return implode("\n", array_map(function (ConstInfo $const) use ($allConstInfos) {
+                return $const->getFieldSynopsisValueString($allConstInfos);
+            }, $value->originatingConsts));
+        }
+
+        return $this->valueString;
     }
 }
 
 // Instances of AttributeInfo are immutable and do not need to be cloned
 // when held by an object that is cloned
 class AttributeInfo {
-    public /* readonly */ string $class;
-    /** @var \PhpParser\Node\Arg[] */
-    private /* readonly */ array $args;
 
     /** @param \PhpParser\Node\Arg[] $args */
-    public function __construct(string $class, array $args) {
-        $this->class = $class;
-        $this->args = $args;
-    }
+    public function __construct(
+        public readonly string $class,
+        private readonly array $args,
+    ) {}
 
     /**
      * @param array<string, ConstInfo> $allConstInfos
@@ -3399,32 +3378,6 @@ class AttributeInfo {
 }
 
 class ClassInfo {
-    public /* readonly */ Name $name;
-    private int $flags;
-    public string $type;
-    public /* readonly */ ?string $alias;
-    private /* readonly */ ?SimpleType $enumBackingType;
-    private /* readonly */ bool $isDeprecated;
-    private bool $isStrictProperties;
-    /** @var AttributeInfo[] */
-    private array $attributes;
-    private ?ExposedDocComment $exposedDocComment;
-    private bool $isNotSerializable;
-    /** @var Name[] */
-    private /* readonly */ array $extends;
-    /** @var Name[] */
-    private /* readonly */ array $implements;
-    /** @var ConstInfo[] */
-    public /* readonly */ array $constInfos;
-    /** @var PropertyInfo[] */
-    private /* readonly */ array $propertyInfos;
-    /** @var FuncInfo[] */
-    public array $funcInfos;
-    /** @var EnumCaseInfo[] */
-    private /* readonly */ array $enumCaseInfos;
-    public /* readonly */ ?string $cond;
-    public ?int $phpVersionIdMinimumCompatibility;
-    public /* readonly */ bool $isUndocumentable;
 
     /**
      * @param AttributeInfo[] $attributes
@@ -3436,46 +3389,27 @@ class ClassInfo {
      * @param EnumCaseInfo[] $enumCaseInfos
      */
     public function __construct(
-        Name $name,
-        int $flags,
-        string $type,
-        ?string $alias,
-        ?SimpleType $enumBackingType,
-        bool $isDeprecated,
-        bool $isStrictProperties,
-        array $attributes,
-        ?ExposedDocComment $exposedDocComment,
-        bool $isNotSerializable,
-        array $extends,
-        array $implements,
-        array $constInfos,
-        array $propertyInfos,
-        array $funcInfos,
-        array $enumCaseInfos,
-        ?string $cond,
-        ?int $minimumPhpVersionIdCompatibility,
-        bool $isUndocumentable
-    ) {
-        $this->name = $name;
-        $this->flags = $flags;
-        $this->type = $type;
-        $this->alias = $alias;
-        $this->enumBackingType = $enumBackingType;
-        $this->isDeprecated = $isDeprecated;
-        $this->isStrictProperties = $isStrictProperties;
-        $this->attributes = $attributes;
-        $this->exposedDocComment = $exposedDocComment;
-        $this->isNotSerializable = $isNotSerializable;
-        $this->extends = $extends;
-        $this->implements = $implements;
-        $this->constInfos = $constInfos;
-        $this->propertyInfos = $propertyInfos;
-        $this->funcInfos = $funcInfos;
-        $this->enumCaseInfos = $enumCaseInfos;
-        $this->cond = $cond;
-        $this->phpVersionIdMinimumCompatibility = $minimumPhpVersionIdCompatibility;
-        $this->isUndocumentable = $isUndocumentable;
-    }
+        public readonly Name $name,
+        private int $flags,
+        public string $type,
+        public readonly ?string $alias,
+        private readonly ?SimpleType $enumBackingType,
+        private readonly bool $isDeprecated,
+        private bool $isStrictProperties,
+        private array $attributes,
+        private ?ExposedDocComment $exposedDocComment,
+        private bool $isNotSerializable,
+        private readonly array $extends,
+        private readonly array $implements,
+        public /* readonly */ array $constInfos,
+        private /* readonly */ array $propertyInfos,
+        public array $funcInfos,
+        private readonly array $enumCaseInfos,
+        private readonly bool $generateCNameTable,
+        public readonly ?string $cond,
+        public ?int $phpVersionIdMinimumCompatibility,
+        public readonly bool $isUndocumentable,
+    ) {}
 
     /** @param array<string, ConstInfo> $allConstInfos */
     public function getRegistration(array $allConstInfos): string
@@ -3661,6 +3595,57 @@ class ClassInfo {
         return $code;
     }
 
+    public function getCDeclarations(): string
+    {
+        if ($this->type !== "enum") {
+            return '';
+        }
+
+        $code = '';
+
+        if ($this->cond) {
+            $code .= "#if {$this->cond}\n";
+        }
+
+        $cEnumName = 'zend_enum_' . str_replace('\\', '_', $this->name->toString());
+
+        $code .= "typedef enum {$cEnumName} {\n";
+
+        $i = 1;
+        foreach ($this->enumCaseInfos as $case) {
+            $cName = 'ZEND_ENUM_' . str_replace('\\', '_', $this->name->toString()) . '_' . $case->name->case;
+            $code .= "\t{$cName} = {$i},\n";
+            $i++;
+        }
+
+        $code .= "} {$cEnumName};\n";
+
+        $caseCount = count($this->enumCaseInfos);
+
+        if ($this->generateCNameTable && $caseCount > 0) {
+            $cPrefix = 'ZEND_ENUM_' . str_replace('\\', '_', $this->name->toString());
+            $useGuard = $cPrefix . '_USE_NAME_TABLE';
+
+            $code .= "\n#define {$cPrefix}_CASE_COUNT {$caseCount}\n";
+            $code .= "\n#ifdef {$useGuard}\n";
+            $code .= "static const char *{$cEnumName}_case_names[{$cPrefix}_CASE_COUNT + 1] = {\n";
+
+            foreach ($this->enumCaseInfos as $case) {
+                $cName = $cPrefix . '_' . $case->name->case;
+                $code .= "\t[{$cName}] = \"{$case->name->case}\",\n";
+            }
+
+            $code .= "};\n";
+            $code .= "#endif\n";
+        }
+
+        if ($this->cond) {
+            $code .= "#endif\n";
+        }
+
+        return $code;
+    }
+
     private function getFlagsByPhpVersion(): VersionFlags
     {
         $php70Flags = [];
@@ -3695,11 +3680,11 @@ class ClassInfo {
             $flags->addForVersionsAbove("ZEND_ACC_READONLY_CLASS", PHP_82_VERSION_ID);
         }
 
-        foreach ($this->attributes as $attr) {
-            if ($attr->class === "AllowDynamicProperties") {
-                $flags->addForVersionsAbove("ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES", PHP_82_VERSION_ID);
-                break;
-            }
+        if (array_any(
+            $this->attributes,
+            static fn (AttributeInfo $attr): bool => $attr->class === "AllowDynamicProperties"
+        )) {
+            $flags->addForVersionsAbove("ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES", PHP_82_VERSION_ID);
         }
 
         return $flags;
@@ -3740,112 +3725,148 @@ class ClassInfo {
      * @param array<string, ConstInfo> $allConstInfos
      */
     public function getClassSynopsisElement(DOMDocument $doc, array $classMap, array $allConstInfos): ?DOMElement {
-        $classSynopsis = $doc->createElement("classsynopsis");
-        $classSynopsis->setAttribute("class", $this->type === "interface" ? "interface" : "class");
-
-        $exceptionOverride = $this->type === "class" && $this->isException($classMap) ? "exception" : null;
-        $ooElement = self::createOoElement($doc, $this, $exceptionOverride, true, null, 4);
-        if (!$ooElement) {
-            return null;
+        if ($this->type === "enum") {
+            $classSynopsis = $doc->createElement("enumsynopsis");
+        } else {
+            $classSynopsis = $doc->createElement("classsynopsis");
+            $classSynopsis->setAttribute("class", $this->type === "interface" ? "interface" : "class");
         }
-        $classSynopsis->appendChild(new DOMText("\n    "));
-        $classSynopsis->appendChild($ooElement);
 
-        foreach ($this->extends as $k => $parent) {
-            $parentInfo = $classMap[$parent->toString()] ?? null;
-            if ($parentInfo === null) {
-                throw new Exception("Missing parent class " . $parent->toString());
+        $namespace = $this->getNamespace();
+        if ($namespace) {
+            $classSynopsisIndentationLevel = 4;
+            $classSynopsisIndentation = str_repeat(" ", $classSynopsisIndentationLevel);
+            $packageSynopsis = $doc->createElement("packagesynopsis");
+            $packageSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation"));
+            $package = $doc->createElement("package", $namespace);
+            $packageSynopsis->appendChild($package);
+            $packageSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation"));
+            $packageSynopsis->appendChild($classSynopsis);
+            $packageSynopsis->appendChild(new DOMText("\n   "));
+            $root = $packageSynopsis;
+        } else {
+            $root = $classSynopsis;
+            $classSynopsisIndentationLevel = 3;
+            $classSynopsisIndentation = str_repeat(" ", $classSynopsisIndentationLevel);
+        }
+
+        $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
+
+        if ($this->type === "enum") {
+            $enumName = $doc->createElement("enumname", $this->getClassName());
+            $classSynopsis->appendChild($enumName);
+
+            foreach ($this->enumCaseInfos as $enumCaseInfo) {
+                $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
+                $enumItemElement = $enumCaseInfo->getEnumSynopsisItemElement($doc, $allConstInfos, $classSynopsisIndentationLevel + 1);
+                $classSynopsis->appendChild($enumItemElement);
+            }
+        } else {
+            $exceptionOverride = $this->type === "class" && $this->isException($classMap) ? "exception" : null;
+            $ooElement = self::createOoElement($doc, $this, $exceptionOverride, true, null, $classSynopsisIndentationLevel + 1);
+            if (!$ooElement) {
+                return null;
+            }
+            $classSynopsis->appendChild($ooElement);
+
+            foreach ($this->extends as $k => $parent) {
+                $parentInfo = $classMap[$parent->toString()] ?? null;
+                if ($parentInfo === null) {
+                    throw new Exception("Missing parent class " . $parent->toString());
+                }
+
+                $ooElement = self::createOoElement(
+                    $doc,
+                    $parentInfo,
+                    null,
+                    false,
+                    $k === 0 ? "extends" : null,
+                    $classSynopsisIndentationLevel + 1
+                );
+                if (!$ooElement) {
+                    return null;
+                }
+
+                $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
+                $classSynopsis->appendChild($ooElement);
             }
 
-            $ooElement = self::createOoElement(
-                $doc,
-                $parentInfo,
-                null,
-                false,
-                $k === 0 ? "extends" : null,
-                4
+            foreach ($this->implements as $k => $interface) {
+                $interfaceInfo = $classMap[$interface->toString()] ?? null;
+                if (!$interfaceInfo) {
+                    throw new Exception("Missing implemented interface " . $interface->toString());
+                }
+
+                $ooElement = self::createOoElement($doc, $interfaceInfo, null, false, $k === 0 ? "implements" : null, $classSynopsisIndentationLevel + 1);
+                if (!$ooElement) {
+                    return null;
+                }
+                $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
+                $classSynopsis->appendChild($ooElement);
+            }
+
+            /** @var array<string, Name> $parentsWithInheritedConstants */
+            $parentsWithInheritedConstants = [];
+            /** @var array<string, Name> $parentsWithInheritedProperties */
+            $parentsWithInheritedProperties = [];
+            /** @var array<int, array{name: Name, types: int[]}> $parentsWithInheritedMethods */
+            $parentsWithInheritedMethods = [];
+
+            $this->collectInheritedMembers(
+                $parentsWithInheritedConstants,
+                $parentsWithInheritedProperties,
+                $parentsWithInheritedMethods,
+                $this->hasConstructor(),
+                $classMap
             );
-            if (!$ooElement) {
-                return null;
+
+            $this->appendInheritedMemberSectionToClassSynopsis(
+                $doc,
+                $classSynopsis,
+                $parentsWithInheritedConstants,
+                "&Constants;",
+                "&InheritedConstants;",
+                $classSynopsisIndentationLevel + 1
+            );
+
+            if (!empty($this->constInfos)) {
+                $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
+                $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "&Constants;");
+                $classSynopsisInfo->setAttribute("role", "comment");
+                $classSynopsis->appendChild($classSynopsisInfo);
+
+                foreach ($this->constInfos as $constInfo) {
+                    $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
+                    $fieldSynopsisElement = $constInfo->getFieldSynopsisElement($doc, $allConstInfos, $classSynopsisIndentationLevel + 1);
+                    $classSynopsis->appendChild($fieldSynopsisElement);
+                }
             }
 
-            $classSynopsis->appendChild(new DOMText("\n\n    "));
-            $classSynopsis->appendChild($ooElement);
+            if (!empty($this->propertyInfos)) {
+                $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
+                $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "&Properties;");
+                $classSynopsisInfo->setAttribute("role", "comment");
+                $classSynopsis->appendChild($classSynopsisInfo);
+
+                foreach ($this->propertyInfos as $propertyInfo) {
+                    $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
+                    $fieldSynopsisElement = $propertyInfo->getFieldSynopsisElement($doc, $allConstInfos, $classSynopsisIndentationLevel + 1);
+                    $classSynopsis->appendChild($fieldSynopsisElement);
+                }
+            }
+
+            $this->appendInheritedMemberSectionToClassSynopsis(
+                $doc,
+                $classSynopsis,
+                $parentsWithInheritedProperties,
+                "&Properties;",
+                "&InheritedProperties;",
+                $classSynopsisIndentationLevel + 1
+            );
         }
-
-        foreach ($this->implements as $k => $interface) {
-            $interfaceInfo = $classMap[$interface->toString()] ?? null;
-            if (!$interfaceInfo) {
-                throw new Exception("Missing implemented interface " . $interface->toString());
-            }
-
-            $ooElement = self::createOoElement($doc, $interfaceInfo, null, false, $k === 0 ? "implements" : null, 4);
-            if (!$ooElement) {
-                return null;
-            }
-            $classSynopsis->appendChild(new DOMText("\n\n    "));
-            $classSynopsis->appendChild($ooElement);
-        }
-
-        /** @var array<string, Name> $parentsWithInheritedConstants */
-        $parentsWithInheritedConstants = [];
-        /** @var array<string, Name> $parentsWithInheritedProperties */
-        $parentsWithInheritedProperties = [];
-        /** @var array<int, array{name: Name, types: int[]}> $parentsWithInheritedMethods */
-        $parentsWithInheritedMethods = [];
-
-        $this->collectInheritedMembers(
-            $parentsWithInheritedConstants,
-            $parentsWithInheritedProperties,
-            $parentsWithInheritedMethods,
-            $this->hasConstructor(),
-            $classMap
-        );
-
-        $this->appendInheritedMemberSectionToClassSynopsis(
-            $doc,
-            $classSynopsis,
-            $parentsWithInheritedConstants,
-            "&Constants;",
-            "&InheritedConstants;"
-        );
-
-        if (!empty($this->constInfos)) {
-            $classSynopsis->appendChild(new DOMText("\n\n    "));
-            $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "&Constants;");
-            $classSynopsisInfo->setAttribute("role", "comment");
-            $classSynopsis->appendChild($classSynopsisInfo);
-
-            foreach ($this->constInfos as $constInfo) {
-                $classSynopsis->appendChild(new DOMText("\n    "));
-                $fieldSynopsisElement = $constInfo->getFieldSynopsisElement($doc, $allConstInfos);
-                $classSynopsis->appendChild($fieldSynopsisElement);
-            }
-        }
-
-        if (!empty($this->propertyInfos)) {
-            $classSynopsis->appendChild(new DOMText("\n\n    "));
-            $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "&Properties;");
-            $classSynopsisInfo->setAttribute("role", "comment");
-            $classSynopsis->appendChild($classSynopsisInfo);
-
-            foreach ($this->propertyInfos as $propertyInfo) {
-                $classSynopsis->appendChild(new DOMText("\n    "));
-                $fieldSynopsisElement = $propertyInfo->getFieldSynopsisElement($doc, $allConstInfos);
-                $classSynopsis->appendChild($fieldSynopsisElement);
-            }
-        }
-
-        $this->appendInheritedMemberSectionToClassSynopsis(
-            $doc,
-            $classSynopsis,
-            $parentsWithInheritedProperties,
-            "&Properties;",
-            "&InheritedProperties;"
-        );
 
         if (!empty($this->funcInfos)) {
-            $classSynopsis->appendChild(new DOMText("\n\n    "));
+            $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
             $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "&Methods;");
             $classSynopsisInfo->setAttribute("role", "comment");
             $classSynopsis->appendChild($classSynopsisInfo);
@@ -3854,35 +3875,38 @@ class ClassInfo {
             $escapedName = addslashes($this->name->__toString());
 
             if ($this->hasConstructor()) {
-                $classSynopsis->appendChild(new DOMText("\n    "));
+                $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
                 $includeElement = $this->createIncludeElement(
                     $doc,
-                    "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$classReference')/db:refentry/db:refsect1[@role='description']/descendant::db:constructorsynopsis[@role='$escapedName'])"
+                    "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$classReference')/db:refentry/db:refsect1[@role='description']/descendant::db:constructorsynopsis[@role='$escapedName'])",
+                    $classSynopsisIndentationLevel + 1
                 );
                 $classSynopsis->appendChild($includeElement);
             }
 
             if ($this->hasMethods()) {
-                $classSynopsis->appendChild(new DOMText("\n    "));
+                $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
                 $includeElement = $this->createIncludeElement(
                     $doc,
-                    "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$classReference')/db:refentry/db:refsect1[@role='description']/descendant::db:methodsynopsis[@role='$escapedName'])"
+                    "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$classReference')/db:refentry/db:refsect1[@role='description']/descendant::db:methodsynopsis[@role='$escapedName'])",
+                    $classSynopsisIndentationLevel + 1
                 );
                 $classSynopsis->appendChild($includeElement);
             }
 
             if ($this->hasDestructor()) {
-                $classSynopsis->appendChild(new DOMText("\n    "));
+                $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
                 $includeElement = $this->createIncludeElement(
                     $doc,
-                    "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$classReference')/db:refentry/db:refsect1[@role='description']/descendant::db:destructorsynopsis[@role='$escapedName'])"
+                    "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$classReference')/db:refentry/db:refsect1[@role='description']/descendant::db:destructorsynopsis[@role='$escapedName'])",
+                    $classSynopsisIndentationLevel + 1
                 );
                 $classSynopsis->appendChild($includeElement);
             }
         }
 
         if (!empty($parentsWithInheritedMethods)) {
-            $classSynopsis->appendChild(new DOMText("\n\n    "));
+            $classSynopsis->appendChild(new DOMText("\n\n$classSynopsisIndentation "));
             $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "&InheritedMethods;");
             $classSynopsisInfo->setAttribute("role", "comment");
             $classSynopsis->appendChild($classSynopsisInfo);
@@ -3895,10 +3919,11 @@ class ClassInfo {
                 $escapedParentName = addslashes($parentName->__toString());
 
                 foreach ($parentMethodsynopsisTypes as $parentMethodsynopsisType) {
-                    $classSynopsis->appendChild(new DOMText("\n    "));
+                    $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation "));
                     $includeElement = $this->createIncludeElement(
                         $doc,
-                        "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$parentReference')/db:refentry/db:refsect1[@role='description']/descendant::db:{$parentMethodsynopsisType}[@role='$escapedParentName'])"
+                        "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$parentReference')/db:refentry/db:refsect1[@role='description']/descendant::db:{$parentMethodsynopsisType}[@role='$escapedParentName'])",
+                        $classSynopsisIndentationLevel + 1
                     );
 
                     $classSynopsis->appendChild($includeElement);
@@ -3906,23 +3931,23 @@ class ClassInfo {
             }
         }
 
-        $classSynopsis->appendChild(new DOMText("\n   "));
+        $classSynopsis->appendChild(new DOMText("\n$classSynopsisIndentation"));
 
-        return $classSynopsis;
+        return $root;
     }
 
     private static function createOoElement(
         DOMDocument $doc,
         ClassInfo $classInfo,
         ?string $typeOverride,
-        bool $withModifiers,
+        bool $isMainClass,
         ?string $modifierOverride,
         int $indentationLevel
     ): ?DOMElement {
         $indentation = str_repeat(" ", $indentationLevel);
 
         if ($classInfo->type !== "class" && $classInfo->type !== "interface") {
-            echo "Class synopsis generation is not implemented for " . $classInfo->type . "\n";
+            echo "Warning: Class synopsis generation is not implemented for " . $classInfo->type . " of type " . $classInfo->name . "\n";
             return null;
         }
 
@@ -3933,7 +3958,7 @@ class ClassInfo {
         if ($modifierOverride !== null) {
             $ooElement->appendChild($doc->createElement('modifier', $modifierOverride));
             $ooElement->appendChild(new DOMText("\n$indentation "));
-        } elseif ($withModifiers) {
+        } elseif ($isMainClass) {
             foreach ($classInfo->attributes as $attribute) {
                 $modifier = $doc->createElement("modifier", "#[\\" . $attribute->class . "]");
                 $modifier->setAttribute("role", "attribute");
@@ -3955,7 +3980,7 @@ class ClassInfo {
             }
         }
 
-        $nameElement = $doc->createElement("{$type}name", $classInfo->name->toString());
+        $nameElement = $doc->createElement("{$type}name", $isMainClass ? $classInfo->getClassName() : $classInfo->name->toString());
         $ooElement->appendChild($nameElement);
         $ooElement->appendChild(new DOMText("\n$indentation"));
 
@@ -4082,98 +4107,95 @@ class ClassInfo {
 
     private function hasConstructor(): bool
     {
-        foreach ($this->funcInfos as $funcInfo) {
-            if ($funcInfo->name->isConstructor()) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any(
+            $this->funcInfos,
+            static fn (FuncInfo $funcInfo): bool => $funcInfo->name->isConstructor()
+        );
     }
 
     private function hasNonPrivateConstructor(): bool
     {
-        foreach ($this->funcInfos as $funcInfo) {
-            if ($funcInfo->name->isConstructor() && !($funcInfo->flags & Modifiers::PRIVATE)) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any(
+            $this->funcInfos,
+            static fn (FuncInfo $funcInfo): bool => $funcInfo->name->isConstructor() && !($funcInfo->flags & Modifiers::PRIVATE)
+        );
     }
 
     private function hasDestructor(): bool
     {
-        foreach ($this->funcInfos as $funcInfo) {
-            if ($funcInfo->name->isDestructor()) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any(
+            $this->funcInfos,
+            static fn (FuncInfo $funcInfo): bool => $funcInfo->name->isDestructor()
+        );
     }
 
     private function hasMethods(): bool
     {
-        foreach ($this->funcInfos as $funcInfo) {
-            if (!$funcInfo->name->isConstructor() && !$funcInfo->name->isDestructor()) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any(
+            $this->funcInfos,
+            static fn (FuncInfo $funcInfo): bool => !$funcInfo->name->isConstructor() && !$funcInfo->name->isDestructor()
+        );
     }
 
-    private function createIncludeElement(DOMDocument $doc, string $query): DOMElement
+    public function getNamespace(): ?string {
+        if ($this->name->isQualified()) {
+            return $this->name->slice(0, -1)->toString();
+        }
+
+        return null;
+    }
+
+    public function getClassName(): string {
+        return $this->name->getLast();
+    }
+
+    private function createIncludeElement(DOMDocument $doc, string $query, int $indentationLevel): DOMElement
     {
+        $indentation = str_repeat(" ", $indentationLevel);
+
         $includeElement = $doc->createElement("xi:include");
         $attr = $doc->createAttribute("xpointer");
         $attr->value = $query;
         $includeElement->appendChild($attr);
         $fallbackElement = $doc->createElement("xi:fallback");
-        $includeElement->appendChild(new DOMText("\n     "));
+        $includeElement->appendChild(new DOMText("\n$indentation "));
         $includeElement->appendChild($fallbackElement);
-        $includeElement->appendChild(new DOMText("\n    "));
+        $includeElement->appendChild(new DOMText("\n$indentation"));
 
         return $includeElement;
     }
 
     public function __clone()
     {
-        foreach ($this->constInfos as $key => $constInfo) {
-            $this->constInfos[$key] = clone $constInfo;
-        }
-
-        foreach ($this->propertyInfos as $key => $propertyInfo) {
-            $this->propertyInfos[$key] = clone $propertyInfo;
-        }
-
-        foreach ($this->funcInfos as $key => $funcInfo) {
-            $this->funcInfos[$key] = clone $funcInfo;
-        }
+        $this->constInfos = array_map((\clone)(...), $this->constInfos);
+        $this->propertyInfos = array_map((\clone)(...), $this->propertyInfos);
+        $this->funcInfos = array_map((\clone)(...), $this->funcInfos);
     }
 
     /**
      * @param Name[] $parents
      */
-    private function appendInheritedMemberSectionToClassSynopsis(DOMDocument $doc, DOMElement $classSynopsis, array $parents, string $label, string $inheritedLabel): void
+    private function appendInheritedMemberSectionToClassSynopsis(DOMDocument $doc, DOMElement $classSynopsis, array $parents, string $label, string $inheritedLabel, int $indentationLevel): void
     {
         if (empty($parents)) {
             return;
         }
 
-        $classSynopsis->appendChild(new DOMText("\n\n    "));
+        $indentation = str_repeat(" ", $indentationLevel);
+
+        $classSynopsis->appendChild(new DOMText("\n\n$indentation"));
         $classSynopsisInfo = $doc->createElement("classsynopsisinfo", "$inheritedLabel");
         $classSynopsisInfo->setAttribute("role", "comment");
         $classSynopsis->appendChild($classSynopsisInfo);
 
         foreach ($parents as $parent) {
-            $classSynopsis->appendChild(new DOMText("\n    "));
+            $classSynopsis->appendChild(new DOMText("\n$indentation"));
             $parentReference = self::getClassSynopsisReference($parent);
 
             $includeElement = $this->createIncludeElement(
                 $doc,
-                "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$parentReference')/db:partintro/db:section/db:classsynopsis/db:fieldsynopsis[preceding-sibling::db:classsynopsisinfo[1][@role='comment' and text()='$label']]))"
+                "xmlns(db=http://docbook.org/ns/docbook) xpointer(id('$parentReference')/db:partintro/db:section/db:classsynopsis/db:fieldsynopsis[preceding-sibling::db:classsynopsisinfo[1][@role='comment' and text()='$label']]))",
+                $indentationLevel
             );
             $classSynopsis->appendChild($includeElement);
         }
@@ -4186,12 +4208,13 @@ class FileInfo {
     /** @var ConstInfo[] */
     public array $constInfos = [];
     /** @var FuncInfo[] */
-    public array $funcInfos = [];
+    private array $funcInfos = [];
     /** @var ClassInfo[] */
     public array $classInfos = [];
-    public bool $generateFunctionEntries = false;
-    public string $declarationPrefix = "";
-    public bool $generateClassEntries = false;
+    private bool $generateFunctionEntries = false;
+    private string $declarationPrefix = "";
+    private bool $generateClassEntries = false;
+    private bool $generateCEnums = false;
     private bool $isUndocumentable = false;
     private bool $legacyArginfoGeneration = false;
     private ?int $minimumPhpVersionIdCompatibility = null;
@@ -4207,7 +4230,8 @@ class FileInfo {
                     throw new Exception(
                         "Legacy PHP version must be one of: \"" . PHP_70_VERSION_ID . "\" (PHP 7.0), \"" . PHP_80_VERSION_ID . "\" (PHP 8.0), " .
                         "\"" . PHP_81_VERSION_ID . "\" (PHP 8.1), \"" . PHP_82_VERSION_ID . "\" (PHP 8.2), \"" . PHP_83_VERSION_ID . "\" (PHP 8.3), " .
-                        "\"" . PHP_84_VERSION_ID . "\" (PHP 8.4), \"" . PHP_85_VERSION_ID . "\" (PHP 8.5), \"" . $tag->value . "\" provided"
+                        "\"" . PHP_84_VERSION_ID . "\" (PHP 8.4), \"" . PHP_85_VERSION_ID . "\" (PHP 8.5), \"" . PHP_86_VERSION_ID . "\" (PHP 8.6), " .
+                        $tag->value . "\" provided"
                     );
                 }
 
@@ -4217,6 +4241,8 @@ class FileInfo {
                 $this->declarationPrefix = $tag->value ? $tag->value . " " : "";
             } else if ($tag->name === 'undocumentable') {
                 $this->isUndocumentable = true;
+            } else if ($tag->name === 'generate-c-enums') {
+                $this->generateCEnums = true;
             }
         }
 
@@ -4255,20 +4281,12 @@ class FileInfo {
 
     public function __clone()
     {
-        foreach ($this->constInfos as $key => $constInfo) {
-            $this->constInfos[$key] = clone $constInfo;
-        }
-
-        foreach ($this->funcInfos as $key => $funcInfo) {
-            $this->funcInfos[$key] = clone $funcInfo;
-        }
-
-        foreach ($this->classInfos as $key => $classInfo) {
-            $this->classInfos[$key] = clone $classInfo;
-        }
+        $this->constInfos = array_map((\clone)(...), $this->constInfos);
+        $this->funcInfos = array_map((\clone)(...), $this->funcInfos);
+        $this->classInfos = array_map((\clone)(...), $this->classInfos);
     }
 
-    public function getMinimumPhpVersionIdCompatibility(): ?int {
+    private function getMinimumPhpVersionIdCompatibility(): ?int {
         // Non-legacy arginfo files are always PHP 8.0+ compatible
         if (!$this->legacyArginfoGeneration &&
             $this->minimumPhpVersionIdCompatibility !== null &&
@@ -4310,13 +4328,13 @@ class FileInfo {
                 return implode('\\', $node->getParts());
             }
         };
-    
+
         $stmts = $parser->parse($code);
         $nodeTraverser->traverse($stmts);
-    
+
         $fileTags = DocCommentTag::parseDocComments(self::getFileDocComments($stmts));
         $fileInfo = new FileInfo($fileTags);
-    
+
         $fileInfo->handleStatements($stmts, $prettyPrinter);
         return $fileInfo;
     }
@@ -4337,16 +4355,21 @@ class FileInfo {
         $conds = [];
         foreach ($stmts as $stmt) {
             $cond = self::handlePreprocessorConditions($conds, $stmt);
-    
+
             if ($stmt instanceof Stmt\Nop) {
                 continue;
             }
-    
+
             if ($stmt instanceof Stmt\Namespace_) {
                 $this->handleStatements($stmt->stmts, $prettyPrinter);
                 continue;
             }
-    
+
+            if ($stmt instanceof Stmt\Use_ || $stmt instanceof Stmt\GroupUse) {
+                // use statements are resolved by NameResolver before this point
+                continue;
+            }
+
             if ($stmt instanceof Stmt\Const_) {
                 foreach ($stmt->consts as $const) {
                     $this->constInfos[] = parseConstLike(
@@ -4364,7 +4387,7 @@ class FileInfo {
                 }
                 continue;
             }
-    
+
             if ($stmt instanceof Stmt\Function_) {
                 $this->funcInfos[] = parseFunctionLike(
                     $prettyPrinter,
@@ -4378,7 +4401,7 @@ class FileInfo {
                 );
                 continue;
             }
-    
+
             if ($stmt instanceof Stmt\ClassLike) {
                 $className = $stmt->namespacedName;
                 $constInfos = [];
@@ -4390,10 +4413,10 @@ class FileInfo {
                     if ($classStmt instanceof Stmt\Nop) {
                         continue;
                     }
-    
+
                     $classFlags = $stmt instanceof Class_ ? $stmt->flags : 0;
                     $abstractFlag = $stmt instanceof Stmt\Interface_ ? Modifiers::ABSTRACT : 0;
-    
+
                     if ($classStmt instanceof Stmt\ClassConst) {
                         foreach ($classStmt->consts as $const) {
                             $constInfos[] = parseConstLike(
@@ -4442,12 +4465,15 @@ class FileInfo {
                         );
                     } else if ($classStmt instanceof Stmt\EnumCase) {
                         $enumCaseInfos[] = new EnumCaseInfo(
-                            $classStmt->name->toString(), $classStmt->expr);
+                            new EnumCaseName($className, $classStmt->name->toString()),
+                            $classStmt->expr,
+                            $classStmt->expr ? $prettyPrinter->prettyPrintExpr($classStmt->expr) : null,
+                        );
                     } else {
                         throw new Exception("Not implemented {$classStmt->getType()}");
                     }
                 }
-    
+
                 $this->classInfos[] = parseClass(
                     $className,
                     $stmt,
@@ -4461,7 +4487,7 @@ class FileInfo {
                 );
                 continue;
             }
-    
+
             if ($stmt instanceof Stmt\Expression) {
                 $expr = $stmt->expr;
                 if ($expr instanceof Expr\Include_) {
@@ -4469,7 +4495,7 @@ class FileInfo {
                     continue;
                 }
             }
-    
+
             throw new Exception("Unexpected node {$stmt->getType()}");
         }
         if (!empty($conds)) {
@@ -4501,7 +4527,7 @@ class FileInfo {
                 throw new Exception("Unrecognized preprocessor directive \"$text\"");
             }
         }
-    
+
         return empty($conds) ? null : implode(' && ', $conds);
     }
 
@@ -4515,16 +4541,155 @@ class FileInfo {
 
         return $code;
     }
+
+    public function generateCDeclarations(): string {
+        $code = "";
+
+        if (!$this->generateCEnums) {
+            return $code;
+        }
+
+        foreach ($this->classInfos as $class) {
+            $cdecl = $class->getCDeclarations();
+            if ($cdecl !== '') {
+                $code .= "\n" . $cdecl;
+            }
+        }
+
+        return $code;
+    }
+
+
+    /**
+     * @param array<string, ConstInfo> $allConstInfos
+     * @return array{string, string}
+     */
+    public function generateArgInfoCode(
+        string $stubFilenameWithoutExtension,
+        array $allConstInfos,
+        string $stubHash
+    ): array {
+        $code = "";
+
+        $generatedFuncInfos = [];
+
+        $argInfoCode = generateCodeWithConditions(
+            $this->getAllFuncInfos(), "\n",
+            function (FuncInfo $funcInfo) use (&$generatedFuncInfos) {
+                /* If there already is an equivalent arginfo structure, only emit a #define */
+                if ($generatedFuncInfo = $funcInfo->findEquivalent($generatedFuncInfos)) {
+                    $code = sprintf(
+                        "#define %s %s\n",
+                        $funcInfo->getArgInfoName(), $generatedFuncInfo->getArgInfoName()
+                    );
+                } else {
+                    $code = $funcInfo->toArgInfoCode($this->getMinimumPhpVersionIdCompatibility());
+                }
+
+                $generatedFuncInfos[] = $funcInfo;
+                return $code;
+            }
+        );
+
+        if ($argInfoCode !== "") {
+            $code .= "$argInfoCode\n";
+        }
+
+        if ($this->generateFunctionEntries) {
+            $framelessFunctionCode = generateCodeWithConditions(
+                $this->getAllFuncInfos(), "\n",
+                static function (FuncInfo $funcInfo) {
+                    return $funcInfo->getFramelessDeclaration();
+                }
+            );
+
+            if ($framelessFunctionCode !== "") {
+                $code .= "$framelessFunctionCode\n";
+            }
+
+            $generatedFunctionDeclarations = [];
+            $code .= generateCodeWithConditions(
+                $this->getAllFuncInfos(), "",
+                function (FuncInfo $funcInfo) use (&$generatedFunctionDeclarations) {
+                    $key = $funcInfo->getDeclarationKey();
+                    if (isset($generatedFunctionDeclarations[$key])) {
+                        return null;
+                    }
+
+                    $generatedFunctionDeclarations[$key] = true;
+                    return $this->declarationPrefix . $funcInfo->getDeclaration();
+                }
+            );
+
+            $code .= generateFunctionEntries(null, $this->funcInfos);
+
+            foreach ($this->classInfos as $classInfo) {
+                $code .= generateFunctionEntries($classInfo->name, $classInfo->funcInfos, $classInfo->cond);
+            }
+        }
+
+        $php80MinimumCompatibility = $this->getMinimumPhpVersionIdCompatibility() === null || $this->getMinimumPhpVersionIdCompatibility() >= PHP_80_VERSION_ID;
+
+        if ($this->generateClassEntries) {
+            $declaredStrings = [];
+            $attributeInitializationCode = generateFunctionAttributeInitialization($this->funcInfos, $allConstInfos, $this->getMinimumPhpVersionIdCompatibility(), null, $declaredStrings);
+            $attributeInitializationCode .= generateGlobalConstantAttributeInitialization($this->constInfos, $allConstInfos, $this->getMinimumPhpVersionIdCompatibility(), null, $declaredStrings);
+            if ($attributeInitializationCode) {
+                if (!$php80MinimumCompatibility) {
+                    $attributeInitializationCode = "\n#if (PHP_VERSION_ID >= " . PHP_80_VERSION_ID . ")" . $attributeInitializationCode . "#endif\n";
+                }
+            }
+
+            if ($attributeInitializationCode !== "" || !empty($this->constInfos)) {
+                $code .= "\nstatic void register_{$stubFilenameWithoutExtension}_symbols(int module_number)\n";
+                $code .= "{\n";
+
+                $code .= generateCodeWithConditions(
+                    $this->constInfos,
+                    '',
+                    static fn (ConstInfo $constInfo): string => $constInfo->getDeclaration($allConstInfos)
+                );
+
+                if ($attributeInitializationCode !== "" && $this->constInfos) {
+                    $code .= "\n";
+                }
+
+                $code .= $attributeInitializationCode;
+                $code .= "}\n";
+            }
+
+            $code .= $this->generateClassEntryCode($allConstInfos);
+        }
+
+        $hasDeclFile = false;
+        $declCode = $this->generateCDeclarations();
+        if ($declCode !== '') {
+            $hasDeclFile = true;
+            $headerName = "ZEND_" . strtoupper($stubFilenameWithoutExtension) . "_DECL_{$stubHash}_H";
+            $declCode = "/* This is a generated file, edit {$stubFilenameWithoutExtension}.stub.php instead.\n"
+                . " * Stub hash: $stubHash */\n"
+                . "\n"
+                . "#ifndef {$headerName}\n"
+                . "#define {$headerName}\n"
+                . $declCode . "\n"
+                . "#endif /* {$headerName} */\n";
+        }
+
+        $code = "/* This is a generated file, edit {$stubFilenameWithoutExtension}.stub.php instead.\n"
+            . " * Stub hash: $stubHash"
+            . ($hasDeclFile ? "\n * Has decl header: yes */\n" : " */\n")
+            . $code;
+
+        return [$code, $declCode];
+    }
 }
 
 class DocCommentTag {
-    public /* readonly */ string $name;
-    public /* readonly */ ?string $value;
 
-    public function __construct(string $name, ?string $value) {
-        $this->name = $name;
-        $this->value = $value;
-    }
+    public function __construct(
+        public readonly string $name,
+        public readonly ?string $value,
+    ) {}
 
     public function getValue(): string {
         if ($this->value === null) {
@@ -4540,7 +4705,7 @@ class DocCommentTag {
         $matches = [];
 
         if ($this->name === "param") {
-            preg_match('/^\s*([\w\|\\\\\[\]<>, ]+)\s*(?:[{(]|\$\w+).*$/', $value, $matches);
+            preg_match('/^\s*([\w\|\\\\\[\]<>, ]+)\s*(?:[{(]|(\.\.\.)?\$\w+).*$/', $value, $matches);
         } elseif ($this->name === "return" || $this->name === "var") {
             preg_match('/^\s*([\w\|\\\\\[\]<>, ]+)/', $value, $matches);
         }
@@ -4562,7 +4727,7 @@ class DocCommentTag {
 
         if ($this->name === "param") {
             // Allow for parsing extended types like callable(string):mixed in docblocks
-            preg_match('/^\s*(?<type>[\w\|\\\\]+(?<parens>\((?<inparens>(?:(?&parens)|[^(){}[\]<>]*+))++\)|\{(?&inparens)\}|\[(?&inparens)\]|<(?&inparens)>)*+(?::(?&type))?)\s*\$(?<name>\w+).*$/', $value, $matches);
+            preg_match('/^\s*(?<type>[\w\|\\\\]+(?<parens>\((?<inparens>(?:(?&parens)|[^(){}[\]<>]*+))++\)|\{(?&inparens)\}|\[(?&inparens)\]|<(?&inparens)>)*+(?::(?&type))?)\s*(\.\.\.)?\$(?<name>\w+).*$/', $value, $matches);
         } elseif ($this->name === "prefer-ref") {
             preg_match('/^\s*\$(?<name>\w+).*$/', $value, $matches);
         }
@@ -4610,11 +4775,10 @@ class DocCommentTag {
 // Instances of ExposedDocComment are immutable and do not need to be cloned
 // when held by an object that is cloned
 class ExposedDocComment {
-    private /* readonly */ string $docComment;
 
-    public function __construct(string $docComment) {
-        $this->docComment = $docComment;
-    }
+    public function __construct(
+        private readonly string $docComment,
+    ) {}
 
     public function escape(): string {
         return str_replace("\n", '\n', addslashes($this->docComment));
@@ -4651,7 +4815,7 @@ class ExposedDocComment {
 // Instances of FramelessFunctionInfo are immutable and do not need to be cloned
 // when held by an object that is cloned
 class FramelessFunctionInfo {
-    public /* readonly */ int $arity;
+    public readonly int $arity;
 
     public function __construct(string $json) {
         // FIXME: Should have some validation
@@ -4678,6 +4842,7 @@ function parseFunctionLike(
         $alias = null;
         $isDeprecated = false;
         $supportsCompileTimeEval = false;
+        $forbidDynamicCalls = false;
         $verify = true;
         $docReturnType = null;
         $tentativeReturnType = false;
@@ -4693,6 +4858,7 @@ function parseFunctionLike(
             $verify = !array_key_exists('no-verify', $tagMap);
             $tentativeReturnType = array_key_exists('tentative-return-type', $tagMap);
             $supportsCompileTimeEval = array_key_exists('compile-time-eval', $tagMap);
+            $forbidDynamicCalls = array_key_exists('forbid-dynamic-calls', $tagMap);
             $isUndocumentable = $isUndocumentable || array_key_exists('undocumentable', $tagMap);
 
             foreach ($tags as $tag) {
@@ -4825,6 +4991,7 @@ function parseFunctionLike(
             $alias,
             $isDeprecated,
             $supportsCompileTimeEval,
+            $forbidDynamicCalls,
             $verify,
             $args,
             $return,
@@ -5014,7 +5181,6 @@ function parseClass(
 ): ClassInfo {
     $comments = $class->getComments();
     $alias = null;
-    $allowsDynamicProperties = false;
 
     $tags = DocCommentTag::parseDocComments($comments);
     $tagMap = DocCommentTag::makeTagMap($tags);
@@ -5023,6 +5189,7 @@ function parseClass(
     $isStrictProperties = array_key_exists('strict-properties', $tagMap);
     $isNotSerializable = array_key_exists('not-serializable', $tagMap);
     $isUndocumentable = $isUndocumentable || array_key_exists('undocumentable', $tagMap);
+    $generateCNameTable = array_key_exists('c-name-table', $tagMap);
     foreach ($tags as $tag) {
         if ($tag->name === 'alias') {
             $alias = $tag->getValue();
@@ -5030,13 +5197,10 @@ function parseClass(
     }
 
     $attributes = AttributeInfo::createFromGroups($class->attrGroups);
-    foreach ($attributes as $attribute) {
-        switch ($attribute->class) {
-            case 'AllowDynamicProperties':
-                $allowsDynamicProperties = true;
-                break 2;
-        }
-    }
+    $allowsDynamicProperties = array_any(
+        $attributes,
+        static fn (AttributeInfo $attribute): bool => $attribute->class === 'AllowDynamicProperties'
+    );
 
     if ($isStrictProperties && $allowsDynamicProperties) {
         throw new Exception("A class may not have '@strict-properties' and '#[\\AllowDynamicProperties]' at the same time.");
@@ -5087,6 +5251,7 @@ function parseClass(
         $properties,
         $methods,
         $enumCases,
+        $generateCNameTable,
         $cond,
         $minimumPhpVersionIdCompatibility,
         $isUndocumentable
@@ -5143,111 +5308,6 @@ function generateCodeWithConditions(
     // The last info might have been in a conditional block
     if ($openCondition !== null) {
         $code .= "#endif\n";
-    }
-
-    return $code;
-}
-
-/**
- * @param array<string, ConstInfo> $allConstInfos
- */
-function generateArgInfoCode(
-    string $stubFilenameWithoutExtension,
-    FileInfo $fileInfo,
-    array $allConstInfos,
-    string $stubHash
-): string {
-    $code = "/* This is a generated file, edit the .stub.php file instead.\n"
-          . " * Stub hash: $stubHash */\n";
-
-    $generatedFuncInfos = [];
-
-    $argInfoCode = generateCodeWithConditions(
-        $fileInfo->getAllFuncInfos(), "\n",
-        static function (FuncInfo $funcInfo) use (&$generatedFuncInfos, $fileInfo) {
-            /* If there already is an equivalent arginfo structure, only emit a #define */
-            if ($generatedFuncInfo = $funcInfo->findEquivalent($generatedFuncInfos)) {
-                $code = sprintf(
-                    "#define %s %s\n",
-                    $funcInfo->getArgInfoName(), $generatedFuncInfo->getArgInfoName()
-                );
-            } else {
-                $code = $funcInfo->toArgInfoCode($fileInfo->getMinimumPhpVersionIdCompatibility());
-            }
-
-            $generatedFuncInfos[] = $funcInfo;
-            return $code;
-        }
-    );
-
-    if ($argInfoCode !== "") {
-        $code .= "$argInfoCode\n";
-    }
-
-    if ($fileInfo->generateFunctionEntries) {
-        $framelessFunctionCode = generateCodeWithConditions(
-            $fileInfo->getAllFuncInfos(), "\n",
-            static function (FuncInfo $funcInfo) {
-                return $funcInfo->getFramelessDeclaration();
-            }
-        );
-
-        if ($framelessFunctionCode !== "") {
-            $code .= "$framelessFunctionCode\n";
-        }
-
-        $generatedFunctionDeclarations = [];
-        $code .= generateCodeWithConditions(
-            $fileInfo->getAllFuncInfos(), "",
-            static function (FuncInfo $funcInfo) use ($fileInfo, &$generatedFunctionDeclarations) {
-                $key = $funcInfo->getDeclarationKey();
-                if (isset($generatedFunctionDeclarations[$key])) {
-                    return null;
-                }
-
-                $generatedFunctionDeclarations[$key] = true;
-                return $fileInfo->declarationPrefix . $funcInfo->getDeclaration();
-            }
-        );
-
-        $code .= generateFunctionEntries(null, $fileInfo->funcInfos);
-
-        foreach ($fileInfo->classInfos as $classInfo) {
-            $code .= generateFunctionEntries($classInfo->name, $classInfo->funcInfos, $classInfo->cond);
-        }
-    }
-
-    $php80MinimumCompatibility = $fileInfo->getMinimumPhpVersionIdCompatibility() === null || $fileInfo->getMinimumPhpVersionIdCompatibility() >= PHP_80_VERSION_ID;
-
-    if ($fileInfo->generateClassEntries) {
-        $declaredStrings = [];
-        $attributeInitializationCode = generateFunctionAttributeInitialization($fileInfo->funcInfos, $allConstInfos, $fileInfo->getMinimumPhpVersionIdCompatibility(), null, $declaredStrings);
-        $attributeInitializationCode .= generateGlobalConstantAttributeInitialization($fileInfo->constInfos, $allConstInfos, $fileInfo->getMinimumPhpVersionIdCompatibility(), null, $declaredStrings);
-        if ($attributeInitializationCode) {
-            if (!$php80MinimumCompatibility) {
-                $attributeInitializationCode = "\n#if (PHP_VERSION_ID >= " . PHP_80_VERSION_ID . ")" . $attributeInitializationCode . "#endif\n";
-            }
-        }
-
-        if ($attributeInitializationCode !== "" || !empty($fileInfo->constInfos)) {
-            $code .= "\nstatic void register_{$stubFilenameWithoutExtension}_symbols(int module_number)\n";
-            $code .= "{\n";
-
-            $code .= generateCodeWithConditions(
-                $fileInfo->constInfos,
-                '',
-                static fn (ConstInfo $constInfo): string => $constInfo->getDeclaration($allConstInfos)
-            );
-
-            if ($attributeInitializationCode !== "" && $fileInfo->constInfos) {
-                $code .= "\n";
-            }
-
-            $code .= $attributeInitializationCode;
-            $code .= "}\n";
-        }
-
-        $code .= $fileInfo->generateClassEntryCode($allConstInfos);
     }
 
     return $code;
@@ -5692,7 +5752,7 @@ function replaceClassSynopses(
             continue;
         }
 
-        if (stripos($xml, "<classsynopsis") === false) {
+        if (stripos($xml, "<classsynopsis") === false && stripos($xml, "<enumsynopsis") === false) {
             continue;
         }
 
@@ -5708,25 +5768,50 @@ function replaceClassSynopses(
             continue;
         }
 
-        $classSynopsisElements = [];
+        $synopsisElements = [];
         foreach ($doc->getElementsByTagName("classsynopsis") as $element) {
-            $classSynopsisElements[] = $element;
+            $synopsisElements[] = $element;
         }
 
-        foreach ($classSynopsisElements as $classSynopsis) {
-            if (!$classSynopsis instanceof DOMElement) {
+        foreach ($doc->getElementsByTagName("enumsynopsis") as $element) {
+            $synopsisElements[] = $element;
+        }
+
+        foreach ($synopsisElements as $synopsis) {
+            if (!$synopsis instanceof DOMElement) {
                 continue;
             }
 
-            $child = $classSynopsis->firstElementChild;
-            if ($child === null) {
-                continue;
+            if ($synopsis->nodeName === "classsynopsis") {
+                $child = $synopsis->firstElementChild;
+                if ($child === null) {
+                    continue;
+                }
+                $child = $child->lastElementChild;
+                if ($child === null) {
+                    continue;
+                }
+            } elseif ($synopsis->nodeName === "enumsynopsis") {
+                $child = $synopsis->firstElementChild;
+                if ($child === null) {
+                    continue;
+                }
             }
-            $child = $child->lastElementChild;
-            if ($child === null) {
-                continue;
-            }
+
             $className = $child->textContent;
+
+            if ($synopsis->parentElement->nodeName === "packagesynopsis" &&
+                $synopsis->parentElement->firstElementChild->nodeName === "package"
+            ) {
+                $package = $synopsis->parentElement->firstElementChild;
+                $namespace = $package->textContent;
+
+                $className = $namespace . "\\" . $className;
+                $elementToReplace = $synopsis->parentElement;
+            } else {
+                $elementToReplace = $synopsis;
+            }
+
             if (!isset($classMap[$className])) {
                 continue;
             }
@@ -5735,15 +5820,30 @@ function replaceClassSynopses(
 
             $classInfo = $classMap[$className];
 
-            $newClassSynopsis = $classInfo->getClassSynopsisElement($doc, $classMap, $allConstInfos);
-            if ($newClassSynopsis === null) {
+            $newSynopsis = $classInfo->getClassSynopsisElement($doc, $classMap, $allConstInfos);
+            if ($newSynopsis === null) {
                 continue;
             }
 
             // Check if there is any change - short circuit if there is not any.
 
-            if (replaceAndCompareXmls($doc, $classSynopsis, $newClassSynopsis)) {
+            if (replaceAndCompareXmls($doc, $elementToReplace, $newSynopsis)) {
                 continue;
+            }
+
+            if ($synopsis->nodeName === "enumsynopsis") {
+                $oldEnumCaseDescriptionElements = collectEnumSynopsisItemDescriptions($className, $elementToReplace);
+                $newEnumCaseDescriptionElements = collectEnumSynopsisItemDescriptions($className, $newSynopsis);
+
+                foreach ($newEnumCaseDescriptionElements as $key => $newEnumCaseDescriptionElement) {
+                    if (isset($oldEnumCaseDescriptionElements[$key]) === false) {
+                        continue;
+                    }
+
+                    $oldEnumCaseDescriptionElement = $oldEnumCaseDescriptionElements[$key];
+
+                    $newEnumCaseDescriptionElement->parentElement->replaceChild($oldEnumCaseDescriptionElement, $newEnumCaseDescriptionElement);
+                }
             }
 
             // Return the updated XML
@@ -5779,6 +5879,28 @@ function replaceClassSynopses(
     $undocumentedClassMap = array_diff_key($classMap, $documentedClassMap);
 
     return $classSynopses;
+}
+
+/**
+ * @return array<string, DOMElement>
+ */
+function collectEnumSynopsisItemDescriptions(string $className, DOMElement $synopsis): array
+{
+    $enumCaseDescriptionElements = [];
+
+    $enumCaseDescriptions = $synopsis->getElementsByTagName("enumitemdescription");
+    foreach ($enumCaseDescriptions as $enumItemDescription) {
+        $enumCaseNames = $enumItemDescription->parentElement->getElementsByTagName("enumidentifier");
+        if (empty($enumCaseNames)) {
+            continue;
+        }
+
+        $enumCaseName = $enumCaseNames[0]->textContent;
+
+        $enumCaseDescriptionElements["$className::$enumCaseName"] = $enumItemDescription;
+    }
+
+    return $enumCaseDescriptionElements;
 }
 
 function getReplacedSynopsisXml(string $xml): string
@@ -6048,9 +6170,10 @@ function installPhpParser(string $version, string $phpParserDir) {
         chdir(__DIR__);
 
         $tarName = "v$version.tar.gz";
-        passthru("wget https://github.com/nikic/PHP-Parser/archive/$tarName", $exit);
+        $downloadUrl = "https://github.com/nikic/PHP-Parser/archive/$tarName";
+        passthru("wget -O $tarName $downloadUrl", $exit);
         if ($exit !== 0) {
-            passthru("curl -LO https://github.com/nikic/PHP-Parser/archive/$tarName", $exit);
+            passthru("curl -LO $downloadUrl", $exit);
         }
         if ($exit !== 0) {
             throw new Exception("Failed to download PHP-Parser tarball");
@@ -6060,6 +6183,7 @@ function installPhpParser(string $version, string $phpParserDir) {
         }
         passthru("tar xvzf $tarName -C PHP-Parser-$version --strip-components 1", $exit);
         if ($exit !== 0) {
+            rmdir($phpParserDir);
             throw new Exception("Failed to extract PHP-Parser tarball");
         }
         unlink(__DIR__ . "/$tarName");
@@ -6088,7 +6212,7 @@ function initPhpParser() {
     }
 
     spl_autoload_register(static function(string $class) use ($phpParserDir) {
-        if (strpos($class, "PhpParser\\") === 0) {
+        if (str_starts_with($class, "PhpParser\\")) {
             $fileName = $phpParserDir . "/lib/" . str_replace("\\", "/", $class) . ".php";
             require $fileName;
         }

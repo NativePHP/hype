@@ -2,15 +2,14 @@
    +----------------------------------------------------------------------+
    | Zend Engine                                                          |
    +----------------------------------------------------------------------+
-   | Copyright (c) Zend Technologies Ltd. (http://www.zend.com)           |
+   | Copyright © Zend Technologies Ltd., a subsidiary company of          |
+   |     Perforce Software, Inc., and Contributors.                       |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 2.00 of the Zend license,     |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | http://www.zend.com/license/2_00.txt.                                |
-   | If you did not receive a copy of the Zend license and are unable to  |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@zend.com so we can mail you a copy immediately.              |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Andi Gutmans <andi@php.net>                                 |
    |          Zeev Suraski <zeev@php.net>                                 |
@@ -168,7 +167,7 @@ static zend_always_inline void zend_hash_real_init_mixed_ex(HashTable *ht)
 	void *data;
 	uint32_t nSize = ht->nTableSize;
 
-	ZEND_ASSERT(HT_SIZE_TO_MASK(nSize));
+	ZEND_ASSERT(HT_SIZE_TO_MASK(nSize) != 0);
 
 	if (UNEXPECTED(GC_FLAGS(ht) & IS_ARRAY_PERSISTENT)) {
 		data = pemalloc(HT_SIZE_EX(nSize, HT_SIZE_TO_MASK(nSize)), 1);
@@ -350,7 +349,7 @@ ZEND_API void ZEND_FASTCALL zend_hash_packed_to_hash(HashTable *ht)
 	uint32_t i;
 	uint32_t nSize = ht->nTableSize;
 
-	ZEND_ASSERT(HT_SIZE_TO_MASK(nSize));
+	ZEND_ASSERT(HT_SIZE_TO_MASK(nSize) != 0);
 
 	HT_ASSERT_RC1(ht);
 	// Alloc before assign to avoid inconsistencies on OOM
@@ -398,7 +397,7 @@ ZEND_API void ZEND_FASTCALL zend_hash_extend(HashTable *ht, uint32_t nSize, bool
 
 	if (nSize == 0) return;
 
-	ZEND_ASSERT(HT_SIZE_TO_MASK(nSize));
+	ZEND_ASSERT(HT_SIZE_TO_MASK(nSize) != 0);
 
 	if (UNEXPECTED(HT_FLAGS(ht) & HASH_FLAG_UNINITIALIZED)) {
 		if (nSize > ht->nTableSize) {
@@ -1062,6 +1061,13 @@ ZEND_API zval* ZEND_FASTCALL zend_hash_str_add_new(HashTable *ht, const char *st
 	return _zend_hash_str_add_or_update_i(ht, str, len, h, pData, HASH_ADD_NEW);
 }
 
+ZEND_API zval* ZEND_FASTCALL zend_hash_str_lookup(HashTable *ht, const char *str, size_t len)
+{
+	zend_ulong h = zend_hash_func(str, len);
+
+	return _zend_hash_str_add_or_update_i(ht, str, len, h, NULL, HASH_LOOKUP);
+}
+
 ZEND_API zval* ZEND_FASTCALL zend_hash_index_add_empty_element(HashTable *ht, zend_ulong h)
 {
 	zval dummy;
@@ -1104,7 +1110,10 @@ static zend_always_inline zval *_zend_hash_index_add_or_update_i(HashTable *ht, 
 		if ((flag & (HASH_ADD_NEW|HASH_ADD_NEXT)) != (HASH_ADD_NEW|HASH_ADD_NEXT)
 		 && h < ht->nNumUsed) {
 			zv = ht->arPacked + h;
-			if (Z_TYPE_P(zv) != IS_UNDEF) {
+			if (flag & HASH_ADD_NEW) {
+				ZEND_ASSERT(Z_TYPE_P(zv) == IS_UNDEF);
+				goto convert_to_hash;
+			} else if (Z_TYPE_P(zv) != IS_UNDEF) {
 				if (flag & HASH_LOOKUP) {
 					return zv;
 				}
@@ -1317,7 +1326,7 @@ static void ZEND_FASTCALL zend_hash_do_resize(HashTable *ht)
 		uint32_t nSize = ht->nTableSize + ht->nTableSize;
 		Bucket *old_buckets = ht->arData;
 
-		ZEND_ASSERT(HT_SIZE_TO_MASK(nSize));
+		ZEND_ASSERT(HT_SIZE_TO_MASK(nSize) != 0);
 
 		new_data = pemalloc(HT_SIZE_EX(nSize, HT_SIZE_TO_MASK(nSize)), GC_FLAGS(ht) & IS_ARRAY_PERSISTENT);
 		ht->nTableSize = nSize;
@@ -3202,7 +3211,7 @@ static zend_always_inline int zend_hash_compare_impl(const HashTable *ht1, const
 	return 0;
 }
 
-ZEND_API int zend_hash_compare(HashTable *ht1, HashTable *ht2, compare_func_t compar, bool ordered)
+ZEND_API int zend_hash_compare(HashTable *ht1, const HashTable *ht2, compare_func_t compar, bool ordered)
 {
 	int result;
 	IS_CONSISTENT(ht1);
@@ -3228,73 +3237,6 @@ ZEND_API int zend_hash_compare(HashTable *ht1, HashTable *ht2, compare_func_t co
 	return result;
 }
 
-
-ZEND_API zval* ZEND_FASTCALL zend_hash_minmax(const HashTable *ht, compare_func_t compar, uint32_t flag)
-{
-	uint32_t idx;
-	zval *res;
-
-	IS_CONSISTENT(ht);
-
-	if (ht->nNumOfElements == 0 ) {
-		return NULL;
-	}
-
-	if (HT_IS_PACKED(ht)) {
-		zval *zv;
-
-		idx = 0;
-		while (1) {
-			if (idx == ht->nNumUsed) {
-				return NULL;
-			}
-			if (Z_TYPE(ht->arPacked[idx]) != IS_UNDEF) break;
-			idx++;
-		}
-		res = ht->arPacked + idx;
-		for (; idx < ht->nNumUsed; idx++) {
-			zv = ht->arPacked + idx;
-			if (UNEXPECTED(Z_TYPE_P(zv) == IS_UNDEF)) continue;
-
-			if (flag) {
-				if (compar(res, zv) < 0) { /* max */
-					res = zv;
-				}
-			} else {
-				if (compar(res, zv) > 0) { /* min */
-					res = zv;
-				}
-			}
-		}
-	} else {
-		Bucket *p;
-
-		idx = 0;
-		while (1) {
-			if (idx == ht->nNumUsed) {
-				return NULL;
-			}
-			if (Z_TYPE(ht->arData[idx].val) != IS_UNDEF) break;
-			idx++;
-		}
-		res = &ht->arData[idx].val;
-		for (; idx < ht->nNumUsed; idx++) {
-			p = ht->arData + idx;
-			if (UNEXPECTED(Z_TYPE(p->val) == IS_UNDEF)) continue;
-
-			if (flag) {
-				if (compar(res, &p->val) < 0) { /* max */
-					res = &p->val;
-				}
-			} else {
-				if (compar(res, &p->val) > 0) { /* min */
-					res = &p->val;
-				}
-			}
-		}
-	}
-	return res;
-}
 
 ZEND_API bool ZEND_FASTCALL _zend_handle_numeric_str_ex(const char *key, size_t length, zend_ulong *idx)
 {

@@ -2,15 +2,13 @@
    +----------------------------------------------------------------------+
    | Zend OPcache                                                         |
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Dmitry Stogov <dmitry@php.net>                              |
    +----------------------------------------------------------------------+
@@ -135,17 +133,13 @@ static int zend_file_cache_flock(int fd, int type)
 			(ptr) = (void*)((char*)buf + (size_t)(ptr)); \
 		} \
 	} while (0)
+
 #define SERIALIZE_STR(ptr) do { \
 		if (ptr) { \
 			if (IS_ACCEL_INTERNED(ptr)) { \
 				(ptr) = zend_file_cache_serialize_interned((zend_string*)(ptr), info); \
 			} else { \
 				ZEND_ASSERT(IS_UNSERIALIZED(ptr)); \
-				/* script->corrupted shows if the script in SHM or not */ \
-				if (EXPECTED(script->corrupted)) { \
-					GC_ADD_FLAGS(ptr, IS_STR_INTERNED); \
-					GC_DEL_FLAGS(ptr, IS_STR_PERMANENT); \
-				} \
 				(ptr) = (void*)((char*)(ptr) - (char*)script->mem); \
 			} \
 		} \
@@ -164,6 +158,7 @@ static int zend_file_cache_flock(int fd, int type)
 					GC_ADD_FLAGS(ptr, IS_STR_INTERNED); \
 					GC_DEL_FLAGS(ptr, IS_STR_PERMANENT); \
 				} \
+				GC_DEL_FLAGS(ptr, IS_STR_CLASS_NAME_MAP_PTR); \
 			} \
 		} \
 	} while (0)
@@ -387,6 +382,12 @@ static void zend_file_cache_serialize_ast(zend_ast                 *ast,
 	} else if (ast->kind == ZEND_AST_CALLABLE_CONVERT) {
 		zend_ast_fcc *fcc = (zend_ast_fcc*)ast;
 		ZEND_MAP_PTR_INIT(fcc->fptr, NULL);
+		if (!IS_SERIALIZED(fcc->args)) {
+			SERIALIZE_PTR(fcc->args);
+			tmp = fcc->args;
+			UNSERIALIZE_PTR(tmp);
+			zend_file_cache_serialize_ast(tmp, script, info, buf);
+		}
 	} else if (zend_ast_is_decl(ast)) {
 		/* Not implemented. */
 		ZEND_UNREACHABLE();
@@ -656,6 +657,7 @@ static void zend_file_cache_serialize_op_array(zend_op_array            *op_arra
 					SERIALIZE_STR(p->name);
 				}
 				zend_file_cache_serialize_type(&p->type, script, info, buf);
+				SERIALIZE_STR(p->doc_comment);
 				p++;
 			}
 		}
@@ -1307,6 +1309,10 @@ static void zend_file_cache_unserialize_ast(zend_ast                *ast,
 	} else if (ast->kind == ZEND_AST_CALLABLE_CONVERT) {
 		zend_ast_fcc *fcc = (zend_ast_fcc*)ast;
 		ZEND_MAP_PTR_NEW(fcc->fptr);
+		if (!IS_UNSERIALIZED(fcc->args)) {
+			UNSERIALIZE_PTR(fcc->args);
+			zend_file_cache_unserialize_ast(fcc->args, script, buf);
+		}
 	} else if (zend_ast_is_decl(ast)) {
 		/* Not implemented. */
 		ZEND_UNREACHABLE();
@@ -1555,6 +1561,7 @@ static void zend_file_cache_unserialize_op_array(zend_op_array           *op_arr
 					UNSERIALIZE_STR(p->name);
 				}
 				zend_file_cache_unserialize_type(&p->type, (op_array->fn_flags & ZEND_ACC_CLOSURE) ? NULL : op_array->scope, script, buf);
+				UNSERIALIZE_STR(p->doc_comment);
 				p++;
 			}
 		}
@@ -2112,7 +2119,7 @@ void zend_file_cache_invalidate(zend_string *full_path)
 	if (ZCG(accel_directives).file_cache_read_only) {
 		return;
 	}
-	
+
 	char *filename;
 
 	filename = zend_file_cache_get_bin_file_path(full_path);

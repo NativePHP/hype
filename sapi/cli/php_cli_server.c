@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Author: Moriyoshi Koizumi <moriyoshi@php.net>                        |
    |         Xinchen Hui       <laruence@php.net>                         |
@@ -44,7 +42,6 @@
 #include <unistd.h>
 #endif
 
-#include <signal.h>
 #include <locale.h>
 
 #ifdef HAVE_DLFCN_H
@@ -304,7 +301,7 @@ static int status_comp(const void *a, const void *b) /* {{{ */
 
 static const char *get_status_string(int code) /* {{{ */
 {
-	http_response_status_code_pair needle = {code, NULL},
+	const http_response_status_code_pair needle = {code, NULL},
 		*result = NULL;
 
 	result = bsearch(&needle, http_status_map, http_status_map_len, sizeof(needle), status_comp);
@@ -395,22 +392,14 @@ static void append_essential_headers(smart_str* buffer, php_cli_server_client *c
 
 static const char *get_mime_type(const php_cli_server *server, const char *ext, size_t ext_len) /* {{{ */
 {
-	char *ret;
-	ALLOCA_FLAG(use_heap)
-	char *ext_lower = do_alloca(ext_len + 1, use_heap);
-	zend_str_tolower_copy(ext_lower, ext, ext_len);
-	ret = zend_hash_str_find_ptr(&server->extension_mime_types, ext_lower, ext_len);
-	free_alloca(ext_lower, use_heap);
-	return (const char*)ret;
+	return zend_hash_str_find_ptr_lc(&server->extension_mime_types, ext, ext_len);
 } /* }}} */
 
 PHP_FUNCTION(apache_request_headers) /* {{{ */
 {
 	php_cli_server_client *client;
 
-	if (zend_parse_parameters_none() == FAILURE) {
-		RETURN_THROWS();
-	}
+	ZEND_PARSE_PARAMETERS_NONE();
 
 	client = SG(server_context);
 
@@ -449,9 +438,7 @@ static void add_response_header(sapi_header_struct *h, zval *return_value) /* {{
 
 PHP_FUNCTION(apache_response_headers) /* {{{ */
 {
-	if (zend_parse_parameters_none() == FAILURE) {
-		RETURN_THROWS();
-	}
+	ZEND_PARSE_PARAMETERS_NONE();
 
 	array_init(return_value);
 	zend_llist_apply_with_argument(&SG(sapi_headers).headers, (llist_apply_with_arg_func_t)add_response_header, return_value);
@@ -664,7 +651,7 @@ static int sapi_cli_server_register_entry_cb(zval *entry, int num_args, va_list 
 			if (key[i] == '-') {
 				key[i] = '_';
 			} else {
-				key[i] = toupper(key[i]);
+				key[i] = toupper((unsigned char)key[i]);
 			}
 		}
 		spprintf(&real_key, 0, "%s_%s", "HTTP", key);
@@ -2659,7 +2646,7 @@ static zend_result php_cli_server_recv_event_read_request(php_cli_server *server
 		case 0:
 			php_cli_server_poller_add(&server->poller, POLLIN, client->sock);
 			return SUCCESS;
-		EMPTY_SWITCH_DEFAULT_CASE();
+		default: ZEND_UNREACHABLE();
 	}
 	/* Under ASAN the compiler somehow doesn't realise that the switch block always returns */
 	return FAILURE;

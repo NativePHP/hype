@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Amitay Isaacs  <amitay@w-o-i.com>                           |
    |          Eric Warnke    <ericw@albany.edu>                           |
@@ -102,9 +100,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 ZEND_GET_MODULE(ldap)
 #endif
 
-static inline ldap_linkdata *ldap_link_from_obj(zend_object *obj) {
-	return (ldap_linkdata *)((char *)(obj) - XtOffsetOf(ldap_linkdata, std));
-}
+#define ldap_link_from_obj(obj) ZEND_CONTAINER_OF(obj, ldap_linkdata, std)
 
 #define Z_LDAP_LINK_P(zv) ldap_link_from_obj(Z_OBJ_P(zv))
 
@@ -149,9 +145,7 @@ static void ldap_link_free_obj(zend_object *obj)
 	zend_object_std_dtor(&ld->std);
 }
 
-static inline ldap_resultdata *ldap_result_from_obj(zend_object *obj) {
-	return (ldap_resultdata *)((char *)(obj) - XtOffsetOf(ldap_resultdata, std));
-}
+#define ldap_result_from_obj(obj) ZEND_CONTAINER_OF(obj, ldap_resultdata, std)
 
 #define Z_LDAP_RESULT_P(zv) ldap_result_from_obj(Z_OBJ_P(zv))
 
@@ -186,9 +180,7 @@ static void ldap_result_free_obj(zend_object *obj)
 	zend_object_std_dtor(&result->std);
 }
 
-static inline ldap_result_entry *ldap_result_entry_from_obj(zend_object *obj) {
-	return (ldap_result_entry *)((char *)(obj) - XtOffsetOf(ldap_result_entry, std));
-}
+#define ldap_result_entry_from_obj(obj) ZEND_CONTAINER_OF(obj, ldap_result_entry, std)
 
 #define Z_LDAP_RESULT_ENTRY_P(zv) ldap_result_entry_from_obj(Z_OBJ_P(zv))
 
@@ -273,7 +265,7 @@ static zend_string* php_ldap_try_get_ldap_value_from_zval(zval *zv) {
 
 /* The char pointer MUST refer to the char* of a zend_string struct */
 static void php_ldap_zend_string_release_from_char_pointer(char *ptr) {
-	zend_string_release((zend_string*) (ptr - XtOffsetOf(zend_string, val)));
+	zend_string_release((zend_string*) (ptr - offsetof(zend_string, val)));
 }
 
 /* {{{ Parse controls from and to arrays */
@@ -425,7 +417,7 @@ static void _php_ldap_control_to_array(LDAP *ld, LDAPControl* ctrl, zval* array,
 static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashTable *control_ht)
 {
 	zval* val;
-	zend_string *control_oid;
+	zend_string *control_oid, *control_oid_tmp;
 	char** ldap_attrs = NULL;
 	LDAPSortKey** sort_keys = NULL;
 	zend_string *tmpstring = NULL, **tmpstrings1 = NULL, **tmpstrings2 = NULL;
@@ -436,8 +428,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 		return -1;
 	}
 
-	control_oid = zval_get_string(val);
-	if (EG(exception)) {
+	control_oid = zval_try_get_tmp_string(val, &control_oid_tmp);
+	if (!control_oid) {
 		return -1;
 	}
 
@@ -453,8 +445,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 
 	if ((val = zend_hash_find(control_ht, ZSTR_KNOWN(ZEND_STR_VALUE))) != NULL) {
 		if (Z_TYPE_P(val) != IS_ARRAY) {
-			tmpstring = zval_get_string(val);
-			if (EG(exception)) {
+			tmpstring = zval_try_get_string(val);
+			if (!tmpstring) {
 				rc = -1;
 				goto failure;
 			}
@@ -468,8 +460,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 				pagesize = zval_get_long(tmp);
 			}
 			if ((tmp = zend_hash_str_find(Z_ARRVAL_P(val), "cookie", sizeof("cookie") - 1)) != NULL) {
-				tmpstring = zval_get_string(tmp);
-				if (EG(exception)) {
+				tmpstring = zval_try_get_string(tmp);
+				if (!tmpstring) {
 					rc = -1;
 					goto failure;
 				}
@@ -488,8 +480,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 				rc = -1;
 				zend_value_error("%s(): Control must have a \"filter\" key", get_active_function_name());
 			} else {
-				zend_string* assert = zval_get_string(tmp);
-				if (EG(exception)) {
+				zend_string* assert = zval_try_get_string(tmp);
+				if (!assert) {
 					rc = -1;
 					goto failure;
 				}
@@ -516,8 +508,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 					rc = -1;
 					php_error_docref(NULL, E_WARNING, "Failed to allocate control value");
 				} else {
-					tmpstring = zval_get_string(tmp);
-					if (EG(exception)) {
+					tmpstring = zval_try_get_string(tmp);
+					if (!tmpstring) {
 						rc = -1;
 						goto failure;
 					}
@@ -555,8 +547,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 							goto failure;
 						}
 
-						tmpstrings1[num_tmpstrings1] = zval_get_string(attr);
-						if (EG(exception)) {
+						tmpstrings1[num_tmpstrings1] = zval_try_get_string(attr);
+						if (!tmpstrings1[num_tmpstrings1]) {
 							rc = -1;
 							goto failure;
 						}
@@ -585,6 +577,7 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 
 			uint32_t num_keys = zend_hash_num_elements(Z_ARRVAL_P(val));
 			sort_keys = safe_emalloc((num_keys+1), sizeof(LDAPSortKey*), 0);
+			memset(sort_keys, 0, (num_keys+1) * sizeof(LDAPSortKey*));
 			tmpstrings1 = safe_emalloc(num_keys, sizeof(zend_string*), 0);
 			tmpstrings2 = safe_emalloc(num_keys, sizeof(zend_string*), 0);
 			num_tmpstrings1 = 0;
@@ -603,8 +596,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 					goto failure;
 				}
 				sort_keys[i] = emalloc(sizeof(LDAPSortKey));
-				tmpstrings1[num_tmpstrings1] = zval_get_string(tmp);
-				if (EG(exception)) {
+				tmpstrings1[num_tmpstrings1] = zval_try_get_string(tmp);
+				if (!tmpstrings1[num_tmpstrings1]) {
 					rc = -1;
 					goto failure;
 				}
@@ -612,8 +605,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 				++num_tmpstrings1;
 
 				if ((tmp = zend_hash_str_find(Z_ARRVAL_P(sortkey), "oid", sizeof("oid") - 1)) != NULL) {
-					tmpstrings2[num_tmpstrings2] = zval_get_string(tmp);
-					if (EG(exception)) {
+					tmpstrings2[num_tmpstrings2] = zval_try_get_string(tmp);
+					if (!tmpstrings2[num_tmpstrings2]) {
 						rc = -1;
 						goto failure;
 					}
@@ -659,8 +652,8 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 			}
 
 			if ((tmp = zend_hash_str_find(Z_ARRVAL_P(val), "attrvalue", sizeof("attrvalue") - 1)) != NULL) {
-				tmpstring = zval_get_string(tmp);
-				if (EG(exception)) {
+				tmpstring = zval_try_get_string(tmp);
+				if (!tmpstring) {
 					rc = -1;
 					goto failure;
 				}
@@ -684,14 +677,15 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 				goto failure;
 			}
 
+			zend_string *context_str = NULL;
 			if ((tmp = zend_hash_str_find(Z_ARRVAL_P(val), "context", sizeof("context") - 1)) != NULL) {
-				tmpstring = zval_get_string(tmp);
-				if (EG(exception)) {
+				context_str = zval_try_get_string(tmp);
+				if (!context_str) {
 					rc = -1;
 					goto failure;
 				}
-				context.bv_val = ZSTR_VAL(tmpstring);
-				context.bv_len = ZSTR_LEN(tmpstring);
+				context.bv_val = ZSTR_VAL(context_str);
+				context.bv_len = ZSTR_LEN(context_str);
 				vlvInfo.ldvlv_context = &context;
 			} else {
 				vlvInfo.ldvlv_context = NULL;
@@ -702,6 +696,9 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 			rc = ldap_create_vlv_control_value(ld, &vlvInfo, &control_value);
 			if (rc != LDAP_SUCCESS) {
 				php_error_docref(NULL, E_WARNING, "Failed to create VLV control value: %s (%d)", ldap_err2string(rc), rc);
+			}
+			if (context_str) {
+				zend_string_release_ex(context_str, false);
 			}
 		} else {
 			zend_type_error("%s(): Control OID %s cannot be of type array", get_active_function_name(), ZSTR_VAL(control_oid));
@@ -714,7 +711,7 @@ static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashT
 	}
 
 failure:
-	zend_string_release(control_oid);
+	zend_tmp_string_release(control_oid_tmp);
 	if (tmpstring != NULL) {
 		zend_string_release(tmpstring);
 	}
@@ -875,7 +872,7 @@ PHP_MINIT_FUNCTION(ldap)
 	ldap_link_ce->default_object_handlers = &ldap_link_object_handlers;
 
 	memcpy(&ldap_link_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-	ldap_link_object_handlers.offset = XtOffsetOf(ldap_linkdata, std);
+	ldap_link_object_handlers.offset = offsetof(ldap_linkdata, std);
 	ldap_link_object_handlers.free_obj = ldap_link_free_obj;
 	ldap_link_object_handlers.get_constructor = ldap_link_get_constructor;
 	ldap_link_object_handlers.clone_obj = NULL;
@@ -886,7 +883,7 @@ PHP_MINIT_FUNCTION(ldap)
 	ldap_result_ce->default_object_handlers = &ldap_result_object_handlers;
 
 	memcpy(&ldap_result_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-	ldap_result_object_handlers.offset = XtOffsetOf(ldap_resultdata, std);
+	ldap_result_object_handlers.offset = offsetof(ldap_resultdata, std);
 	ldap_result_object_handlers.free_obj = ldap_result_free_obj;
 	ldap_result_object_handlers.get_constructor = ldap_result_get_constructor;
 	ldap_result_object_handlers.clone_obj = NULL;
@@ -897,7 +894,7 @@ PHP_MINIT_FUNCTION(ldap)
 	ldap_result_entry_ce->default_object_handlers = &ldap_result_entry_object_handlers;
 
 	memcpy(&ldap_result_entry_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-	ldap_result_entry_object_handlers.offset = XtOffsetOf(ldap_result_entry, std);
+	ldap_result_entry_object_handlers.offset = offsetof(ldap_result_entry, std);
 	ldap_result_entry_object_handlers.free_obj = ldap_result_entry_free_obj;
 	ldap_result_entry_object_handlers.get_constructor = ldap_result_entry_get_constructor;
 	ldap_result_entry_object_handlers.clone_obj = NULL;
@@ -980,7 +977,8 @@ PHP_FUNCTION(ldap_connect)
 
 #ifdef HAVE_ORALDAP
 	if (ZEND_NUM_ARGS() == 3 || ZEND_NUM_ARGS() == 4) {
-		WRONG_PARAM_COUNT;
+		zend_wrong_param_count();
+		RETURN_THROWS();
 	}
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|s!lssl", &host, &hostlen, &port, &wallet, &walletlen, &walletpasswd, &walletpasswdlen, &authmode) != SUCCESS) {
@@ -2335,9 +2333,14 @@ static void php_ldap_do_modify(INTERNAL_FUNCTION_PARAMETERS, int oper, bool ext)
 			SEPARATE_ARRAY(attribute_values);
 			uint32_t num_values = zend_hash_num_elements(Z_ARRVAL_P(attribute_values));
 			if (num_values == 0) {
-				zend_argument_value_error(3, "attribute \"%s\" must be a non-empty list of attribute values", ZSTR_VAL(attribute));
-				RETVAL_FALSE;
-				goto cleanup;
+				if (UNEXPECTED(oper == LDAP_MOD_ADD)) {
+					zend_argument_value_error(3, "attribute \"%s\" must be a non-empty list of attribute values", ZSTR_VAL(attribute));
+					RETVAL_FALSE;
+					goto cleanup;
+				}
+				/* When we modify, we mean we delete the attribute */
+				attribute_index++;
+				continue;
 			}
 			if (!php_ldap_is_numerically_indexed_array(Z_ARRVAL_P(attribute_values))) {
 				zend_argument_value_error(3, "attribute \"%s\" must be an array of attribute values with numeric keys", ZSTR_VAL(attribute));
@@ -2424,7 +2427,9 @@ static void php_ldap_do_modify(INTERNAL_FUNCTION_PARAMETERS, int oper, bool ext)
 			object_init_ex(return_value, ldap_result_ce);
 			result = Z_LDAP_RESULT_P(return_value);
 			result->result = ldap_res;
-		} else RETVAL_TRUE;
+		} else {
+			RETVAL_TRUE;
+		}
 	}
 
 cleanup:
@@ -2771,7 +2776,7 @@ PHP_FUNCTION(ldap_modify_batch)
 			case LDAP_MODIFY_BATCH_REPLACE:
 				ldap_operation = LDAP_MOD_REPLACE;
 				break;
-			EMPTY_SWITCH_DEFAULT_CASE();
+			default: ZEND_UNREACHABLE();
 		}
 
 		/* fill in the basic info */
@@ -2790,8 +2795,8 @@ PHP_FUNCTION(ldap_modify_batch)
 			zend_ulong value_index = 0;
 			zval *modification_value_zv = NULL;
 			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(modification_values), modification_value_zv) {
-				zend_string *modval = zval_get_string(modification_value_zv);
-				if (EG(exception)) {
+				zend_string *modval = zval_try_get_string(modification_value_zv);
+				if (!modval) {
 					RETVAL_FALSE;
 					ldap_mods[modification_index]->mod_bvalues[value_index] = NULL;
 					num_mods = modification_index + 1;

@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Felipe Pena <felipe@php.net>                                |
    | Authors: Joe Watkins <joe.watkins@live.co.uk>                        |
@@ -288,9 +286,7 @@ PHP_FUNCTION(phpdbg_break_next)
 {
 	zend_execute_data *ex;
 
-	if (zend_parse_parameters_none() == FAILURE) {
-		RETURN_THROWS();
-	}
+	ZEND_PARSE_PARAMETERS_NONE();
 
 	ex = EG(current_execute_data);
 	while (ex && ex->func && !ZEND_USER_CODE(ex->func->type)) {
@@ -347,9 +343,7 @@ PHP_FUNCTION(phpdbg_break_function)
 /* {{{ instructs phpdbg to clear breakpoints */
 PHP_FUNCTION(phpdbg_clear)
 {
-	if (zend_parse_parameters_none() == FAILURE) {
-		RETURN_THROWS();
-	}
+	ZEND_PARSE_PARAMETERS_NONE();
 
 	zend_hash_clean(&PHPDBG_G(bp)[PHPDBG_BREAK_FILE]);
 	zend_hash_clean(&PHPDBG_G(bp)[PHPDBG_BREAK_FILE_PENDING]);
@@ -404,9 +398,7 @@ PHP_FUNCTION(phpdbg_start_oplog)
 {
 	phpdbg_oplog_list *prev;
 
-	if (zend_parse_parameters_none() == FAILURE) {
-		RETURN_THROWS();
-	}
+	ZEND_PARSE_PARAMETERS_NONE();
 
 	prev = PHPDBG_G(oplog_list);
 
@@ -493,7 +485,7 @@ PHP_FUNCTION(phpdbg_get_executable)
 	HashTable *files = &PHPDBG_G(file_sources);
 	HashTable files_tmp;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|H", &options) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|h", &options) == FAILURE) {
 		RETURN_THROWS();
 	}
 
@@ -587,7 +579,7 @@ PHP_FUNCTION(phpdbg_end_oplog)
 	bool by_function = false;
 	bool by_opcode = false;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|H", &options) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|h", &options) == FAILURE) {
 		RETURN_THROWS();
 	}
 
@@ -1207,9 +1199,9 @@ phpdbg_main:
 			case 'z':
 				zend_extensions_len++;
 				if (zend_extensions_list) {
-					zend_extensions_list = realloc(zend_extensions_list, sizeof(char*) * zend_extensions_len);
+					zend_extensions_list = perealloc(zend_extensions_list, sizeof(char*) * zend_extensions_len, true);
 				} else {
-					zend_extensions_list = malloc(sizeof(char*) * zend_extensions_len);
+					zend_extensions_list = pemalloc(sizeof(char*) * zend_extensions_len, true);
 				}
 				zend_extensions_list[zend_extensions_len-1] = strdup(php_optarg);
 			break;

@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Christian Stocker <chregu@php.net>                          |
    |          Rob Richards <rrichards@php.net>                            |
@@ -138,7 +136,7 @@ zend_result dom_node_node_name_read(dom_object *obj, zval *retval)
 		case XML_TEXT_NODE:
 			ZVAL_STRING(retval, "#text");
 			break;
-		EMPTY_SWITCH_DEFAULT_CASE();
+		default: ZEND_UNREACHABLE();
 	}
 
 	return SUCCESS;
@@ -294,7 +292,18 @@ zend_result dom_node_child_nodes_read(dom_object *obj, zval *retval)
 {
 	DOM_PROP_NODE(xmlNodePtr, nodep, obj);
 
-	object_init_ex(retval, dom_get_nodelist_ce(php_dom_follow_spec_intern(obj)));
+	object_init_ex(retval, dom_get_nodelist_ce(false));
+	dom_object *intern = Z_DOMOBJ_P(retval);
+	php_dom_create_obj_map(obj, intern, NULL, NULL, NULL, &php_dom_obj_map_child_nodes);
+
+	return SUCCESS;
+}
+
+zend_result dom_modern_node_child_nodes_read(dom_object *obj, zval *retval)
+{
+	DOM_PROP_NODE(xmlNodePtr, nodep, obj);
+
+	object_init_ex(retval, dom_get_nodelist_ce(true));
 	dom_object *intern = Z_DOMOBJ_P(retval);
 	php_dom_create_obj_map(obj, intern, NULL, NULL, NULL, &php_dom_obj_map_child_nodes);
 
@@ -666,14 +675,25 @@ zend_result dom_node_base_uri_read(dom_object *obj, zval *retval)
 		ZVAL_STRING(retval, (const char *) baseuri);
 		xmlFree(baseuri);
 	} else {
-		if (php_dom_follow_spec_intern(obj)) {
-			if (nodep->doc->URL) {
-				ZVAL_STRING(retval, (const char *) nodep->doc->URL);
-			} else {
-				ZVAL_STRING(retval, "about:blank");
-			}
+		ZVAL_NULL(retval);
+	}
+
+	return SUCCESS;
+}
+
+zend_result dom_modern_node_base_uri_read(dom_object *obj, zval *retval)
+{
+	DOM_PROP_NODE(xmlNodePtr, nodep, obj);
+
+	xmlChar *baseuri = xmlNodeGetBase(nodep->doc, nodep);
+	if (baseuri) {
+		ZVAL_STRING(retval, (const char *) baseuri);
+		xmlFree(baseuri);
+	} else {
+		if (nodep->doc && nodep->doc->URL) {
+			ZVAL_STRING(retval, (const char *) nodep->doc->URL);
 		} else {
-			ZVAL_NULL(retval);
+			ZVAL_STRING(retval, "about:blank");
 		}
 	}
 
@@ -1878,8 +1898,7 @@ static void dom_node_lookup_prefix(INTERNAL_FUNCTION_PARAMETERS, bool modern)
 			case XML_DOCUMENT_FRAG_NODE:
 			case XML_DOCUMENT_TYPE_NODE:
 			case XML_DTD_NODE:
-				RETURN_NULL();
-				break;
+				return;
 			default:
 				lookupp = nodep->parent;
 		}
@@ -1898,8 +1917,6 @@ static void dom_node_lookup_prefix(INTERNAL_FUNCTION_PARAMETERS, bool modern)
 			}
 		}
 	}
-
-	RETURN_NULL();
 }
 
 PHP_METHOD(DOMNode, lookupPrefix)
@@ -2065,16 +2082,14 @@ PHP_METHOD(DOMNode, lookupNamespaceURI)
 			prefix = NULL;
 		}
 		const char *ns_uri = dom_locate_a_namespace(nodep, prefix);
-		if (ns_uri == NULL) {
-			RETURN_NULL();
-		} else {
+		if (ns_uri != NULL) {
 			RETURN_STRING(ns_uri);
 		}
 	} else {
 		if (nodep->type == XML_DOCUMENT_NODE || nodep->type == XML_HTML_DOCUMENT_NODE) {
 			nodep = xmlDocGetRootElement((xmlDocPtr) nodep);
 			if (nodep == NULL) {
-				RETURN_NULL();
+				return;
 			}
 		}
 
@@ -2083,8 +2098,6 @@ PHP_METHOD(DOMNode, lookupNamespaceURI)
 			RETURN_STRING((char *) nsptr->href);
 		}
 	}
-
-	RETURN_NULL();
 }
 /* }}} end dom_node_lookup_namespace_uri */
 
@@ -2133,7 +2146,7 @@ static void dom_canonicalization(INTERNAL_FUNCTION_PARAMETERS, int mode) /* {{{ 
 		}
 	} else {
 		if (zend_parse_parameters(ZEND_NUM_ARGS(),
-			"s|bba!a!", &file, &file_len, &exclusive,
+			"p|bba!a!", &file, &file_len, &exclusive,
 			&with_comments, &xpath_array, &ns_prefixes) == FAILURE) {
 			RETURN_THROWS();
 		}
@@ -2143,7 +2156,27 @@ static void dom_canonicalization(INTERNAL_FUNCTION_PARAMETERS, int mode) /* {{{ 
 
 	docp = nodep->doc;
 
-	if (! docp) {
+	HashTable links;
+	bool modern = php_dom_follow_spec_node(nodep);
+	if (modern) {
+		xmlNodePtr root = nodep;
+		while (root->parent) {
+			root = root->parent;
+		}
+
+		if (UNEXPECTED(root->type != XML_DOCUMENT_NODE && root->type != XML_HTML_DOCUMENT_NODE)) {
+			php_dom_throw_error_with_message(HIERARCHY_REQUEST_ERR, "Canonicalization can only happen on nodes attached to a document.", /* strict */ true);
+			RETURN_THROWS();
+		}
+
+		zend_hash_init(&links, 0, NULL, NULL, false);
+		xmlNodePtr root_element = xmlDocGetRootElement(docp);
+
+		if (root_element) {
+			dom_relink_ns_decls(&links, root_element);
+		}
+	} else if (!docp) {
+		/* Note: not triggerable with modern DOM */
 		zend_throw_error(NULL, "Node must be associated with a document");
 		RETURN_THROWS();
 	}
@@ -2165,12 +2198,12 @@ static void dom_canonicalization(INTERNAL_FUNCTION_PARAMETERS, int mode) /* {{{ 
 		if (!tmp) {
 			/* if mode == 0 then $xpath arg is 3, if mode == 1 then $xpath is 4 */
 			zend_argument_value_error(3 + mode, "must have a \"query\" key");
-			RETURN_THROWS();
+			goto clean_links;
 		}
 		if (Z_TYPE_P(tmp) != IS_STRING) {
 			/* if mode == 0 then $xpath arg is 3, if mode == 1 then $xpath is 4 */
 			zend_argument_type_error(3 + mode, "\"query\" option must be a string, %s given", zend_zval_value_name(tmp));
-			RETURN_THROWS();
+			goto clean_links;
 		}
 		xquery = Z_STRVAL_P(tmp);
 
@@ -2202,7 +2235,7 @@ static void dom_canonicalization(INTERNAL_FUNCTION_PARAMETERS, int mode) /* {{{ 
 			}
 			xmlXPathFreeContext(ctxp);
 			zend_throw_error(NULL, "XPath query did not return a nodeset");
-			RETURN_THROWS();
+			goto clean_links;
 		}
 	}
 
@@ -2271,6 +2304,12 @@ static void dom_canonicalization(INTERNAL_FUNCTION_PARAMETERS, int mode) /* {{{ 
 			RETURN_LONG(bytes);
 		}
 	}
+
+clean_links:
+	if (modern) {
+		dom_unlink_ns_decls(&links);
+		zend_hash_destroy(&links);
+	}
 }
 /* }}} */
 
@@ -2294,13 +2333,12 @@ static void dom_node_get_node_path(INTERNAL_FUNCTION_PARAMETERS, bool throw)
 	zval *id;
 	xmlNode *nodep;
 	dom_object *intern;
-	char *value;
 
 	ZEND_PARSE_PARAMETERS_NONE();
 
 	DOM_GET_THIS_OBJ(nodep, id, xmlNodePtr, intern);
 
-	value = (char *) xmlGetNodePath(nodep);
+	char *value = (char *) xmlGetNodePath(nodep);
 	if (value == NULL) {
 		/* This is only possible when an invalid argument is passed (e.g. namespace declaration, but that's not the case for this call site),
 		 * or on allocation failure. So in other words, this only happens on allocation failure. */
@@ -2308,7 +2346,6 @@ static void dom_node_get_node_path(INTERNAL_FUNCTION_PARAMETERS, bool throw)
 			php_dom_throw_error(INVALID_STATE_ERR, /* strict */ true);
 			RETURN_THROWS();
 		}
-		RETURN_NULL();
 	} else {
 		RETVAL_STRING(value);
 		xmlFree(value);

@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Dmitry Stogov <dmitry@php.net>                              |
    +----------------------------------------------------------------------+
@@ -641,7 +639,7 @@ static int is_port_number(const char *bindpath)
 
 int fcgi_listen(const char *path, int backlog)
 {
-	char     *s;
+	const char *s;
 	int       tcp = 0;
 	char      host[MAXPATHLEN];
 	short     port = 0;
@@ -737,7 +735,7 @@ int fcgi_listen(const char *path, int backlog)
 		memset(&sa.sa_unix, 0, sizeof(sa.sa_unix));
 		sa.sa_unix.sun_family = AF_UNIX;
 		memcpy(sa.sa_unix.sun_path, path, path_len + 1);
-		sock_len = XtOffsetOf(struct sockaddr_un, sun_path) + path_len;
+		sock_len = offsetof(struct sockaddr_un, sun_path) + path_len;
 #ifdef HAVE_STRUCT_SOCKADDR_UN_SUN_LEN
 		sa.sa_unix.sun_len = sock_len;
 #endif
@@ -944,7 +942,7 @@ static inline ssize_t safe_write(fcgi_request *req, const void *buf, size_t coun
 	return n;
 }
 
-static inline ssize_t safe_read(fcgi_request *req, const void *buf, size_t count)
+static inline ssize_t safe_read(fcgi_request *req, void *buf, size_t count)
 {
 	int    ret;
 	size_t n = 0;

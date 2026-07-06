@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Authors: Pierre A. Joye <pierre@php.net>                             |
    +----------------------------------------------------------------------+
@@ -32,7 +30,7 @@ PHP_FUNCTION(dns_get_mx) /* {{{ */
 	DNS_STATUS      status;                 /* Return value of DnsQuery_A() function */
 	PDNS_RECORD     pResult, pRec;          /* Pointer to DNS_RECORD structure */
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "sz|z", &hostname, &hostname_len, &mx_list, &weight_list) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "pz|z", &hostname, &hostname_len, &mx_list, &weight_list) == FAILURE) {
 		RETURN_THROWS();
 	}
 
@@ -86,7 +84,7 @@ PHP_FUNCTION(dns_check_record)
 	DNS_STATUS      status;                 /* Return value of DnsQuery_A() function */
 	PDNS_RECORD     pResult;          /* Pointer to DNS_RECORD structure */
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "s|S", &hostname, &hostname_len, &rectype) == FAILURE) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "p|S", &hostname, &hostname_len, &rectype) == FAILURE) {
 		RETURN_THROWS();
 	}
 
@@ -116,11 +114,7 @@ PHP_FUNCTION(dns_check_record)
 
 	status = DnsQuery_A(hostname, type, DNS_QUERY_STANDARD, NULL, &pResult, NULL);
 
-	if (status) {
-		RETURN_FALSE;
-	}
-
-	RETURN_TRUE;
+	RETURN_BOOL(!status);
 }
 /* }}} */
 
@@ -343,7 +337,7 @@ PHP_FUNCTION(dns_get_record)
 	int type, type_to_fetch, first_query = 1, store_results = 1;
 	bool raw = false;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "s|lz!z!b",
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "p|lz!z!b",
 			&hostname, &hostname_len, &type_param, &authns, &addtl, &raw) == FAILURE) {
 		RETURN_THROWS();
 	}

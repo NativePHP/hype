@@ -1,14 +1,12 @@
 /*
    +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
+   | Copyright © The PHP Group and Contributors.                          |
    +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | https://www.php.net/license/3_01.txt                                 |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
+   | This source file is subject to the Modified BSD License that is      |
+   | bundled with this package in the file LICENSE, and is available      |
+   | through the World Wide Web at <https://www.php.net/license/>.        |
+   |                                                                      |
+   | SPDX-License-Identifier: BSD-3-Clause                                |
    +----------------------------------------------------------------------+
    | Author: Rasmus Lerdorf <rasmus@lerdorf.on.ca>                        |
    +----------------------------------------------------------------------+
@@ -76,6 +74,13 @@ PHPAPI bool php_header(void)
 	}
 }
 
+PHPAPI bool php_is_valid_samesite_value(zend_string *value)
+{
+	return zend_string_equals_literal_ci(value, "Strict")
+		|| zend_string_equals_literal_ci(value, "Lax")
+		|| zend_string_equals_literal_ci(value, "None");
+}
+
 #define ILLEGAL_COOKIE_CHARACTER "\",\", \";\", \" \", \"\\t\", \"\\r\", \"\\n\", \"\\013\", or \"\\014\""
 PHPAPI zend_result php_setcookie(zend_string *name, zend_string *value, time_t expires,
 	zend_string *path, zend_string *domain, bool secure, bool httponly,
@@ -123,7 +128,11 @@ PHPAPI zend_result php_setcookie(zend_string *name, zend_string *value, time_t e
 		return FAILURE;
 	}
 
-	/* Should check value of SameSite? */
+	if (samesite && ZSTR_LEN(samesite) > 0 && !php_is_valid_samesite_value(samesite)) {
+		zend_value_error("%s(): \"samesite\" option must be \"Strict\", \"Lax\", \"None\", or \"\"",
+			get_active_function_name());
+		return FAILURE;
+	}
 
 	if (value == NULL || ZSTR_LEN(value) == 0) {
 		/*
@@ -209,14 +218,23 @@ static zend_result php_head_parse_cookie_options_array(HashTable *options, zend_
 		if (zend_string_equals_literal_ci(key, "expires")) {
 			*expires = zval_get_long(value);
 		} else if (zend_string_equals_literal_ci(key, "path")) {
+			if (*path) {
+				zend_string_release(*path);
+			}
 			*path = zval_get_string(value);
 		} else if (zend_string_equals_literal_ci(key, "domain")) {
+			if (*domain) {
+				zend_string_release(*domain);
+			}
 			*domain = zval_get_string(value);
 		} else if (zend_string_equals_literal_ci(key, "secure")) {
 			*secure = zend_is_true(value);
 		} else if (zend_string_equals_literal_ci(key, "httponly")) {
 			*httponly = zend_is_true(value);
 		} else if (zend_string_equals_literal_ci(key, "samesite")) {
+			if (*samesite) {
+				zend_string_release(*samesite);
+			}
 			*samesite = zval_get_string(value);
 		} else if (zend_string_equals_literal_ci(key, "partitioned")) {
 			*partitioned = zend_is_true(value);
@@ -260,11 +278,7 @@ static void php_setcookie_common(INTERNAL_FUNCTION_PARAMETERS, bool is_raw)
 		}
 	}
 
-	if (php_setcookie(name, value, expires, path, domain, secure, httponly, samesite, partitioned, !is_raw) == SUCCESS) {
-		RETVAL_TRUE;
-	} else {
-		RETVAL_FALSE;
-	}
+	RETVAL_BOOL(php_setcookie(name, value, expires, path, domain, secure, httponly, samesite, partitioned, !is_raw) == SUCCESS);
 
 	if (options) {
 cleanup:
@@ -328,11 +342,7 @@ PHP_FUNCTION(headers_sent)
 		break;
 	}
 
-	if (SG(headers_sent)) {
-		RETURN_TRUE;
-	} else {
-		RETURN_FALSE;
-	}
+	RETURN_BOOL(SG(headers_sent));
 }
 /* }}} */
 
