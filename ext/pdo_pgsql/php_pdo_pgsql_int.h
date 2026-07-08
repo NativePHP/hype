@@ -22,6 +22,9 @@
 #include <libpq-fe.h>
 #include <libpq/libpq-fs.h>
 #include <php.h>
+#include "main/php_network.h"
+#include "zend_async_API.h"
+#include "ext/pdo/pdo_pool.h"
 
 #define PHP_PDO_PGSQL_CONNECTION_FAILURE_SQLSTATE "08006"
 
@@ -38,7 +41,8 @@ typedef struct pdo_pgsql_stmt pdo_pgsql_stmt;
 typedef struct {
 	PGconn		*server;
 	unsigned 	attached:1;
-	unsigned 	_reserved:31;
+	unsigned 	is_sync:1;
+	unsigned 	_reserved:30;
 	pdo_pgsql_error_info	einfo;
 	Oid 		pgoid;
 	unsigned int	stmt_counter;
@@ -48,6 +52,7 @@ typedef struct {
 	zend_fcall_info_cache *notice_callback;
 	bool		default_fetching_laziness;
 	pdo_pgsql_stmt  *running_stmt;
+	pdo_pool_stmt_cache_t *stmt_cache; /* per-physical-conn prepared-stmt LRU cache; NULL if disabled */
 } pdo_pgsql_db_handle;
 
 typedef struct {
@@ -69,6 +74,7 @@ struct pdo_pgsql_stmt {
 	bool is_prepared;
 	bool is_unbuffered;
 	bool is_running_unbuffered;
+	bool from_cache; /* true: stmt_name refers to a cache-owned server-side prepared stmt; do not DEALLOCATE on dtor */
 };
 
 typedef struct {
@@ -127,5 +133,23 @@ void pgsqlLOBOpen_internal(INTERNAL_FUNCTION_PARAMETERS);
 void pgsqlLOBUnlink_internal(INTERNAL_FUNCTION_PARAMETERS);
 void pgsqlGetNotify_internal(INTERNAL_FUNCTION_PARAMETERS);
 void pgsqlGetPid_internal(INTERNAL_FUNCTION_PARAMETERS);
+
+/* TrueAsync concurrent helpers (implemented in pgsql_driver.c).
+ * Accept pdo_pgsql_db_handle so that persistent (is_sync) connections
+ * always fall back to synchronous libpq calls. */
+bool pdo_pgsql_flush(pdo_pgsql_db_handle *H);
+PGresult *pdo_pgsql_get_result_concurrent(pdo_pgsql_db_handle *H);
+PGresult *pdo_pgsql_exec_concurrent(pdo_pgsql_db_handle *H, const char *query);
+PGresult *pdo_pgsql_exec_params_concurrent(pdo_pgsql_db_handle *H, const char *query,
+		int nParams, const Oid *paramTypes, const char *const *paramValues,
+		const int *paramLengths, const int *paramFormats, int resultFormat);
+PGresult *pdo_pgsql_prepare_concurrent(pdo_pgsql_db_handle *H, const char *stmtName,
+		const char *query, int nParams, const Oid *paramTypes);
+PGresult *pdo_pgsql_exec_prepared_concurrent(pdo_pgsql_db_handle *H, const char *stmtName,
+		int nParams, const char *const *paramValues,
+		const int *paramLengths, const int *paramFormats, int resultFormat);
+#ifdef HAVE_PQCLOSEPREPARED
+PGresult *pdo_pgsql_close_prepared_concurrent(pdo_pgsql_db_handle *H, const char *stmtName);
+#endif
 
 #endif /* PHP_PDO_PGSQL_INT_H */

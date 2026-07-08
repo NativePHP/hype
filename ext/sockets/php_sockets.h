@@ -31,6 +31,14 @@
 # define IS_INVALID_SOCKET(a) (a->bsd_socket < 0)
 #endif
 
+/* Helper macro to avoid compiler warnings about equal expressions */
+#ifdef PHP_WIN32
+# define IS_EAGAIN_OR_EWOULDBLOCK(err) ((err) == EAGAIN || (err) == EWOULDBLOCK)
+#else
+# define IS_EAGAIN_OR_EWOULDBLOCK(err) ((err) == EAGAIN)
+# define INVALID_SOCKET (-1)
+#endif
+
 #define PHP_SOCKETS_VERSION PHP_VERSION
 
 extern zend_module_entry sockets_module_entry;
@@ -69,6 +77,13 @@ typedef struct {
 	int			type;
 	int			error;
 	int			blocking;
+	/* Equals TRUE if the socket was transferred to a nonblocking mode */
+	bool 		non_blocking;
+	/*
+	 * socket type, e.g. SOCK_STREAM, SOCK_DGRAM
+	 * Needed to understand how to work with the buffer correctly.
+	 */
+	int         socket_type;
 	zval		zstream;
 	zend_object std;
 } php_socket;

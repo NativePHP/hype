@@ -1,5 +1,9 @@
 --TEST--
 Bug GH-9735 008 (Fiber stack variables do not participate in cycle collector)
+--SKIPIF--
+<?php
+if (!function_exists("Async\\spawn")) die("skip TrueAsync runtime required");
+?>
 --FILE--
 <?php
 
@@ -27,16 +31,21 @@ print "1\n";
 $fiber->start();
 gc_collect_cycles();
 
-print "2\n";
-
 $fiber = null;
 gc_collect_cycles();
+
+// In TrueAsync, destructors from GC run in a separate coroutine.
+// Spawn a coroutine after gc_collect_cycles() to verify the destructor
+// runs before the spawned coroutine (GC coroutine has higher priority).
+Async\spawn(function () {
+    echo "2\n";
+});
 
 print "3\n";
 
 ?>
 --EXPECTF--
 1
-2
-C::__destruct
 3
+C::__destruct
+2

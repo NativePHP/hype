@@ -33,6 +33,7 @@
 #include "SAPI.h"
 
 #include "php_streams_int.h"
+#include "zend_exceptions.h"
 #ifdef PHP_WIN32
 # include "win32/winutil.h"
 # include "win32/time.h"
@@ -57,10 +58,14 @@ extern int php_get_gid_by_name(const char *name, gid_t *gid);
 
 #if defined(PHP_WIN32)
 # define PLAIN_WRAP_BUF_SIZE(st) ((unsigned int)(st > INT_MAX ? INT_MAX : st))
-#define fsync _commit
-#define fdatasync fsync
+# define fsync _commit
+# define fdatasync fsync
+# define php_fd_set_nonblock(fd)	((void)0)
+# define php_fd_set_block(fd)		((void)0)
 #else
 # define PLAIN_WRAP_BUF_SIZE(st) (st)
+# define php_fd_set_nonblock(fd)	fcntl((fd), F_SETFL, fcntl((fd), F_GETFL, 0) | O_NONBLOCK)
+# define php_fd_set_block(fd)		fcntl((fd), F_SETFL, fcntl((fd), F_GETFL, 0) & ~O_NONBLOCK)
 # if !defined(HAVE_FDATASYNC)
 #  define fdatasync fsync
 # elif defined(__APPLE__)
@@ -139,7 +144,20 @@ typedef struct {
 	unsigned is_pipe_blocking:1; /* allow blocking read() on pipes, currently Windows only */
 	unsigned no_forced_fstat:1;  /* Use fstat cache even if forced */
 	unsigned is_seekable:1;		/* don't try and seek, if not set */
-	unsigned _reserved:26;
+	unsigned is_blocked:1;		/* true (default) = blocking mode; false = non-blocking */
+	unsigned sync_io_fallback:1;	/* fd temporarily set to blocking for scheduler context */
+	unsigned _reserved:24;
+
+	/* Live references from coroutines parked inside read/write/flock.
+	 * _php_stream_free defers efree(stream/data) while non-zero; the last
+	 * holder finalizes the free when it wakes up. */
+	unsigned int ref_count;
+
+	zend_async_io_t *async_io;
+	zend_async_poll_event_t *poll_event;
+
+	struct timeval timeout;		/* read timeout; tv_sec == -1 means "not set" */
+	bool timeout_event;			/* true if last read timed out */
 
 	int lock_flag;			/* stores the lock state */
 	zend_string *temp_name;	/* if non-null, this is the path to a temporary file that
@@ -160,6 +178,114 @@ typedef struct {
 	zend_stat_t sb;
 } php_stdio_stream_data;
 #define PHP_STDIOP_GET_FD(anfd, data)	anfd = (data)->file ? fileno((data)->file) : (data)->fd
+
+static uint32_t php_stdiop_mode_to_io_state(const char *mode)
+{
+	uint32_t state = 0;
+
+	if (strchr(mode, 'r') || strchr(mode, '+')) {
+		state |= ZEND_ASYNC_IO_READABLE;
+	}
+	if (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, 'x') || strchr(mode, 'c') || strchr(mode, '+')) {
+		state |= ZEND_ASYNC_IO_WRITABLE;
+	}
+	if (strchr(mode, 'a')) {
+		state |= ZEND_ASYNC_IO_APPEND;
+	}
+
+	return state;
+}
+
+/* Called by the reactor during shutdown to detach async IO from this stream.
+ * After this, the stream continues working synchronously. */
+static void php_stdiop_on_async_detach(zend_async_io_t *io, void *arg)
+{
+	php_stdio_stream_data *data = (php_stdio_stream_data *) arg;
+	data->async_io = NULL;
+}
+
+/* Drop one async pin acquired before SUSPEND. Returns true if the stream was
+ * force-closed while we slept (caller must not touch stream/data again).
+ * If we are the last holder of a force-closed stream, finalize the deferred
+ * pefree here. */
+static zend_always_inline bool php_stdiop_unpin_after_suspend(php_stream *stream, php_stdio_stream_data *data)
+{
+	bool was_closed = stream->pending_free;
+	ZEND_ASSERT(data->ref_count > 0);
+	if (--data->ref_count == 0 && was_closed) {
+		/* We are the last holder of a force-closed stream — finalize the
+		 * deferred dispose chain that php_stdiop_close skipped. */
+		if (data->async_io != NULL) {
+			data->async_io->event.dispose(&data->async_io->event);
+			data->async_io = NULL;
+		}
+		bool is_persistent = stream->is_persistent;
+		pefree(data, is_persistent);
+		pefree(stream, is_persistent);
+	}
+	return was_closed;
+}
+
+static void php_stdiop_init_async_io(php_stdio_stream_data *self, const char *mode)
+{
+	if (UNEXPECTED(ZEND_ASYNC_IS_OFF)) {
+		return;
+	}
+
+	zend_async_io_type type;
+#ifdef PHP_WIN32
+	/* On Windows, use GetFileType + GetConsoleMode for reliable type detection.
+	 * isatty() can return true for CRT fd even when the underlying OS handle
+	 * is not a real console (e.g. NUL device, MSYS pipes). */
+	const intptr_t os_handle = _get_osfhandle(self->fd);
+
+	if (os_handle == -1 || os_handle == (intptr_t)INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	const DWORD file_type = GetFileType((HANDLE)os_handle);
+
+	if (file_type == FILE_TYPE_PIPE) {
+		/* GetFileType returns FILE_TYPE_PIPE for both named pipes and sockets.
+		 * GetNamedPipeInfo succeeds only for real pipes, not Winsock sockets. */
+		if (self->is_pipe || GetNamedPipeInfo((HANDLE)os_handle, NULL, NULL, NULL, NULL)) {
+			type = ZEND_ASYNC_IO_TYPE_PIPE;
+		} else {
+			type = ZEND_ASYNC_IO_TYPE_TCP;
+		}
+	} else if (file_type == FILE_TYPE_CHAR) {
+		DWORD console_mode;
+		if (GetConsoleMode((HANDLE)os_handle, &console_mode)) {
+			type = ZEND_ASYNC_IO_TYPE_TTY;
+		} else {
+			type = ZEND_ASYNC_IO_TYPE_FILE;
+		}
+	} else {
+		type = ZEND_ASYNC_IO_TYPE_FILE;
+	}
+
+	zend_file_descriptor_t fd = self->fd;
+
+#else
+	if (self->is_pipe) {
+		type = ZEND_ASYNC_IO_TYPE_PIPE;
+	} else if (self->fd >= 0 && isatty(self->fd)) {
+		type = ZEND_ASYNC_IO_TYPE_TTY;
+	} else {
+		type = ZEND_ASYNC_IO_TYPE_FILE;
+	}
+
+	const zend_file_descriptor_t fd = self->fd;
+#endif
+	const uint32_t state = php_stdiop_mode_to_io_state(mode);
+
+	self->async_io = ZEND_ASYNC_IO_CREATE(fd, type, state);
+
+	if (self->async_io != NULL) {
+		self->async_io->on_detach = php_stdiop_on_async_detach;
+		self->async_io->on_detach_arg = self;
+	}
+}
 
 static int do_fstat(php_stdio_stream_data *d, int force)
 {
@@ -185,10 +311,12 @@ static php_stream *_php_stream_fopen_from_fd_int(int fd, const char *mode, const
 	self->file = NULL;
 	self->is_seekable = 1;
 	self->is_pipe = 0;
+	self->is_blocked = 1;
 	self->lock_flag = LOCK_UN;
 	self->is_process_pipe = 0;
 	self->temp_name = NULL;
 	self->fd = fd;
+	self->timeout.tv_sec = -1;
 #ifdef PHP_WIN32
 	self->is_pipe_blocking = 0;
 #endif
@@ -205,6 +333,7 @@ static php_stream *_php_stream_fopen_from_file_int(FILE *file, const char *mode 
 	self->file = file;
 	self->is_seekable = 1;
 	self->is_pipe = 0;
+	self->is_blocked = 1;
 	self->lock_flag = LOCK_UN;
 	self->is_process_pipe = 0;
 	self->temp_name = NULL;
@@ -322,6 +451,8 @@ PHPAPI php_stream *_php_stream_fopen_from_fd(int fd, const char *mode, const cha
 			}
 #endif
 		}
+
+		php_stdiop_init_async_io(self, mode);
 	}
 
 	return stream;
@@ -341,6 +472,8 @@ PHPAPI php_stream *_php_stream_fopen_from_file(FILE *file, const char *mode STRE
 		} else {
 			stream->position = zend_ftell(file);
 		}
+
+		php_stdiop_init_async_io(self, mode);
 	}
 
 	return stream;
@@ -356,16 +489,31 @@ PHPAPI php_stream *_php_stream_fopen_from_pipe(FILE *file, const char *mode STRE
 	self->file = file;
 	self->is_seekable = 0;
 	self->is_pipe = 1;
+	self->is_blocked = 1;
 	self->lock_flag = LOCK_UN;
 	self->is_process_pipe = 1;
 	self->fd = fileno(file);
 	self->temp_name = NULL;
+	self->timeout.tv_sec = -1;
 #ifdef PHP_WIN32
 	self->is_pipe_blocking = 0;
 #endif
 
 	stream = php_stream_alloc_rel(&php_stream_stdio_ops, self, 0, mode);
 	stream->flags |= PHP_STREAM_FLAG_NO_SEEK;
+
+	/* TODO: popen() should be reimplemented using fork()/exec()/pipe() like proc_open()
+	 * instead of libc popen(), so the child PID is stored explicitly. This would allow
+	 * proper async waitpid() without the dup() workaround below.
+	 *
+	 * Current workaround: dup the fd so libuv owns the copy and the original stays
+	 * in FILE* for pclose() to do fclose() + waitpid(). */
+	int dup_fd = dup(self->fd);
+	if (dup_fd >= 0) {
+		self->fd = dup_fd;
+		php_stdiop_init_async_io(self, mode);
+	}
+
 	return stream;
 }
 
@@ -375,6 +523,105 @@ static ssize_t php_stdiop_write(php_stream *stream, const char *buf, size_t coun
 	ssize_t bytes_written;
 
 	assert(data != NULL);
+
+	if (data->async_io != NULL && !ZEND_ASYNC_IS_OFF && data->is_blocked && !ZEND_ASYNC_IS_SCHEDULER_CONTEXT) {
+		ZEND_ASYNC_SCHEDULER_INIT();
+		if (UNEXPECTED(EG(exception))) {
+			return -1;
+		}
+
+		if (UNEXPECTED(data->sync_io_fallback)) {
+			php_fd_set_nonblock(data->fd);
+			data->sync_io_fallback = 0;
+		}
+
+		zend_async_io_req_t *req = ZEND_ASYNC_IO_WRITE(data->async_io, buf, count);
+		if (UNEXPECTED(req == NULL)) {
+			return -1;
+		}
+
+		if (!req->completed) {
+			zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+			/* Pin stream/data; another coroutine may force-close the resource
+			 * while we are parked here, which would otherwise free them. */
+			data->ref_count++;
+			/* The async IO event is shared by every coroutine writing this
+			 * descriptor, so any write's completion notifies them all. Keep
+			 * suspending until THIS request is the one that finished —
+			 * otherwise a spuriously woken coroutine would dispose a request
+			 * whose uv_write is still in flight, and libuv would later touch
+			 * freed memory. */
+			do {
+				ZEND_ASYNC_WAKER_NEW(coroutine);
+				zend_async_resume_when(coroutine, &data->async_io->event, false,
+						zend_async_waker_callback_resolve, NULL);
+				ZEND_ASYNC_SUSPEND();
+				zend_async_waker_clean(coroutine);
+			} while (!req->completed && EG(exception) == NULL);
+
+			if (UNEXPECTED(stream->pending_free)) {
+				/* Stream force-closed while parked. Suppress any close-induced
+				 * exception (same contract as the io_closed branch below),
+				 * dispose req (caller-owns-req contract — req->io stayed
+				 * valid because php_stdiop_close deferred event.dispose),
+				 * then release the pin which may finalize stream/data/io free. */
+				if (EG(exception)) {
+					zend_clear_exception();
+				}
+				if (req->exception != NULL) {
+					OBJ_RELEASE(req->exception);
+					req->exception = NULL;
+				}
+				req->dispose(req);
+				php_stdiop_unpin_after_suspend(stream, data);
+				return -1;
+			}
+			php_stdiop_unpin_after_suspend(stream, data);
+		}
+
+		/* IO closed externally while parked — stream/data may be freed. */
+		if (UNEXPECTED(req->io_closed)) {
+			if (EG(exception)) {
+				zend_clear_exception();
+			}
+			if (req->exception != NULL) {
+				OBJ_RELEASE(req->exception);
+				req->exception = NULL;
+			}
+			req->dispose(req);
+			return -1;
+		}
+
+		if (UNEXPECTED(EG(exception)) || UNEXPECTED(req->exception != NULL)) {
+			if (!(stream->flags & PHP_STREAM_FLAG_SUPPRESS_ERRORS)) {
+				zend_object *exception = EG(exception) ? EG(exception) : req->exception;
+				zval rv;
+				const zval *message =
+						zend_read_property_ex(exception->ce, exception, zend_known_strings[ZEND_STR_MESSAGE], 0, &rv);
+
+				php_error_docref(NULL, E_NOTICE, "Write of %zu bytes failed with async IO error: %s",
+						count, message ? Z_STRVAL_P(message) : "empty error");
+			}
+			if (EG(exception)) {
+				zend_clear_exception();
+			}
+			if (req->exception != NULL) {
+				OBJ_RELEASE(req->exception);
+				req->exception = NULL;
+			}
+			req->dispose(req);
+			return -1;
+		}
+
+		const ssize_t transferred = req->transferred;
+		req->dispose(req);
+		return transferred;
+	}
+
+	if (data->async_io != NULL && data->is_blocked && !data->sync_io_fallback) {
+		php_fd_set_block(data->fd);
+		data->sync_io_fallback = 1;
+	}
 
 	if (data->fd >= 0) {
 #ifdef PHP_WIN32
@@ -424,6 +671,138 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 
 	assert(data != NULL);
 
+	/* Scheduler context cannot suspend coroutines, so async IO is not possible.
+	 * Skip this block entirely and fall through to the sync path below,
+	 * which will set the fd to blocking mode if needed. */
+	if (data->async_io != NULL && !ZEND_ASYNC_IS_OFF && data->is_blocked && !ZEND_ASYNC_IS_SCHEDULER_CONTEXT) {
+		ZEND_ASYNC_SCHEDULER_INIT();
+		if (UNEXPECTED(EG(exception))) {
+			return -1;
+		}
+
+		data->timeout_event = false;
+
+		/* Restore non-blocking mode if a previous scheduler-context call
+		 * temporarily switched the fd to blocking. */
+		if (UNEXPECTED(data->sync_io_fallback)) {
+			php_fd_set_nonblock(data->fd);
+			data->sync_io_fallback = 0;
+		}
+
+		zend_async_io_req_t *req = ZEND_ASYNC_IO_READ(data->async_io, buf, count);
+		if (UNEXPECTED(req == NULL)) {
+			return -1;
+		}
+
+		if (!req->completed) {
+			zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+			const zend_ulong timeout_ms = data->timeout.tv_sec >= 0
+				? (zend_ulong)data->timeout.tv_sec * 1000 + (zend_ulong)data->timeout.tv_usec / 1000
+				: 0;
+
+			/* Pin stream/data; another coroutine may force-close the resource
+			 * while we are parked here, which would otherwise free them. */
+			data->ref_count++;
+
+			/* The async IO event is shared by every coroutine using this
+			 * descriptor, so an unrelated completion can wake us. Keep
+			 * suspending until THIS request finished — otherwise we would use
+			 * and dispose a request whose libuv operation is still in flight. */
+			do {
+				ZEND_ASYNC_WAKER_NEW(coroutine);
+
+				if (timeout_ms) {
+					zend_async_resume_when(coroutine, &ZEND_ASYNC_NEW_TIMER_EVENT(timeout_ms, false)->base, true,
+							zend_async_waker_callback_timeout, NULL);
+				}
+
+				zend_async_resume_when(coroutine, &data->async_io->event, false,
+						zend_async_waker_callback_resolve, NULL);
+
+				if (!ZEND_ASYNC_SUSPEND()) {
+					zend_async_waker_clean(coroutine);
+					if (EG(exception) != NULL
+						&& instanceof_function(EG(exception)->ce, ZEND_ASYNC_GET_EXCEPTION_CE(ZEND_ASYNC_EXCEPTION_TIMEOUT))) {
+						/* Clear the timeout exception, as we will handle it via return value. */
+						zend_clear_exception();
+
+						if (!req->completed) {
+							data->timeout_event = true;
+							req->dispose(req);
+							php_stdiop_unpin_after_suspend(stream, data);
+							return -1;
+						}
+					}
+					break;
+				}
+
+				zend_async_waker_clean(coroutine);
+			} while (!req->completed && EG(exception) == NULL);
+
+			if (UNEXPECTED(stream->pending_free)) {
+				/* Stream force-closed while parked. Same teardown as the
+				 * io_closed branch below: suppress close-induced exception,
+				 * dispose req (caller-owns contract), then unpin. */
+				if (EG(exception)) {
+					zend_clear_exception();
+				}
+				if (req->exception != NULL) {
+					OBJ_RELEASE(req->exception);
+					req->exception = NULL;
+				}
+				req->dispose(req);
+				php_stdiop_unpin_after_suspend(stream, data);
+				return -1;
+			}
+			php_stdiop_unpin_after_suspend(stream, data);
+		}
+
+		/* IO closed externally while parked — stream/data may be freed. */
+		if (UNEXPECTED(req->io_closed)) {
+			if (EG(exception)) {
+				zend_clear_exception();
+			}
+			if (req->exception != NULL) {
+				OBJ_RELEASE(req->exception);
+				req->exception = NULL;
+			}
+			req->dispose(req);
+			return -1;
+		}
+
+		if (UNEXPECTED(EG(exception)) || UNEXPECTED(req->exception != NULL)) {
+			if (!(stream->flags & PHP_STREAM_FLAG_SUPPRESS_ERRORS)) {
+				zend_object *exception = EG(exception) ? EG(exception) : req->exception;
+				zval rv;
+				const zval *message =
+						zend_read_property_ex(exception->ce, exception, zend_known_strings[ZEND_STR_MESSAGE], 0, &rv);
+				php_error_docref(NULL, E_NOTICE, "Read of %zu bytes failed with async IO error: %s",
+						count, message ? Z_STRVAL_P(message) : "empty error");
+			}
+			if (EG(exception)) {
+				zend_clear_exception();
+			}
+			if (req->exception != NULL) {
+				OBJ_RELEASE(req->exception);
+				req->exception = NULL;
+			}
+			req->dispose(req);
+			return -1;
+		}
+
+		const ssize_t transferred = req->transferred;
+		if (transferred == 0) {
+			stream->eof = 1;
+		}
+		req->dispose(req);
+		return transferred;
+	}
+
+	if (data->async_io != NULL && data->is_blocked && !data->sync_io_fallback) {
+		php_fd_set_block(data->fd);
+		data->sync_io_fallback = 1;
+	}
+
 	if (data->fd >= 0) {
 #ifdef PHP_WIN32
 		php_stdio_stream_data *self = (php_stdio_stream_data*)stream->abstract;
@@ -442,6 +821,9 @@ static ssize_t php_stdiop_read(php_stream *stream, char *buf, size_t count)
 				}
 				/* If there's nothing to read, wait in 10us periods. */
 				if (0 == avail_read) {
+					if (!self->is_blocked) {
+						return 0;
+					}
 					usleep(10);
 				}
 			} while (0 == avail_read && retry++ < 3200000);
@@ -512,6 +894,42 @@ static int php_stdiop_close(php_stream *stream, int close_handle)
 
 	assert(data != NULL);
 
+	if (data->poll_event) {
+		data->poll_event->base.dispose(&data->poll_event->base);
+		data->poll_event = NULL;
+	}
+
+	if (data->async_io != NULL) {
+		if (!close_handle) {
+			data->async_io->state |= ZEND_ASYNC_IO_PRESERVE_FD;
+		}
+		/* Clear on_detach before dispose — data is about to be freed. */
+		data->async_io->on_detach = NULL;
+		const bool is_stream = ZEND_ASYNC_IO_IS_STREAM(data->async_io->type);
+		/* Logical close always synchronous — NOTIFY's parked reqs with
+		 * req->io_closed and unblocks libuv-side I/O. */
+		ZEND_ASYNC_IO_CLOSE(data->async_io);
+		if (data->ref_count == 0) {
+			data->async_io->event.dispose(&data->async_io->event);
+			data->async_io = NULL;
+		}
+		/* else: leave async_io live for the parked coroutine — its
+		 * caller-side req->dispose() needs req->io still valid. The last
+		 * unpin will dispose it. */
+		if (is_stream && !data->is_process_pipe) {
+			data->fd = -1;
+		}
+		/* If FILE* was created via fdopen(dup(fd)) in php_stdiop_cast,
+		 * it owns a separate fd copy that must be closed explicitly.
+		 * The original fd (data->fd) will be closed by normal logic below.
+		 * When close_handle is 0 (preserve mode), do NOT close the C FILE*
+		 * as it may be stdout/stderr/stdin needed for error display during shutdown. */
+		if (data->file != NULL && close_handle) {
+			fclose(data->file);
+			data->file = NULL;
+		}
+	}
+
 #ifdef HAVE_MMAP
 	if (data->last_mapped_addr) {
 		munmap(data->last_mapped_addr, data->last_mapped_len);
@@ -547,7 +965,7 @@ static int php_stdiop_close(php_stream *stream, int close_handle)
 			ret = close(data->fd);
 			data->fd = -1;
 		} else {
-			return 0; /* everything should be closed already -> success */
+			ret = 0; /* everything should be closed already -> success */
 		}
 		if (data->temp_name) {
 #ifdef PHP_WIN32
@@ -565,7 +983,14 @@ static int php_stdiop_close(php_stream *stream, int close_handle)
 		data->fd = -1;
 	}
 
-	pefree(data, stream->is_persistent);
+	if (UNEXPECTED(data->ref_count > 0)) {
+		/* Coroutines parked on this stream still hold pointers to data
+		 * (and to stream). Mark for deferred free; the last unpin in
+		 * php_stdiop_unpin_after_suspend will efree both. */
+		stream->pending_free = 1;
+	} else {
+		pefree(data, stream->is_persistent);
+	}
 
 	return ret;
 }
@@ -595,6 +1020,35 @@ static int php_stdiop_flush(php_stream *stream)
 static int php_stdiop_sync(php_stream *stream, bool dataonly)
 {
 	php_stdio_stream_data *data = (php_stdio_stream_data*)stream->abstract;
+
+	/* Async IO path: flush via async reactor, avoid fdopen() which creates
+	 * a FILE* that conflicts with reactor's fd ownership. */
+	if (data->async_io != NULL) {
+		/* fsync/fdatasync is only meaningful for regular files */
+		if (data->async_io->type == ZEND_ASYNC_IO_TYPE_PIPE
+				|| data->async_io->type == ZEND_ASYNC_IO_TYPE_TTY) {
+			return -1;
+		}
+
+		zend_async_io_req_t *req = ZEND_ASYNC_IO_FLUSH(data->async_io);
+		if (UNEXPECTED(req == NULL)) {
+			return -1;
+		}
+
+		if (!req->completed) {
+			zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+			ZEND_ASYNC_WAKER_NEW(coroutine);
+			zend_async_resume_when(coroutine, &data->async_io->event, false,
+					zend_async_waker_callback_resolve, NULL);
+			ZEND_ASYNC_SUSPEND();
+			ZEND_ASYNC_WAKER_DESTROY(coroutine);
+		}
+
+		const int result = (int) req->result;
+		req->dispose(req);
+		return result;
+	}
+
 	FILE *fp;
 	int fd;
 
@@ -616,7 +1070,6 @@ static int php_stdiop_sync(php_stream *stream, bool dataonly)
 static int php_stdiop_seek(php_stream *stream, zend_off_t offset, int whence, zend_off_t *newoffset)
 {
 	php_stdio_stream_data *data = (php_stdio_stream_data*)stream->abstract;
-	int ret;
 
 	assert(data != NULL);
 
@@ -627,17 +1080,19 @@ static int php_stdiop_seek(php_stream *stream, zend_off_t offset, int whence, ze
 	}
 
 	if (data->fd >= 0) {
-		zend_off_t result;
+		const zend_off_t result = data->async_io != NULL
+			? ZEND_ASYNC_IO_SEEK(data->async_io, offset, whence)
+			: zend_lseek(data->fd, offset, whence);
 
-		result = zend_lseek(data->fd, offset, whence);
-		if (result == (zend_off_t)-1)
+		if (result == (zend_off_t)-1) {
 			return -1;
+		}
 
 		*newoffset = result;
 		return 0;
 
 	} else {
-		ret = zend_fseek(data->file, offset, whence);
+		const int ret = zend_fseek(data->file, offset, whence);
 		*newoffset = zend_ftell(data->file);
 		return ret;
 	}
@@ -656,20 +1111,48 @@ static int php_stdiop_cast(php_stream *stream, int castas, void **ret)
 	switch (castas)	{
 		case PHP_STREAM_AS_STDIO:
 			if (ret) {
-
 				if (data->file == NULL) {
-					/* we were opened as a plain file descriptor, so we
-					 * need fdopen now */
+					int fd_for_fdopen = data->fd;
+
+					/* TEMPORARY: When async IO owns the fd, dup() before fdopen()
+					 * to avoid dual ownership.  fdopen() wraps the fd, but libuv
+					 * also holds it; on close libuv calls _close(fd), orphaning
+					 * the FILE* in CRT — which crashes on Windows during exit().
+					 * With dup, FILE* gets its own fd copy.
+					 * TODO: analyze all PHP_STREAM_AS_STDIO call sites for a
+					 * proper long-term solution (see ext/async/TODO.md). */
+					if (data->async_io != NULL) {
+#ifdef PHP_WIN32
+						fd_for_fdopen = _dup(data->fd);
+#else
+						fd_for_fdopen = dup(data->fd);
+#endif
+						if (fd_for_fdopen < 0) {
+							return FAILURE;
+						}
+					}
+
 					char fixed_mode[5];
 					php_stream_mode_sanitize_fdopen_fopencookie(stream, fixed_mode);
-					data->file = fdopen(data->fd, fixed_mode);
+					data->file = fdopen(fd_for_fdopen, fixed_mode);
 					if (data->file == NULL) {
+						if (data->async_io != NULL) {
+#ifdef PHP_WIN32
+							_close(fd_for_fdopen);
+#else
+							close(fd_for_fdopen);
+#endif
+						}
 						return FAILURE;
 					}
 				}
 
 				*(FILE**)ret = data->file;
-				data->fd = SOCK_ERR;
+				/* When async IO dup'd the fd, the original fd is still valid
+				 * and must remain tracked so plain_wrapper can close it. */
+				if (data->async_io == NULL) {
+					data->fd = SOCK_ERR;
+				}
 			}
 			return SUCCESS;
 
@@ -714,6 +1197,24 @@ static int php_stdiop_stat(php_stream *stream, php_stream_statbuf *ssb)
 	return ret;
 }
 
+/* Thread pool flock support */
+typedef struct {
+	int fd;
+	int operation;
+	int result;
+	int error_code;
+} php_stdiop_flock_task_data_t;
+
+static void php_stdiop_flock_task_run(zend_async_task_t *task)
+{
+	php_stdiop_flock_task_data_t *flock_data = (php_stdiop_flock_task_data_t *) task->data;
+	flock_data->result = flock(flock_data->fd, flock_data->operation);
+
+	if (flock_data->result != 0) {
+		flock_data->error_code = errno;
+	}
+}
+
 static int php_stdiop_set_option(php_stream *stream, int option, int value, void *ptrparam)
 {
 	php_stdio_stream_data *data = (php_stdio_stream_data*) stream->abstract;
@@ -741,9 +1242,18 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 
 			if (-1 == fcntl(fd, F_SETFL, flags))
 				return -1;
+			data->is_blocked = value ? 1 : 0;
 			return oldval;
 #else
-			return -1; /* not yet implemented */
+			/* Windows has no fcntl/O_NONBLOCK, but when async IO is active
+			 * the is_blocked flag controls whether reads suspend the coroutine
+			 * (blocking) or return immediately (non-blocking). */
+			if (data->async_io != NULL) {
+				const int was_blocked = data->is_blocked;
+				data->is_blocked = value ? 1 : 0;
+				return was_blocked;
+			}
+			return -1;
 #endif
 
 		case PHP_STREAM_OPTION_WRITE_BUFFER:
@@ -779,6 +1289,78 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 
 			if ((uintptr_t) ptrparam == PHP_STREAM_LOCK_SUPPORTED) {
 				return 0;
+			}
+
+			/* Use thread pool for potentially blocking lock operations inside coroutines.
+			 * LOCK_UN (unlock) and LOCK_NB (non-blocking) never block, so skip the thread pool. */
+			if (!(value & LOCK_NB) && (value & ~LOCK_NB) != LOCK_UN
+					&& !ZEND_ASYNC_IS_OFF && !ZEND_ASYNC_IS_SCHEDULER_CONTEXT
+					&& zend_async_thread_pool_is_enabled()) {
+
+				ZEND_ASYNC_SCHEDULER_INIT();
+
+				if (UNEXPECTED(EG(exception))) {
+					return -1;
+				}
+
+				/* Inline-tail so flock_data outlives caller on cancel —
+				 * worker keeps writing after AsyncCancellation unwinds the frame. */
+				zend_async_task_t *task = ZEND_ASYNC_NEW_TASK_EX(
+					php_stdiop_flock_task_run, NULL,
+					sizeof(php_stdiop_flock_task_data_t));
+				if (UNEXPECTED(task == NULL)) {
+					return -1;
+				}
+				php_stdiop_flock_task_data_t *flock_data =
+					(php_stdiop_flock_task_data_t *)
+						((char *)task + task->base.extra_offset);
+				flock_data->fd = fd;
+				flock_data->operation = value;
+				task->data = flock_data;
+
+				zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+				ZEND_ASYNC_WAKER_NEW(coroutine);
+
+				if (UNEXPECTED(!zend_async_resume_when(coroutine, &task->base, true,
+					zend_async_waker_callback_resolve, NULL))) {
+					ZEND_ASYNC_WAKER_DESTROY(coroutine);
+					return -1;
+				}
+
+				if (UNEXPECTED(!ZEND_ASYNC_QUEUE_TASK(task))) {
+					ZEND_ASYNC_WAKER_DESTROY(coroutine);
+					return -1;
+				}
+
+				/* Pin task across SUSPEND: waker cleanup disposes it before SUSPEND returns,
+				 * freeing the inline-tail flock_data we still need to read.
+				 * Pin stream/data too — another coroutine may force-close the resource. */
+				ZEND_ASYNC_EVENT_ADD_REF(&task->base);
+				data->ref_count++;
+
+				if (UNEXPECTED(!ZEND_ASYNC_SUSPEND())) {
+					ZEND_ASYNC_WAKER_DESTROY(coroutine);
+					ZEND_ASYNC_EVENT_RELEASE(&task->base);
+					php_stdiop_unpin_after_suspend(stream, data);
+					return -1;
+				}
+
+				const int flock_result = flock_data->result;
+				const int flock_errno = flock_data->error_code;
+				ZEND_ASYNC_EVENT_RELEASE(&task->base);
+
+				if (UNEXPECTED(php_stdiop_unpin_after_suspend(stream, data))) {
+					/* Stream force-closed while parked. */
+					return -1;
+				}
+
+				if (flock_result == 0) {
+					data->lock_flag = value;
+					return 0;
+				}
+
+				errno = flock_errno;
+				return -1;
 			}
 
 			if (!flock(fd, value)) {
@@ -1033,18 +1615,99 @@ static int php_stdiop_set_option(php_stream *stream, int option, int value, void
 			return PHP_STREAM_OPTION_RETURN_OK;
 #endif
 		case PHP_STREAM_OPTION_META_DATA_API:
-			if (fd == -1)
+			if (fd == -1) {
 				return -1;
-#ifdef O_NONBLOCK
-			flags = fcntl(fd, F_GETFL, 0);
+			}
 
-			add_assoc_bool((zval*)ptrparam, "timed_out", 0);
-			add_assoc_bool((zval*)ptrparam, "blocked", (flags & O_NONBLOCK)? 0 : 1);
+			add_assoc_bool((zval*)ptrparam, "timed_out", data->timeout_event);
+			if (data->async_io != NULL) {
+				/* When async IO is active the fd is non-blocking at the OS level,
+				 * but the logical blocking mode is tracked in is_blocked. */
+				add_assoc_bool((zval*)ptrparam, "blocked", data->is_blocked);
+			} else {
+#ifdef O_NONBLOCK
+				flags = fcntl(fd, F_GETFL, 0);
+				add_assoc_bool((zval*)ptrparam, "blocked", (flags & O_NONBLOCK)? 0 : 1);
+#else
+				add_assoc_bool((zval*)ptrparam, "blocked", 1);
+#endif
+			}
 			add_assoc_bool((zval*)ptrparam, "eof", stream->eof);
+			return PHP_STREAM_OPTION_RETURN_OK;
+		case PHP_STREAM_OPTION_ASYNC_EVENT_HANDLE:
+			if (fd == -1) {
+				return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+			}
+#ifdef PHP_WIN32
+			return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+#else
+			{
+				zend_async_poll_event_t **handle_ptr = (zend_async_poll_event_t **)ptrparam;
+
+				if (data->poll_event == NULL) {
+					data->poll_event = ZEND_ASYNC_NEW_POLL_EVENT(fd, 0, 0);
+					if (UNEXPECTED(EG(exception) != NULL)) {
+						return PHP_STREAM_OPTION_RETURN_ERR;
+					}
+
+					data->poll_event->base.start(&data->poll_event->base);
+
+					if (UNEXPECTED(EG(exception) != NULL)) {
+						return PHP_STREAM_OPTION_RETURN_ERR;
+					}
+				}
+
+				zend_async_poll_proxy_t *proxy = ZEND_ASYNC_NEW_POLL_PROXY_EVENT(data->poll_event, value);
+				if (UNEXPECTED(EG(exception) != NULL)) {
+					return PHP_STREAM_OPTION_RETURN_ERR;
+				}
+
+				*handle_ptr = (zend_async_poll_event_t*)proxy;
+				proxy->base.ref_count = 0;
+
+				return PHP_STREAM_OPTION_RETURN_OK;
+			}
+#endif
+
+		case PHP_STREAM_OPTION_ASYNC_IO:
+			if (data->async_io != NULL && ptrparam != NULL) {
+				*(zend_async_io_t **)ptrparam = data->async_io;
+				return PHP_STREAM_OPTION_RETURN_OK;
+			}
+			return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+
+		case PHP_STREAM_OPTION_DETACH_ASYNC_IO:
+			if (data->poll_event) {
+				data->poll_event->base.dispose(&data->poll_event->base);
+				data->poll_event = NULL;
+			}
+
+			if (data->async_io != NULL) {
+				data->async_io->on_detach = NULL;
+				data->async_io->state |= ZEND_ASYNC_IO_PRESERVE_FD;
+				ZEND_ASYNC_IO_CLOSE(data->async_io);
+				data->async_io->event.dispose(&data->async_io->event);
+				data->async_io = NULL;
+			}
 
 			return PHP_STREAM_OPTION_RETURN_OK;
-#endif
-			return -1;
+
+		case PHP_STREAM_OPTION_ALIGN_POSITION:
+			if (data->async_io != NULL && ptrparam != NULL && zend_async_io_seek_fn != NULL) {
+				zend_off_t *pos = (zend_off_t *)ptrparam;
+				ZEND_ASYNC_IO_SEEK(data->async_io, *pos, SEEK_SET);
+				return PHP_STREAM_OPTION_RETURN_OK;
+			}
+			return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+
+		case PHP_STREAM_OPTION_READ_TIMEOUT:
+			if (data->is_pipe) {
+				data->timeout = *(struct timeval *)ptrparam;
+				data->timeout_event = false;
+				return PHP_STREAM_OPTION_RETURN_OK;
+			}
+			return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+
 		default:
 			return PHP_STREAM_OPTION_RETURN_NOTIMPL;
 	}

@@ -15,6 +15,7 @@
 #include <php.h>
 #include <php_network.h>
 #include "php_sockets.h"
+#include "main/network_async.h"
 
 #ifdef PHP_WIN32
 #include "windows_common.h"
@@ -26,6 +27,7 @@
 extern zend_result php_string_to_if_index(const char *val, unsigned *out);
 
 #ifdef HAVE_IPV6
+# define FREEADDRINFO(addrinfo) is_async ? ZEND_ASYNC_FREEADDRINFO(addrinfo) : freeaddrinfo(addrinfo)
 /* Sets addr by hostname, or by ip in string form (AF_INET6) */
 int php_set_inet6_addr(struct sockaddr_in6 *sin6, zend_string *string, php_socket *php_sock) /* {{{ */
 {
@@ -48,7 +50,26 @@ int php_set_inet6_addr(struct sockaddr_in6 *sin6, zend_string *string, php_socke
 #else
 		hints.ai_flags = AI_ADDRCONFIG;
 #endif
-		getaddrinfo(ZSTR_VAL(string), NULL, &hints, &addrinfo);
+		bool is_async = ZEND_ASYNC_IS_ACTIVE;
+
+		if (is_async) {
+			if (php_network_getaddrinfo_async(ZSTR_VAL(string), NULL, &hints, &addrinfo) != 0) {
+#ifdef PHP_WIN32
+				PHP_SOCKET_ERROR(php_sock, "Host lookup failed", WSAGetLastError());
+#else
+				PHP_SOCKET_ERROR(php_sock, "Host lookup failed", (-10000 - h_errno));
+#endif
+				return 0;
+			}
+		} else if (getaddrinfo(ZSTR_VAL(string), NULL, &hints, &addrinfo) != 0) {
+#ifdef PHP_WIN32
+			PHP_SOCKET_ERROR(php_sock, "Host lookup failed", WSAGetLastError());
+#else
+			PHP_SOCKET_ERROR(php_sock, "Host lookup failed", (-10000 - h_errno));
+#endif
+			return 0;
+		}
+
 		if (!addrinfo) {
 #ifdef PHP_WIN32
 			PHP_SOCKET_ERROR(php_sock, "Host lookup failed", WSAGetLastError());
@@ -59,12 +80,12 @@ int php_set_inet6_addr(struct sockaddr_in6 *sin6, zend_string *string, php_socke
 		}
 		if (addrinfo->ai_family != PF_INET6 || addrinfo->ai_addrlen != sizeof(struct sockaddr_in6)) {
 			php_error_docref(NULL, E_WARNING, "Host lookup failed: Non AF_INET6 domain returned on AF_INET6 socket");
-			freeaddrinfo(addrinfo);
+			FREEADDRINFO(addrinfo);
 			return 0;
 		}
 
 		memcpy(&(sin6->sin6_addr.s6_addr), ((struct sockaddr_in6*)(addrinfo->ai_addr))->sin6_addr.s6_addr, sizeof(struct in6_addr));
-		freeaddrinfo(addrinfo);
+		FREEADDRINFO(addrinfo);
 
 #else
 		/* No IPv6 specific hostname resolution is available on this system? */

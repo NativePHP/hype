@@ -16,6 +16,8 @@
 #include "php_network.h"
 #include "win32/time.h"
 
+#include "network_async.h"
+
 /* Win32 select() will only work with sockets, so we roll our own implementation here.
  * - If you supply only sockets, this simply passes through to winsock select().
  * - If you supply file handles, there is no way to distinguish between
@@ -96,6 +98,10 @@ PHPAPI int php_select(php_socket_t max_fd, fd_set *rfds, fd_set *wfds, fd_set *e
 
 	if (n_handles == 0) {
 		/* plain sockets only - let winsock handle the whole thing */
+		// For win32 we support only sockets in this function
+		if (ZEND_ASYNC_IS_ACTIVE && (tv == NULL || tv->tv_sec > 0 || tv->tv_usec > 0)) {
+			return php_select_async(max_fd, rfds, wfds, efds, tv);
+		}
 		return select(-1, rfds, wfds, efds, tv);
 	}
 
@@ -146,8 +152,7 @@ PHPAPI int php_select(php_socket_t max_fd, fd_set *rfds, fd_set *wfds, fd_set *e
 					if (WAIT_OBJECT_0 == WaitForSingleObject(handles[i], 0)) {
 						if (SAFE_FD_ISSET(handle_slot_to_fd[i], rfds)) {
 							DWORD avail_read = 0;
-							if (num_read_pipes < n_handles
-								|| !PeekNamedPipe(handles[i], NULL, 0, NULL, &avail_read, NULL)
+							if (!PeekNamedPipe(handles[i], NULL, 0, NULL, &avail_read, NULL)
 								|| avail_read > 0
 							) {
 								FD_SET((uint32_t)handle_slot_to_fd[i], &aread);

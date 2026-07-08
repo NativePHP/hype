@@ -88,6 +88,7 @@
 #include "rfc1867.h"
 
 #include "main_arginfo.h"
+#include "zend_async_API.h"
 /* }}} */
 
 PHPAPI int (*php_register_internal_extensions_func)(void) = php_register_internal_extensions;
@@ -145,6 +146,7 @@ PHPAPI char *php_get_version(sapi_module_struct *sapi_module)
 #ifdef HAVE_GCOV
 		" GCOV"
 #endif
+		" " ZEND_ASYNC_API
 	);
 	smart_string_appends(&version_info, "Copyright © The PHP Group and Contributors\n");
 
@@ -156,7 +158,6 @@ PHPAPI char *php_get_version(sapi_module_struct *sapi_module)
 	}
 	smart_string_appends(&version_info, get_zend_version());
 	smart_string_0(&version_info);
-
 	return version_info.c;
 }
 
@@ -1992,6 +1993,18 @@ void php_request_shutdown(void *dummy)
 		zend_call_destructors();
 	} zend_end_try();
 
+	// Before PHP shuts down completely,
+	// control is passed to the coroutines one last time (if any remain).
+	zend_try {
+		ZEND_ASYNC_RUN_SCHEDULER_AFTER_MAIN(false);
+	} zend_end_try();
+
+	// Detach async IO from all streams (they become sync-only).
+	// The reactor stays alive until zend_deactivate() for object destructors.
+	php_stream_detach_async_io();
+	// After that, all functions must work synchronously and follow only the synchronous path.
+	ZEND_ASYNC_DEACTIVATE;
+
 	/* 3. Flush all output buffers */
 	zend_try {
 		php_output_end_all();
@@ -2218,6 +2231,7 @@ zend_result php_module_startup(sapi_module_struct *sf, zend_module_entry *additi
 
 	module_shutdown = false;
 	module_startup = true;
+	zend_async_init_internal_context_api();
 	sapi_initialize_empty_request();
 	sapi_activate();
 
@@ -2226,8 +2240,6 @@ zend_result php_module_startup(sapi_module_struct *sf, zend_module_entry *additi
 	}
 
 	sapi_module = *sf;
-
-	php_output_startup();
 
 #ifdef ZTS
 	ts_allocate_fast_id(&core_globals_id, &core_globals_offset, sizeof(php_core_globals), (ts_allocate_ctor) core_globals_ctor, (ts_allocate_dtor) core_globals_dtor);
@@ -2239,6 +2251,9 @@ zend_result php_module_startup(sapi_module_struct *sf, zend_module_entry *additi
 	php_startup_ticks();
 #endif
 	gc_globals_ctor();
+	zend_async_globals_ctor();
+
+	php_output_startup();
 
 	zend_observer_startup();
 #if ZEND_DEBUG
@@ -2511,6 +2526,11 @@ void php_module_shutdown(void)
 		return;
 	}
 
+	/* Drain child threads spawned via the async reactor before any module
+	 * gets destroyed. Workers may still be running their own request
+	 * shutdown and touching TSRM globals of modules we are about to free. */
+	ZEND_ASYNC_REACTOR_QUIESCE();
+
 	zend_interned_strings_switch_storage(0);
 
 #if ZEND_RC_DEBUG
@@ -2561,6 +2581,8 @@ void php_module_shutdown(void)
 	}
 
 	module_initialized = false;
+
+	zend_async_api_shutdown();
 
 #ifndef ZTS
 	core_globals_dtor(&core_globals);
@@ -2657,7 +2679,11 @@ PHPAPI bool php_execute_script_ex(zend_file_handle *primary_file, zval *retval)
 		if (append_file_p && result) {
 			result = zend_execute_script(ZEND_REQUIRE, NULL, append_file_p) == SUCCESS;
 		}
+
+		ZEND_ASYNC_RUN_SCHEDULER_AFTER_MAIN(false);
 	} zend_catch {
+		// We provide the ability to correctly handle a bailout in the main coroutine.
+		ZEND_ASYNC_RUN_SCHEDULER_AFTER_MAIN(true);
 		result = false;
 	} zend_end_try();
 
@@ -2829,11 +2855,13 @@ PHPAPI void php_reserve_tsrm_memory(void)
 		TSRM_ALIGNED_SIZE(zend_gc_globals_size()) +
 		TSRM_ALIGNED_SIZE(sizeof(php_core_globals)) +
 		TSRM_ALIGNED_SIZE(sizeof(sapi_globals_struct)) +
+		TSRM_ALIGNED_SIZE(sizeof(sapi_globals_struct)) +
 		TSRM_ALIGNED_SIZE(sizeof(zend_accel_globals)) +
+		TSRM_ALIGNED_SIZE(sizeof(sapi_globals_struct)) +
 #ifdef HAVE_JIT
 		TSRM_ALIGNED_SIZE(sizeof(zend_jit_globals)) +
 #endif
-		0
+		TSRM_ALIGNED_SIZE(sizeof(zend_async_globals_t))
 	);
 }
 /* }}} */

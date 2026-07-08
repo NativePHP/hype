@@ -2400,6 +2400,12 @@ static zend_class_entry* zend_accel_inheritance_cache_add(zend_class_entry *ce, 
 			SHM_PROTECT();
 			if (!needs_autoload) {
 				zend_map_ptr_extend(ZCSG(map_ptr_last));
+				/* Another thread cached this class first; our transient linked
+				 * copy is now unreachable. The MISS path frees it inside persist
+				 * (zend_shared_memdup_free), so the HIT path must free it here. */
+				zval zv_ce;
+				ZVAL_PTR(&zv_ce, ce);
+				destroy_zend_class(&zv_ce);
 				return entry->ce;
 			} else {
 				return NULL;
@@ -2711,7 +2717,12 @@ ZEND_RINIT_FUNCTION(zend_accelerator)
 #endif
 
 	HANDLE_BLOCK_INTERRUPTIONS();
+	/* SHM_UNPROTECT/PROTECT pair temporarily disabled for ZTS.
+	 * mprotect() is process-global and races with JIT trace compilation
+	 * in other threads. See https://github.com/php/php-src/issues/21772 */
+#ifndef ZTS
 	SHM_UNPROTECT();
+#endif
 
 	if (ZCG(counted)) {
 #ifdef ZTS
@@ -2775,7 +2786,9 @@ ZEND_RINIT_FUNCTION(zend_accelerator)
 
 	ZCG(accelerator_enabled) = ZCSG(accelerator_enabled);
 
+#ifndef ZTS
 	SHM_PROTECT();
+#endif
 	HANDLE_UNBLOCK_INTERRUPTIONS();
 
 	if (ZCG(accelerator_enabled) && ZCSG(last_restart_time) != ZCG(last_restart_time)) {

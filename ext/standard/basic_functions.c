@@ -114,6 +114,8 @@ PHPAPI php_basic_globals basic_globals;
 #include "zend_frameless_function.h"
 #include "basic_functions_arginfo.h"
 
+#include "Zend/zend_async_API.h"
+
 #if __has_feature(memory_sanitizer)
 # include <sanitizer/msan_interface.h>
 #endif
@@ -1119,6 +1121,44 @@ PHP_FUNCTION(flush)
 }
 /* }}} */
 
+static zend_long sleep_async(zend_long ms, zend_long nanoseconds)
+{
+	zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+	if (UNEXPECTED(coroutine == NULL)) {
+		return -1;
+	}
+
+	if (ms == 0 && nanoseconds == 0) {
+		ZEND_ASYNC_ENQUEUE_COROUTINE(ZEND_ASYNC_CURRENT_COROUTINE);
+		ZEND_ASYNC_SUSPEND();
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			return -1;
+		}
+		return 0;
+	}
+
+	if (nanoseconds == 0) {
+		zend_async_waker_new_with_timeout(coroutine, ms, NULL);
+	} else {
+		ZEND_ASYNC_WAKER_NEW(coroutine);
+		zend_async_resume_when(
+			coroutine,
+			&ZEND_ASYNC_NEW_TIMER_EVENT_NS(ms, nanoseconds, false)->base,
+			true,
+			zend_async_waker_callback_resolve,
+			NULL
+		);
+	}
+
+	if (UNEXPECTED(EG(exception) != NULL)) {
+		return -1;
+	}
+
+	ZEND_ASYNC_SUSPEND();
+	zend_async_waker_clean(coroutine);
+	return 0;
+}
+
 /* {{{ Delay for a given number of seconds */
 PHP_FUNCTION(sleep)
 {
@@ -1133,6 +1173,13 @@ PHP_FUNCTION(sleep)
 		RETURN_THROWS();
 	}
 
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		sleep_async(num * 1000, 0);
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			RETURN_THROWS();
+		}
+		RETURN_LONG(0);
+	}
 	RETURN_LONG(php_sleep((unsigned int)num));
 }
 /* }}} */
@@ -1149,6 +1196,14 @@ PHP_FUNCTION(usleep)
 	if (num < 0) {
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
+	}
+
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		sleep_async(0, num * 1000);
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			RETURN_THROWS();
+		}
+		return;
 	}
 
 #ifdef HAVE_USLEEP
@@ -1176,6 +1231,16 @@ PHP_FUNCTION(time_nanosleep)
 	if (tv_nsec < 0) {
 		zend_argument_value_error(2, "must be greater than or equal to 0");
 		RETURN_THROWS();
+	}
+
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		sleep_async(tv_sec * 1000, tv_nsec);
+
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			RETURN_THROWS();
+		}
+
+		RETURN_TRUE;
 	}
 
 	php_req.tv_sec = (time_t) tv_sec;
@@ -1228,6 +1293,17 @@ PHP_FUNCTION(time_sleep_until)
 	}
 
 	diff_ns = target_ns - current_ns;
+
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		sleep_async(0, (zend_long) diff_ns);
+
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			RETURN_THROWS();
+		}
+
+		RETURN_TRUE;
+	}
+
 	php_req.tv_sec = (time_t) (diff_ns / ns_per_sec);
 	php_req.tv_nsec = (long) (diff_ns % ns_per_sec);
 

@@ -87,24 +87,24 @@ static void pgsql_stmt_finish(pdo_pgsql_stmt *S, int fin_mode)
 		// @todo Implement !(fin_mode & FIN_DISCARD)
 		//       instead of discarding results we could store them to their statement
 		//       so that their fetch() will get them (albeit not in lazy mode anymore).
-		while ((S->result = PQgetResult(H->server))) {
+		while ((S->result = pdo_pgsql_get_result_concurrent(H))) {
 			PQclear(S->result);
 			S->result = NULL;
 		}
 		S->is_running_unbuffered = false;
 	}
 
-	if (S->stmt_name && S->is_prepared && (fin_mode & FIN_CLOSE)) {
+	if (S->stmt_name && S->is_prepared && (fin_mode & FIN_CLOSE) && !S->from_cache) {
 		PGresult *res;
 #ifndef HAVE_PQCLOSEPREPARED
 		// TODO (??) libpq does not support close statement protocol < postgres 17
 		// check if we can circumvent this.
 		char *q = NULL;
 		spprintf(&q, 0, "DEALLOCATE %s", S->stmt_name);
-		res = PQexec(H->server, q);
+		res = pdo_pgsql_exec_concurrent(H, q);
 		efree(q);
 #else
-		res = PQclosePrepared(H->server, S->stmt_name);
+		res = pdo_pgsql_close_prepared_concurrent(H, S->stmt_name);
 #endif
 		if (res) {
 			PQclear(res);
@@ -156,7 +156,7 @@ static int pgsql_stmt_dtor(pdo_stmt_t *stmt)
 			PGresult *res;
 
 			spprintf(&q, 0, "CLOSE %s", S->cursor_name);
-			res = PQexec(H->server, q);
+			res = pdo_pgsql_exec_concurrent(H, q);
 			efree(q);
 			if (res) PQclear(res);
 		}
@@ -179,8 +179,10 @@ static int pgsql_stmt_execute(pdo_stmt_t *stmt)
 	pdo_pgsql_db_handle *H = S->H;
 	ExecStatusType status;
 	int dispatch_result = 1;
+	bool plan_invalidation_retried = false;
 
-	bool in_trans = stmt->dbh->methods->in_transaction(stmt->dbh);
+	pdo_dbh_t *active_dbh = stmt->pooled_conn ? stmt->pooled_conn : stmt->dbh;
+	const bool in_trans = active_dbh->methods->in_transaction(active_dbh);
 
 	/* in unbuffered mode, finish any running statement: libpq explicitely prohibits this
 	 * and returns a PGRES_FATAL_ERROR when PQgetResult gets called for stmt 2 if DEALLOCATE
@@ -200,12 +202,12 @@ static int pgsql_stmt_execute(pdo_stmt_t *stmt)
 
 		if (S->is_prepared) {
 			spprintf(&q, 0, "CLOSE %s", S->cursor_name);
-			PQclear(PQexec(H->server, q));
+			PQclear(pdo_pgsql_exec_concurrent(H, q));
 			efree(q);
 		}
 
 		spprintf(&q, 0, "DECLARE %s SCROLL CURSOR WITH HOLD FOR %s", S->cursor_name, ZSTR_VAL(stmt->active_query_string));
-		S->result = PQexec(H->server, q);
+		S->result = pdo_pgsql_exec_concurrent(H, q);
 		efree(q);
 
 		/* check if declare failed */
@@ -221,16 +223,17 @@ static int pgsql_stmt_execute(pdo_stmt_t *stmt)
 
 		/* fetch to be able to get the number of tuples later, but don't advance the cursor pointer */
 		spprintf(&q, 0, "FETCH FORWARD 0 FROM %s", S->cursor_name);
-		S->result = PQexec(H->server, q);
+		S->result = pdo_pgsql_exec_concurrent(H, q);
 		efree(q);
 	} else if (S->stmt_name) {
 		/* using a prepared statement */
+plan_invalidation_retry:
 
 		if (!S->is_prepared) {
 stmt_retry:
 			/* we deferred the prepare until now, because we didn't
 			 * know anything about the parameter types; now we do */
-			S->result = PQprepare(H->server, S->stmt_name, ZSTR_VAL(S->query),
+			S->result = pdo_pgsql_prepare_concurrent(H, S->stmt_name, ZSTR_VAL(S->query),
 						stmt->bound_params ? zend_hash_num_elements(stmt->bound_params) : 0,
 						S->param_types);
 			status = PQresultStatus(S->result);
@@ -241,6 +244,30 @@ stmt_retry:
 					S->is_prepared = true;
 					PQclear(S->result);
 					S->result = NULL;
+					/* If we just re-prepared after a plan-invalidation eviction,
+					 * re-insert this name into the cache so subsequent prepares
+					 * on this conn collapse to the same server-side stmt again. */
+					if (plan_invalidation_retried && H->stmt_cache != NULL && S->from_cache) {
+						pdo_pool_stmt_cache_entry_t *evicted = NULL;
+						pdo_pool_stmt_cache_entry_t *e = pdo_pool_stmt_cache_insert(
+							H->stmt_cache, S->query, &evicted);
+						if (evicted != NULL) {
+							PGresult *r;
+#ifndef HAVE_PQCLOSEPREPARED
+							char *q = NULL;
+							spprintf(&q, 0, "DEALLOCATE %s", evicted->server_stmt_name);
+							r = pdo_pgsql_exec_concurrent(H, q);
+							efree(q);
+#else
+							r = pdo_pgsql_close_prepared_concurrent(H, evicted->server_stmt_name);
+#endif
+							if (r) PQclear(r);
+							pdo_pool_stmt_cache_entry_free(evicted);
+						}
+						if (e != NULL) {
+							e->server_stmt_name = estrdup(S->stmt_name);
+						}
+					}
 					break;
 				default: {
 					char *sqlstate = pdo_pgsql_sqlstate(S->result);
@@ -255,9 +282,9 @@ stmt_retry:
 #ifndef HAVE_PQCLOSEPREPARED
 						char buf[100]; /* stmt_name == "pdo_crsr_%08x" */
 						snprintf(buf, sizeof(buf), "DEALLOCATE %s", S->stmt_name);
-						res = PQexec(H->server, buf);
+						res = pdo_pgsql_exec_concurrent(H, buf);
 #else
-						res = PQclosePrepared(H->server, S->stmt_name);
+						res = pdo_pgsql_close_prepared_concurrent(H, S->stmt_name);
 #endif
 						if (res) {
 							PQclear(res);
@@ -279,8 +306,13 @@ stmt_retry:
 					S->param_lengths,
 					S->param_formats,
 					0);
+			if (dispatch_result) {
+				if (!pdo_pgsql_flush(H)) {
+					dispatch_result = 0;
+				}
+			}
 		} else {
-			S->result = PQexecPrepared(H->server, S->stmt_name,
+			S->result = pdo_pgsql_exec_prepared_concurrent(H, S->stmt_name,
 				stmt->bound_params ?
 					zend_hash_num_elements(stmt->bound_params) :
 					0,
@@ -299,8 +331,13 @@ stmt_retry:
 					S->param_lengths,
 					S->param_formats,
 					0);
+			if (dispatch_result) {
+				if (!pdo_pgsql_flush(H)) {
+					dispatch_result = 0;
+				}
+			}
 		} else {
-			S->result = PQexecParams(H->server, ZSTR_VAL(S->query),
+			S->result = pdo_pgsql_exec_params_concurrent(H, ZSTR_VAL(S->query),
 				stmt->bound_params ? zend_hash_num_elements(stmt->bound_params) : 0,
 				S->param_types,
 				(const char**)S->param_values,
@@ -312,8 +349,13 @@ stmt_retry:
 		/* execute plain query (with embedded parameters) */
 		if (S->is_unbuffered) {
 			dispatch_result = PQsendQuery(H->server, ZSTR_VAL(stmt->active_query_string));
+			if (dispatch_result) {
+				if (!pdo_pgsql_flush(H)) {
+					dispatch_result = 0;
+				}
+			}
 		} else {
-			S->result = PQexec(H->server, ZSTR_VAL(stmt->active_query_string));
+			S->result = pdo_pgsql_exec_concurrent(H, ZSTR_VAL(stmt->active_query_string));
 		}
 	}
 
@@ -330,13 +372,60 @@ stmt_retry:
 		/* no matter if it returns 0: PQ then transparently fallbacks to full result fetching */
 
 		/* try a first fetch to at least have column names and so on */
-		S->result = PQgetResult(S->H->server);
+		S->result = pdo_pgsql_get_result_concurrent(S->H);
 	}
 
 	status = PQresultStatus(S->result);
 
 	if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK && status != PGRES_SINGLE_TUPLE) {
-		pdo_pgsql_error_stmt(stmt, status, pdo_pgsql_sqlstate(S->result));
+		/* Plan-invalidation handling for cache-backed prepared statements.
+		 * After DDL on referenced objects (ALTER TABLE, DROP INDEX, schema
+		 * resolution change, etc.) PostgreSQL invalidates cached plans and
+		 * fails the next EXECUTE with one of:
+		 *   0A000 — feature_not_supported (e.g. "cached plan must not change result type")
+		 *   26000 — invalid_sql_statement_name (server-side stmt vanished)
+		 * Evict from cache, DEALLOCATE on a best-effort basis, re-PQprepare
+		 * with the same name and retry once. The user never sees the error. */
+		/* Order from cheapest to most expensive: bool flags → pointer non-null
+		 * → strcmp. Plan invalidation is rare; strcmp must not run on the
+		 * common error path (most stmt errors are not from a cached plan). */
+		const char *const sqlstate = pdo_pgsql_sqlstate(S->result);
+		if (UNEXPECTED(
+			S->from_cache
+			&& !plan_invalidation_retried
+			&& S->stmt_name != NULL
+			&& sqlstate != NULL
+			&& (strcmp(sqlstate, "0A000") == 0 || strcmp(sqlstate, "26000") == 0)))
+		{
+			plan_invalidation_retried = true;
+
+			PQclear(S->result);
+			S->result = NULL;
+			S->is_prepared = false;
+			H->running_stmt = NULL;
+
+			pdo_pool_stmt_cache_entry_t *taken = pdo_pool_stmt_cache_take(H->stmt_cache, S->query);
+			if (taken != NULL) {
+				/* Best-effort DEALLOCATE — for 26000 the server already lost
+				 * the stmt, so failure is fine. For 0A000 it still exists
+				 * with a stale plan; drop it. */
+				PGresult *r;
+#ifndef HAVE_PQCLOSEPREPARED
+				char *q = NULL;
+				spprintf(&q, 0, "DEALLOCATE %s", taken->server_stmt_name);
+				r = pdo_pgsql_exec_concurrent(H, q);
+				efree(q);
+#else
+				r = pdo_pgsql_close_prepared_concurrent(H, taken->server_stmt_name);
+#endif
+				if (r) PQclear(r);
+				pdo_pool_stmt_cache_entry_free(taken);
+			}
+
+			goto plan_invalidation_retry;
+		}
+
+		pdo_pgsql_error_stmt(stmt, status, sqlstate);
 		return 0;
 	}
 
@@ -352,8 +441,8 @@ stmt_retry:
 		stmt->row_count = (zend_long)PQntuples(S->result);
 	}
 
-	if (in_trans && !stmt->dbh->methods->in_transaction(stmt->dbh)) {
-		pdo_pgsql_close_lob_streams(stmt->dbh);
+	if (in_trans && !active_dbh->methods->in_transaction(active_dbh)) {
+		pdo_pgsql_close_lob_streams(active_dbh);
 	}
 
 	return 1;
@@ -543,7 +632,7 @@ static int pgsql_stmt_fetch(pdo_stmt_t *stmt,
 		if (ori == PDO_FETCH_ORI_ABS || ori == PDO_FETCH_ORI_REL) {
 			efree(ori_str);
 		}
-		S->result = PQexec(S->H->server, q);
+		S->result = pdo_pgsql_exec_concurrent(S->H, q);
 		efree(q);
 		status = PQresultStatus(S->result);
 
@@ -570,7 +659,7 @@ static int pgsql_stmt_fetch(pdo_stmt_t *stmt,
 				S->result = NULL;
 			}
 
-			S->result = PQgetResult(S->H->server);
+			S->result = pdo_pgsql_get_result_concurrent(S->H);
 			if (!S->result) {
 				S->is_running_unbuffered = false;
 				stmt->row_count = 0;
@@ -588,8 +677,8 @@ static int pgsql_stmt_fetch(pdo_stmt_t *stmt,
 			S->current_row = 0;
 
 			if (!stmt->row_count) {
-				S->is_running_unbuffered = false;
-				/* libpq requires looping until getResult returns null */
+				/* libpq requires looping until getResult returns null.
+				 * pgsql_stmt_finish will clear is_running_unbuffered after draining. */
 				pgsql_stmt_finish(S, 0);
 			}
 		}
@@ -706,7 +795,7 @@ static int pgsql_stmt_get_col(pdo_stmt_t *stmt, int colno, zval *result, enum pd
 	return 1;
 }
 
-static zend_always_inline char * pdo_pgsql_translate_oid_to_table(Oid oid, PGconn *conn)
+static zend_always_inline char * pdo_pgsql_translate_oid_to_table(Oid oid, pdo_pgsql_db_handle *conn)
 {
 	char *table_name = NULL;
 	PGresult *tmp_res;
@@ -714,7 +803,7 @@ static zend_always_inline char * pdo_pgsql_translate_oid_to_table(Oid oid, PGcon
 
 	spprintf(&querystr, 0, "SELECT RELNAME FROM PG_CLASS WHERE OID=%d", oid);
 
-	if ((tmp_res = PQexec(conn, querystr)) == NULL || PQresultStatus(tmp_res) != PGRES_TUPLES_OK) {
+	if ((tmp_res = pdo_pgsql_exec_concurrent(conn, querystr)) == NULL || PQresultStatus(tmp_res) != PGRES_TUPLES_OK) {
 		if (tmp_res) {
 			PQclear(tmp_res);
 		}
@@ -756,7 +845,7 @@ static int pgsql_stmt_get_column_meta(pdo_stmt_t *stmt, zend_long colno, zval *r
 
 	table_oid = PQftable(S->result, colno);
 	add_assoc_long(return_value, "pgsql:table_oid", table_oid);
-	table_name = pdo_pgsql_translate_oid_to_table(table_oid, S->H->server);
+	table_name = pdo_pgsql_translate_oid_to_table(table_oid, S->H);
 	if (table_name) {
 		add_assoc_string(return_value, "table", table_name);
 		efree(table_name);
@@ -799,7 +888,7 @@ static int pgsql_stmt_get_column_meta(pdo_stmt_t *stmt, zend_long colno, zval *r
 		default:
 			/* Fetch metadata from Postgres system catalogue */
 			spprintf(&q, 0, "SELECT TYPNAME FROM PG_TYPE WHERE OID=%u", S->cols[colno].pgsql_type);
-			res = PQexec(S->H->server, q);
+			res = pdo_pgsql_exec_concurrent(S->H, q);
 			efree(q);
 			status = PQresultStatus(res);
 			if (status == PGRES_TUPLES_OK && 1 == PQntuples(res)) {

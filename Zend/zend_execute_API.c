@@ -48,6 +48,8 @@
 #include <sys/syscall.h>
 #endif
 
+#include "zend_async_API.h"
+
 ZEND_API void (*zend_execute_ex)(zend_execute_data *execute_data);
 ZEND_API void (*zend_execute_internal)(zend_execute_data *execute_data, zval *return_value);
 ZEND_API zend_class_entry *(*zend_autoload)(zend_string *name, zend_string *lc_name);
@@ -196,6 +198,13 @@ void init_executor(void) /* {{{ */
 	EG(filename_override) = NULL;
 	EG(lineno_override) = -1;
 
+	EG(shutdown_context) = (zend_shutdown_context_t) {
+		.is_started = false,
+		.coroutine = NULL,
+		.num_elements = 0,
+		.idx = 0
+	};
+
 	zend_max_execution_timer_init();
 	zend_fiber_init();
 	zend_weakrefs_init();
@@ -203,19 +212,6 @@ void init_executor(void) /* {{{ */
 	zend_hash_init(&EG(callable_convert_cache), 8, NULL, ZVAL_PTR_DTOR, 0);
 
 	EG(active) = 1;
-}
-/* }}} */
-
-static int zval_call_destructor(zval *zv) /* {{{ */
-{
-	if (Z_TYPE_P(zv) == IS_INDIRECT) {
-		zv = Z_INDIRECT_P(zv);
-	}
-	if (Z_TYPE_P(zv) == IS_OBJECT && Z_REFCOUNT_P(zv) == 1) {
-		return ZEND_HASH_APPLY_REMOVE;
-	} else {
-		return ZEND_HASH_APPLY_KEEP;
-	}
 }
 /* }}} */
 
@@ -247,22 +243,125 @@ static ZEND_COLD void zend_throw_or_error(uint32_t fetch_type, zend_class_entry 
 }
 /* }}} */
 
+static void  shutdown_destructors_coroutine_dtor(zend_coroutine_t *coroutine) /* {{{ */
+{
+	zend_shutdown_context_t *shutdown_context = &EG(shutdown_context);
+
+	if (shutdown_context->is_started && shutdown_context->coroutine == coroutine) {
+		shutdown_context->coroutine = NULL;
+		shutdown_context->is_started = false;
+		zend_error(E_CORE_ERROR, "Shutdown destructors coroutine was not finished property");
+		EG(symbol_table).pDestructor = zend_unclean_zval_ptr_dtor;
+		shutdown_destructors();
+	}
+}
+
+static bool shutdown_destructors_context_switch_handler(
+	zend_coroutine_t *coroutine, 
+	bool is_enter, 
+	bool is_finishing
+) {
+	if (is_enter) {
+		return true;
+	}
+
+	if (is_finishing) {
+		return false;
+	}
+
+	zend_shutdown_context_t *shutdown_context = &EG(shutdown_context);
+
+	if (false == shutdown_context->is_started) {
+		return false;
+	}
+
+	zend_coroutine_t *shutdown_coroutine = ZEND_ASYNC_SPAWN_WITH_SCOPE_EX(ZEND_ASYNC_MAIN_SCOPE, 1);
+	shutdown_coroutine->internal_entry = shutdown_destructors;
+	shutdown_coroutine->extended_dispose = shutdown_destructors_coroutine_dtor;
+
+	return false;
+}
+
 void shutdown_destructors(void) /* {{{ */
 {
+	zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+	bool should_continue = false;
+
+	zend_shutdown_context_t *shutdown_context = &EG(shutdown_context);
+
+	if (coroutine == NULL) {
+		ZEND_ASYNC_ADD_MAIN_COROUTINE_START_HANDLER(shutdown_destructors_context_switch_handler);
+	} else {
+		ZEND_COROUTINE_ADD_SWITCH_HANDLER(coroutine, shutdown_destructors_context_switch_handler);
+	}
+
+	HashTable *symbol_table = &EG(symbol_table);
+
+	if (false == shutdown_context->is_started) {
+		shutdown_context->is_started = true;
+		shutdown_context->coroutine = coroutine;
+		shutdown_context->num_elements = zend_hash_num_elements(symbol_table);
+		shutdown_context->idx = symbol_table->nNumUsed;
+	}
+
 	if (CG(unclean_shutdown)) {
 		EG(symbol_table).pDestructor = zend_unclean_zval_ptr_dtor;
 	}
+
 	zend_try {
-		uint32_t symbols;
 		do {
-			symbols = zend_hash_num_elements(&EG(symbol_table));
-			zend_hash_reverse_apply(&EG(symbol_table), (apply_func_t) zval_call_destructor);
-		} while (symbols != zend_hash_num_elements(&EG(symbol_table)));
-		zend_objects_store_call_destructors(&EG(objects_store));
+			if (should_continue) {
+				shutdown_context->num_elements = zend_hash_num_elements(symbol_table);
+				shutdown_context->idx = symbol_table->nNumUsed;
+			} else {
+				should_continue = true;
+			}
+
+			while (shutdown_context->idx > 0) {
+
+				shutdown_context->idx--;
+
+				Bucket *p = symbol_table->arData + shutdown_context->idx;
+
+				if (UNEXPECTED(Z_TYPE(p->val) == IS_UNDEF)) {
+					continue;
+				}
+				
+				zval *zv = &p->val;
+				if (Z_TYPE_P(zv) == IS_INDIRECT) {
+					zv = Z_INDIRECT_P(zv);
+				}
+				
+				if (Z_TYPE_P(zv) == IS_OBJECT && Z_REFCOUNT_P(zv) == 1) {
+					zend_hash_del_bucket(symbol_table, p);
+				}
+				
+				// If the coroutine has changed
+				if (coroutine != ZEND_ASYNC_CURRENT_COROUTINE) {
+					should_continue = false;
+					break;
+				}
+			}
+
+			if (false == should_continue) {
+				break;
+			}
+
+		} while (shutdown_context->num_elements != zend_hash_num_elements(symbol_table));
+
+		if (should_continue) {
+			shutdown_context->is_started = false;
+			shutdown_context->coroutine = NULL;
+			zend_objects_store_call_destructors_async(&EG(objects_store));
+		}
 	} zend_catch {
-		/* if we couldn't destruct cleanly, mark all objects as destructed anyway */
-		zend_objects_store_mark_destructed(&EG(objects_store));
+		EG(symbol_table).pDestructor = zend_unclean_zval_ptr_dtor;
+		shutdown_context->is_started = false;
+		shutdown_destructors();
+		zend_bailout();
 	} zend_end_try();
+
+	shutdown_context->is_started = false;
 }
 /* }}} */
 
@@ -567,13 +666,24 @@ ZEND_API const char *get_active_class_name(const char **space) /* {{{ */
 
 ZEND_API const char *get_active_function_name(void) /* {{{ */
 {
-	const zend_function *func;
-
 	if (!zend_is_executing()) {
 		return NULL;
 	}
 
-	func = zend_active_function();
+	/* When acting on behalf of a suspended coroutine, use its execute_data */
+	const zend_function *func = NULL;
+	zend_coroutine_t *acting = ZEND_ASYNC_ACTING_COROUTINE;
+
+	if (acting != NULL) {
+		const zend_execute_data *ex = ZEND_ASYNC_COROUTINE_GET_EXECUTE_DATA(acting);
+		if (ex && ex->func) {
+			func = ex->func;
+		}
+	}
+
+	if (func == NULL) {
+		func = zend_active_function();
+	}
 
 	switch (func->type) {
 		case ZEND_USER_FUNCTION: {
@@ -587,8 +697,10 @@ ZEND_API const char *get_active_function_name(void) /* {{{ */
 			}
 			break;
 		case ZEND_INTERNAL_FUNCTION:
-			return ZSTR_VAL(func->common.function_name);
-			break;
+			if (func->common.function_name) {
+				return ZSTR_VAL(func->common.function_name);
+			}
+			return NULL;
 		default:
 			return NULL;
 	}
@@ -671,9 +783,21 @@ ZEND_API zend_string *zend_get_executed_filename_ex(void) /* {{{ */
 	}
 	if (ex) {
 		return ex->func->op_array.filename;
-	} else {
-		return NULL;
 	}
+
+	/* Fall back to acting_coroutine's suspended execute_data */
+	zend_coroutine_t *acting = ZEND_ASYNC_ACTING_COROUTINE;
+	if (acting != NULL) {
+		ex = ZEND_ASYNC_COROUTINE_GET_EXECUTE_DATA(acting);
+		while (ex && (!ex->func || !ZEND_USER_CODE(ex->func->type))) {
+			ex = ex->prev_execute_data;
+		}
+		if (ex) {
+			return ex->func->op_array.filename;
+		}
+	}
+
+	return NULL;
 }
 /* }}} */
 
@@ -699,9 +823,24 @@ ZEND_API uint32_t zend_get_executed_lineno(void) /* {{{ */
 			return EG(opline_before_exception)->lineno;
 		}
 		return ex->opline->lineno;
-	} else {
-		return 0;
 	}
+
+	/* Fall back to acting_coroutine's suspended execute_data */
+	zend_coroutine_t *acting = ZEND_ASYNC_ACTING_COROUTINE;
+	if (acting != NULL) {
+		ex = ZEND_ASYNC_COROUTINE_GET_EXECUTE_DATA(acting);
+		while (ex && (!ex->func || !ZEND_USER_CODE(ex->func->type))) {
+			ex = ex->prev_execute_data;
+		}
+		if (ex) {
+			if (!ex->opline) {
+				return ex->func->op_array.opcodes[0].lineno;
+			}
+			return ex->opline->lineno;
+		}
+	}
+
+	return 0;
 }
 /* }}} */
 

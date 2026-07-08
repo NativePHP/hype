@@ -355,12 +355,20 @@ static void sapi_cli_log_message(const char *message, int syslog_type_int) /* {{
 static int sapi_cli_deactivate(void) /* {{{ */
 {
 	fflush(stdout);
-	if(SG(request_info).argv0) {
+	if (SG(request_info).argv0) {
 		free(SG(request_info).argv0);
 		SG(request_info).argv0 = NULL;
 	}
 	return SUCCESS;
 }
+
+#ifdef ZTS
+static void sapi_cli_thread_init(void) /* {{{ */
+{
+	TSRMLS_CACHE_UPDATE();
+}
+/* }}} */
+#endif
 /* }}} */
 
 static char* sapi_cli_read_cookies(void) /* {{{ */
@@ -866,7 +874,16 @@ static int do_cli(int argc, char **argv) /* {{{ */
 			fflush(stdout);
 		}
 
+	} zend_end_try();
+
 do_repeat:
+	/* Each repeat iteration needs its own SETJMP so that zend_bailout()
+	 * is caught here rather than propagating to the outer handler.
+	 * Without this, goto do_repeat re-enters the outer zend_try block
+	 * without reinitializing its jump buffer, so a bailout on repeat
+	 * iterations would skip php_request_shutdown() entirely. */
+	zend_try {
+
 		/* only set script_file if not set already and not in direct mode and not at end of parameter list */
 		if (argc > php_optind
 		  && !script_file
@@ -1227,6 +1244,9 @@ int main(int argc, char *argv[])
 #endif
 
 	cli_sapi_module.additional_functions = additional_functions;
+#ifdef ZTS
+	cli_sapi_module.thread_init = sapi_cli_thread_init;
+#endif
 
 #if defined(PHP_WIN32) && defined(_DEBUG)
 	{

@@ -72,8 +72,14 @@ if test "$PHP_CURL" != "no"; then
     [AC_MSG_FAILURE([The libcurl check failed.])],
     [$CURL_LIBS])
 
+  curl_sources="interface.c multi.c share.c curl_file.c curl_async.c"
+
+  PKG_CHECK_MODULES([CURL_ASYNC], [libcurl >= 7.87.0], [], [
+    AC_MSG_ERROR([libcurl >= 7.87.0 is required for TrueAsync due to curl_multi_socket_action crashes in earlier versions])
+  ])
+
   PHP_NEW_EXTENSION([curl],
-    [interface.c multi.c share.c curl_file.c],
+    [$curl_sources],
     [$ext_shared])
   PHP_INSTALL_HEADERS([ext/curl], [php_curl.h])
   PHP_SUBST([CURL_SHARED_LIBADD])

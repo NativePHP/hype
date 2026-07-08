@@ -25,6 +25,9 @@ typedef struct _pdo_row_t		 pdo_row_t;
 typedef	struct _pdo_scanner_t	 pdo_scanner_t;
 struct pdo_bound_param_data;
 
+/* forward declaration for async pool (from zend_async_API.h) */
+typedef struct _zend_async_pool_s zend_async_pool_t;
+
 #ifndef TRUE
 # define TRUE 1
 #endif
@@ -32,7 +35,7 @@ struct pdo_bound_param_data;
 # define FALSE 0
 #endif
 
-#define PDO_DRIVER_API	20240423
+#define PDO_DRIVER_API	20260205
 
 /* Doctrine hardcodes these constants, avoid changing their values. */
 enum pdo_param_type {
@@ -121,6 +124,13 @@ enum pdo_attribute_type {
 	PDO_ATTR_DEFAULT_FETCH_MODE, /* Set the default fetch mode */
 	PDO_ATTR_EMULATE_PREPARES,  /* use query emulation rather than native */
 	PDO_ATTR_DEFAULT_STR_PARAM, /* set the default string parameter type (see the PDO::PARAM_STR_* magic flags) */
+
+	/* Connection pool attributes (requires async extension) */
+	PDO_ATTR_POOL_ENABLED,			/* enable connection pooling (bool) */
+	PDO_ATTR_POOL_MIN,				/* minimum idle connections (int) */
+	PDO_ATTR_POOL_MAX,				/* maximum total connections (int) */
+	PDO_ATTR_POOL_HEALTHCHECK_INTERVAL,	/* healthcheck interval in ms (int, 0 = disabled) */
+	PDO_ATTR_POOL_STMT_CACHE_SIZE,	/* per-physical-connection prepared-stmt cache LRU capacity (int, 0 = disabled, default) */
 
 	/* this defines the start of the range for driver specific options.
 	 * Drivers should define their own attribute constants beginning with this
@@ -215,6 +225,13 @@ typedef struct {
 	 */
 	int (*db_handle_factory)(pdo_dbh_t *dbh, zval *driver_options);
 
+	/* Initialize dbh->methods without creating a connection.
+	 * Used for pool templates where driver_data stays NULL.
+	 * If NULL, pool will fall back to db_handle_factory for the template.
+	 * If supports_pool is non-NULL, the driver should set *supports_pool = true
+	 * to indicate that it supports PDO::ATTR_POOL_ENABLED. */
+	void (*db_handle_init_methods)(pdo_dbh_t *dbh, bool *supports_pool);
+
 } pdo_driver_t;
 
 /* {{{ methods for a database handle */
@@ -280,6 +297,14 @@ typedef void (*pdo_dbh_get_gc_func)(pdo_dbh_t *dbh, zend_get_gc_buffer *buffer);
 /* driver specific re2s sql parser, overrides the default one if present */
 typedef int (*pdo_dbh_sql_scanner)(pdo_scanner_t *s);
 
+/* Pool slot lifecycle hooks (NULL → no-op).
+ * Both receive the slot's pdo_dbh_t (driver_data is set). They run inside
+ * the pool's before_acquire / before_release callbacks before the slot is
+ * handed to the coroutine / returned to the pool. Returning false from the
+ * release hook signals a broken connection and the pool will destroy it. */
+typedef bool (*pdo_dbh_pool_acquire_func)(pdo_dbh_t *slot_dbh);
+typedef bool (*pdo_dbh_pool_release_func)(pdo_dbh_t *slot_dbh);
+
 /* for adding methods to the dbh or stmt objects
 pointer to a list of driver specific functions. The convention is
 to prefix the function names using the PDO driver name; this will
@@ -313,6 +338,9 @@ struct pdo_dbh_methods {
 	pdo_dbh_txn_func		in_transaction;
 	pdo_dbh_get_gc_func		get_gc;
 	pdo_dbh_sql_scanner		scanner;
+	/* Pool slot hooks — NULL for drivers without per-slot setup/teardown. */
+	pdo_dbh_pool_acquire_func	pool_before_acquire;
+	pdo_dbh_pool_release_func	pool_before_release;
 };
 
 /* }}} */
@@ -498,12 +526,21 @@ struct _pdo_dbh_t {
 
 	zval def_stmt_ctor_args;
 
-	/* when calling PDO::query(), we need to keep the error
-	 * context from the statement around until we next clear it.
-	 * This will allow us to report the correct error message
-	 * when PDO::query() fails */
-	pdo_stmt_t *query_stmt;
-	zend_object *query_stmt_obj;
+	pdo_stmt_t *last_failed_query_stmt;
+	zend_object *last_failed_query_stmt_obj;
+
+	/* Connection pool (requires async extension) */
+	zend_async_pool_t *pool;		/* internal pool, NULL if pooling disabled */
+	HashTable *pool_bindings;	/* coroutine_id => pdo_pool_binding_t* */
+	zend_object *pool_wrapper;		/* cached PHP Async\Pool object for getPool() */
+	uint32_t pool_slot_refcount;	/* number of statements borrowing this pooled connection */
+	uint32_t pool_stmt_cache_size;	/* configured per-conn prepared-stmt cache capacity (template only); 0 = disabled */
+	bool conn_broken:1;				/* connection lost or protocol desynchronized — must not return to pool */
+
+	/* Driver-owned per-template auxiliary state for pool mode (e.g. SQLite UDF
+	 * registry). NULL by default. Lifetime: allocated by driver on demand,
+	 * released by driver via dbh->methods->closer when dbh_free runs. */
+	void *driver_pool_data;
 };
 
 /* represents a connection to a database */
@@ -611,6 +648,8 @@ struct _pdo_stmt_t {
 	zend_object *lazy_object_ref;
 
 	pdo_dbh_t *dbh;
+	/* borrowed connection from pool, released on statement destroy */
+	pdo_dbh_t *pooled_conn;
 	/* we want to keep the dbh alive while we live, so we own a reference */
 	zend_object *database_object_handle;
 

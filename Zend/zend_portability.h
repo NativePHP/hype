@@ -108,9 +108,25 @@
 #ifdef HAVE_GCOV
 /* Disable assert() when compiling with gcov to avoid untested branch warning. */
 # define ZEND_ASSERT(c) ((void)sizeof(c))
+# define ZEND_PRINT_BACKTRACE(msg) ((void)0)
 #elif ZEND_DEBUG
-# define ZEND_ASSERT(c)	assert(c)
+# ifdef HAVE_LIBBACKTRACE
+BEGIN_EXTERN_C()
+ZEND_API void zend_print_backtrace_ex(const char *msg, const char *file, int line);
+END_EXTERN_C()
+#  define ZEND_PRINT_BACKTRACE(msg) zend_print_backtrace_ex(msg, __FILE__, __LINE__)
+#  define ZEND_ASSERT(c) do { \
+	if (__builtin_expect(!(c), 0)) { \
+		zend_print_backtrace_ex(#c, __FILE__, __LINE__); \
+		assert(c); \
+	} \
+} while (0)
+# else
+#  define ZEND_PRINT_BACKTRACE(msg) ((void)0)
+#  define ZEND_ASSERT(c)	assert(c)
+# endif
 #else
+# define ZEND_PRINT_BACKTRACE(msg) ((void)0)
 # define ZEND_ASSERT(c) ZEND_ASSUME(c)
 #endif
 

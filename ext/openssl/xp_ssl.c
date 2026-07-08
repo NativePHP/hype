@@ -26,6 +26,7 @@
 #include "zend_smart_str.h"
 #include "zend_exceptions.h"
 #include "php_openssl.h"
+#include "main/network_async.h"
 #include "php_openssl_backend.h"
 #include "php_network.h"
 #include <openssl/ssl.h>
@@ -3142,13 +3143,48 @@ static int php_openssl_sockop_close(php_stream *stream, int close_handle) /* {{{
 			 * We use a small timeout which should encourage the OS to send the data,
 			 * but at the same time avoid hanging indefinitely.
 			 * */
-			do {
-				n = php_pollfd_for_ms(sslsock->s.socket, POLLOUT, 500);
-			} while (n == -1 && php_socket_errno() == EINTR);
+			if (ZEND_ASYNC_IS_ACTIVE) {
+				struct timeval tv = {0, 500000}; // 500ms
+				network_async_await_stream_socket(&sslsock->s, POLLOUT, &tv);
+			} else {
+				do {
+					n = php_pollfd_for_ms(sslsock->s.socket, POLLOUT, 500);
+				} while (n == -1 && php_socket_errno() == EINTR);
+			}
 #endif
-			closesocket(sslsock->s.socket);
-			sslsock->s.socket = SOCK_ERR;
+			if (sslsock->s.poll_event) {
+				/*
+				 * Transfer the socket descriptor to the EventLoop which will close it
+				 * once all pending operations are finished.
+				 */
+				sslsock->s.poll_event->socket = sslsock->s.socket;
+				ZEND_ASYNC_EVENT_SET_CLOSE_FD(&sslsock->s.poll_event->base);
+				sslsock->s.socket = SOCK_ERR;
+				sslsock->s.poll_event->base.dispose(&sslsock->s.poll_event->base);
+				sslsock->s.poll_event = NULL;
+			} else {
+				closesocket(sslsock->s.socket);
+				sslsock->s.socket = SOCK_ERR;
+			}
 		}
+	}
+
+	/* Dispose proxies first — they hold references to poll_event.
+	 * Must happen after the close_handle block which may transfer fd to poll_event. */
+	if (sslsock->s.read_event) {
+		sslsock->s.read_event->base.dispose(&sslsock->s.read_event->base);
+		sslsock->s.read_event = NULL;
+	}
+
+	if (sslsock->s.write_event) {
+		sslsock->s.write_event->base.dispose(&sslsock->s.write_event->base);
+		sslsock->s.write_event = NULL;
+	}
+
+	/* Dispose poll_event if it was not transferred to the EventLoop above */
+	if (sslsock->s.poll_event) {
+		sslsock->s.poll_event->base.dispose(&sslsock->s.poll_event->base);
+		sslsock->s.poll_event = NULL;
 	}
 
 	if (sslsock->sni_certs) {
@@ -3237,16 +3273,29 @@ static inline int php_openssl_tcp_sockop_accept(php_stream *stream, php_openssl_
 		}
 	}
 
-	php_socket_t clisock = php_network_accept_incoming_ex(sock->s.socket,
-		xparam->want_textaddr ? &xparam->outputs.textaddr : NULL,
-		xparam->want_addr ? &xparam->outputs.addr : NULL,
-		xparam->want_addr ? &xparam->outputs.addrlen : NULL,
-		xparam->inputs.timeout,
-		xparam->want_errortext ? &xparam->outputs.error_text : NULL,
-		&xparam->outputs.error_code,
-		&sockvals);
+	php_socket_t clisock;
 
-	if (clisock != SOCK_ERR) {
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		clisock = network_async_accept_incoming(&sock->s,
+			xparam->want_textaddr ? &xparam->outputs.textaddr : NULL,
+			xparam->want_addr ? &xparam->outputs.addr : NULL,
+			xparam->want_addr ? &xparam->outputs.addrlen : NULL,
+			xparam->inputs.timeout,
+			xparam->want_errortext ? &xparam->outputs.error_text : NULL,
+			&xparam->outputs.error_code,
+			sockvals.tcp_nodelay);
+	} else {
+		clisock = php_network_accept_incoming_ex(sock->s.socket,
+			xparam->want_textaddr ? &xparam->outputs.textaddr : NULL,
+			xparam->want_addr ? &xparam->outputs.addr : NULL,
+			xparam->want_addr ? &xparam->outputs.addrlen : NULL,
+			xparam->inputs.timeout,
+			xparam->want_errortext ? &xparam->outputs.error_text : NULL,
+			&xparam->outputs.error_code,
+			&sockvals);
+	}
+
+	if (ZEND_VALID_SOCKET(clisock)) {
 		php_openssl_netstream_data_t *clisockdata = (php_openssl_netstream_data_t*) emalloc(sizeof(*clisockdata));
 
 		/* copy underlying tcp fields */
@@ -3254,6 +3303,10 @@ static inline int php_openssl_tcp_sockop_accept(php_stream *stream, php_openssl_
 		memcpy(clisockdata, sock, sizeof(clisockdata->s));
 
 		clisockdata->s.socket = clisock;
+		clisockdata->s.poll_event = NULL;
+		clisockdata->s.read_event = NULL;
+		clisockdata->s.write_event = NULL;
+		clisockdata->s.nonblocking_applied = false;
 #ifdef __linux__
 		/* O_NONBLOCK is not inherited on Linux */
 		clisockdata->s.is_blocked = true;
@@ -3381,15 +3434,11 @@ static int php_openssl_sockop_set_option(php_stream *stream, int option, int val
 					alive = 0;
 				} else if (
 					(
-						!sslsock->ssl_active &&
 						value == 0 &&
-						!(stream->flags & PHP_STREAM_FLAG_NO_IO) &&
-						((MSG_DONTWAIT != 0) || !sslsock->s.is_blocked)
+						!(stream->flags & PHP_STREAM_FLAG_NO_IO)
 					) ||
 					php_pollfd_for(sslsock->s.socket, PHP_POLLREADABLE|POLLPRI, &tv) > 0
 				) {
-					/* the poll() call was skipped if the socket is non-blocking (or MSG_DONTWAIT is available) and if the timeout is zero */
-					/* additionally, we don't use this optimization if SSL is active because in that case, we're not using MSG_DONTWAIT */
 					if (sslsock->ssl_active) {
 						int retry = 1;
 						struct timeval start_time;
@@ -3481,23 +3530,7 @@ static int php_openssl_sockop_set_option(php_stream *stream, int option, int val
 							php_openssl_set_blocking(sslsock, 1);
 						}
 					} else {
-#ifdef PHP_WIN32
-						int ret;
-#else
-						ssize_t ret;
-#endif
-
-						ret = recv(sslsock->s.socket, &buf, sizeof(buf), MSG_PEEK|MSG_DONTWAIT);
-						if (0 == ret) {
-							/* the counterpart did properly shutdown */
-							alive = 0;
-						} else if (0 > ret) {
-							int err = php_socket_errno();
-							if (err != EWOULDBLOCK && err != EMSGSIZE && err != EAGAIN) {
-								/* there was an unrecoverable error */
-								alive = 0;
-							}
-						}
+						alive = php_socket_check_liveness(sslsock->s.socket, sslsock->s.is_blocked, sslsock->s.nonblocking_applied);
 					}
 				}
 				return alive ? PHP_STREAM_OPTION_RETURN_OK : PHP_STREAM_OPTION_RETURN_ERR;

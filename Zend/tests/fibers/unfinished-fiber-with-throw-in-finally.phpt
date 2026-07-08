@@ -1,5 +1,9 @@
 --TEST--
 Test unfinished fiber with suspend in finally
+--SKIPIF--
+<?php
+if (!function_exists("Async\\spawn")) die("skip TrueAsync runtime required");
+?>
 --FILE--
 <?php
 
@@ -41,8 +45,8 @@ echo "done\n";
 ?>
 --EXPECT--
 fiber
+done
 inner finally
 finally exception
 outer finally
 Cannot suspend in a force-closed fiber
-done

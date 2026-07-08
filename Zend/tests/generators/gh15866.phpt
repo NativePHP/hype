@@ -1,5 +1,9 @@
 --TEST--
 GH-15866: Core dumped in Zend/zend_generators.c
+--SKIPIF--
+<?php
+if (!function_exists("Async\\spawn")) die("skip TrueAsync runtime required");
+?>
 --FILE--
 <?php
 
@@ -47,7 +51,7 @@ gc_collect_cycles();
 ==DONE==
 --EXPECT--
 Collect cycles
-Canary::__destruct
+==DONE==
 Generator finally
 Fiber finally
-==DONE==
+Canary::__destruct

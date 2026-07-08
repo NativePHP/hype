@@ -48,6 +48,8 @@
 # include "win32/nice.h"
 #endif
 
+#include "Zend/zend_async_API.h"
+
 static size_t cmd_max_len;
 
 /* {{{ PHP_MINIT_FUNCTION(exec) */
@@ -120,9 +122,32 @@ PHPAPI int php_exec(int type, const char *cmd, zval *array, zval *return_value)
 #endif
 
 #ifdef PHP_WIN32
-	fp = VCWD_POPEN(cmd, "rb");
+	if (ZEND_ASYNC_ON) {
+		char cur_cwd[MAXPATHLEN];
+		const char *cwd = VCWD_GETCWD(cur_cwd, MAXPATHLEN);
+		ZEND_ASYNC_SCHEDULER_INIT();
+		pclose_return = ZEND_ASYNC_EXEC(type, cmd, array, return_value, NULL, cwd, NULL, 0);
+		php_clear_stat_cache(0, NULL, 0);
+		return pclose_return;
+	} else {
+		fp = VCWD_POPEN(cmd, "rb");
+	}
 #else
-	fp = VCWD_POPEN(cmd, "r");
+	if (ZEND_ASYNC_ON) {
+		char cur_cwd[MAXPATHLEN];
+		const char *cwd = VCWD_GETCWD(cur_cwd, MAXPATHLEN);
+#if PHP_SIGCHILD
+		if (sig_handler) {
+			signal(SIGCHLD, sig_handler);
+		}
+#endif
+		ZEND_ASYNC_SCHEDULER_INIT();
+		pclose_return = ZEND_ASYNC_EXEC(type, cmd, array, return_value, NULL, cwd, NULL, 0);
+		php_clear_stat_cache(0, NULL, 0);
+		return pclose_return;
+	} else {
+		fp = VCWD_POPEN(cmd, "r");
+	}
 #endif
 	if (!fp) {
 		php_error_docref(NULL, E_WARNING, "Unable to fork [%s]", cmd);
@@ -508,6 +533,24 @@ PHP_FUNCTION(shell_exec)
 	if (!command_len) {
 		zend_argument_must_not_be_empty_error(1);
 		RETURN_THROWS();
+	}
+
+	if (ZEND_ASYNC_ON) {
+		char cur_cwd[MAXPATHLEN];
+		const char *cwd = VCWD_GETCWD(cur_cwd, MAXPATHLEN);
+		ZEND_ASYNC_SCHEDULER_INIT();
+		ZEND_ASYNC_EXEC(
+			ZEND_ASYNC_EXEC_MODE_SHELL_EXEC,
+			command,
+			return_value,
+			NULL,
+			NULL,
+			cwd,
+			NULL,
+			0
+		);
+		php_clear_stat_cache(0, NULL, 0);
+		return;
 	}
 
 #ifdef PHP_WIN32

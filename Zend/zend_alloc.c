@@ -378,6 +378,9 @@ static const uint32_t bin_pages[] = {
 	ZEND_MM_BINS_INFO(_BIN_DATA_PAGES, x, y)
 };
 
+/* Forward decl — implemented after alloc_globals is in scope. */
+static void zend_mm_mark_oom_bailout(void);
+
 static ZEND_COLD ZEND_NORETURN void zend_mm_panic(const char *message)
 {
 	fprintf(stderr, "%s\n", message);
@@ -414,6 +417,7 @@ static ZEND_COLD ZEND_NORETURN void zend_mm_safe_error(zend_mm_heap *heap,
 	} zend_catch {
 	}  zend_end_try();
 	heap->overflow = 0;
+	zend_mm_mark_oom_bailout();
 	zend_bailout();
 	exit(1);
 }
@@ -1438,6 +1442,34 @@ static zend_always_inline void zend_mm_free_small(zend_mm_heap *heap, void *ptr,
 /* Heap */
 /********/
 
+#ifdef ZEND_MM_TRACK_PHP_SOURCE
+# include "zend_compile.h"  /* ZEND_USER_CODE */
+
+/* Walk past internal frames so an emalloc from inside e.g. array_fill
+ * attributes to the calling user-script line, not the C extension. */
+static zend_always_inline void zend_mm_dbg_set_php_loc(zend_mm_debug_info *dbg)
+{
+	zend_execute_data *ed = EG(current_execute_data);
+
+	while (ed != NULL
+	       && (ed->func == NULL || !ZEND_USER_CODE(ed->func->common.type))) {
+		ed = ed->prev_execute_data;
+	}
+
+	if (ed != NULL && ed->func != NULL && ed->opline != NULL
+	    && ed->func->op_array.filename != NULL) {
+		dbg->php_filename = ZSTR_VAL(ed->func->op_array.filename);
+		dbg->php_lineno   = ed->opline->lineno;
+	} else {
+		dbg->php_filename = NULL;
+		dbg->php_lineno   = 0;
+	}
+}
+# define ZEND_MM_DBG_SET_PHP_LOC(dbg) zend_mm_dbg_set_php_loc(dbg)
+#else
+# define ZEND_MM_DBG_SET_PHP_LOC(dbg) ((void)0)
+#endif
+
 #if ZEND_DEBUG
 static zend_always_inline zend_mm_debug_info *zend_mm_get_debug_info(zend_mm_heap *heap, void *ptr)
 {
@@ -1490,6 +1522,7 @@ static zend_always_inline void *zend_mm_alloc_heap(zend_mm_heap *heap, size_t si
 		dbg->orig_filename = __zend_orig_filename;
 		dbg->lineno = __zend_lineno;
 		dbg->orig_lineno = __zend_orig_lineno;
+		ZEND_MM_DBG_SET_PHP_LOC(dbg);
 #endif
 		return ptr;
 	} else if (EXPECTED(size <= ZEND_MM_MAX_LARGE_SIZE)) {
@@ -1501,6 +1534,7 @@ static zend_always_inline void *zend_mm_alloc_heap(zend_mm_heap *heap, size_t si
 		dbg->orig_filename = __zend_orig_filename;
 		dbg->lineno = __zend_lineno;
 		dbg->orig_lineno = __zend_orig_lineno;
+		ZEND_MM_DBG_SET_PHP_LOC(dbg);
 #endif
 		return ptr;
 	} else {
@@ -1748,6 +1782,7 @@ static zend_always_inline void *zend_mm_realloc_heap(zend_mm_heap *heap, void *p
 				dbg->orig_filename = __zend_orig_filename;
 				dbg->lineno = __zend_lineno;
 				dbg->orig_lineno = __zend_orig_lineno;
+				ZEND_MM_DBG_SET_PHP_LOC(dbg);
 #endif
 				return ret;
 			}  while (0);
@@ -1765,6 +1800,7 @@ static zend_always_inline void *zend_mm_realloc_heap(zend_mm_heap *heap, void *p
 					dbg->orig_filename = __zend_orig_filename;
 					dbg->lineno = __zend_lineno;
 					dbg->orig_lineno = __zend_orig_lineno;
+					ZEND_MM_DBG_SET_PHP_LOC(dbg);
 #endif
 					return ptr;
 				} else if (new_size < old_size) {
@@ -1785,6 +1821,7 @@ static zend_always_inline void *zend_mm_realloc_heap(zend_mm_heap *heap, void *p
 					dbg->orig_filename = __zend_orig_filename;
 					dbg->lineno = __zend_lineno;
 					dbg->orig_lineno = __zend_orig_lineno;
+					ZEND_MM_DBG_SET_PHP_LOC(dbg);
 #endif
 					return ptr;
 				} else /* if (new_size > old_size) */ {
@@ -1812,6 +1849,7 @@ static zend_always_inline void *zend_mm_realloc_heap(zend_mm_heap *heap, void *p
 						dbg->orig_filename = __zend_orig_filename;
 						dbg->lineno = __zend_lineno;
 						dbg->orig_lineno = __zend_orig_lineno;
+						ZEND_MM_DBG_SET_PHP_LOC(dbg);
 #endif
 						return ptr;
 					}
@@ -2411,6 +2449,102 @@ static void zend_mm_check_leaks(zend_mm_heap *heap)
 		zend_message_dispatcher(ZMSG_MEMORY_LEAKS_GRAND_TOTAL, &total);
 	}
 }
+
+/* Mirror of zend_mm_check_leaks's page walk, but observational only —
+ * no dbg zeroing, no free_map clears, no chunk frees. */
+ZEND_API void zend_mm_for_each_live(zend_mm_heap *heap,
+                                    zend_mm_live_callback_t cb, void *user_data)
+{
+	if (heap == NULL || cb == NULL) {
+		return;
+	}
+
+	/* huge_list — single big allocations not owned by a chunk. */
+	for (const zend_mm_huge_list *list = heap->huge_list;
+	     list != NULL; list = list->next) {
+#ifdef ZEND_MM_TRACK_PHP_SOURCE
+		cb(user_data, list->ptr, list->dbg.size,
+		   list->dbg.filename, list->dbg.lineno,
+		   list->dbg.orig_filename, list->dbg.orig_lineno,
+		   list->dbg.php_filename, list->dbg.php_lineno);
+#else
+		cb(user_data, list->ptr, list->dbg.size,
+		   list->dbg.filename, list->dbg.lineno,
+		   list->dbg.orig_filename, list->dbg.orig_lineno,
+		   NULL, 0);
+#endif
+	}
+
+	/* per-chunk page map walk. */
+	zend_mm_chunk *p = heap->main_chunk;
+	if (p == NULL) {
+		return;
+	}
+
+	do {
+		uint32_t i = ZEND_MM_FIRST_PAGE;
+
+		while (i < p->free_tail) {
+			if (zend_mm_bitset_is_set(p->free_map, i)) {
+				if (p->map[i] & ZEND_MM_IS_SRUN) {
+					const int bin_num = ZEND_MM_SRUN_BIN_NUM(p->map[i]);
+					const zend_mm_debug_info *dbg =
+						(zend_mm_debug_info*)((char*)p + ZEND_MM_PAGE_SIZE * i
+						                     + bin_data_size[bin_num]
+						                     - ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info)));
+
+					uint32_t j = 0;
+					while (j < bin_elements[bin_num]) {
+						if (dbg->size != 0) {
+							const void *addr = (void*)((char*)p + ZEND_MM_PAGE_SIZE * i
+							                          + bin_data_size[bin_num] * j);
+#ifdef ZEND_MM_TRACK_PHP_SOURCE
+							cb(user_data, addr, dbg->size,
+							   dbg->filename, dbg->lineno,
+							   dbg->orig_filename, dbg->orig_lineno,
+							   dbg->php_filename, dbg->php_lineno);
+#else
+							cb(user_data, addr, dbg->size,
+							   dbg->filename, dbg->lineno,
+							   dbg->orig_filename, dbg->orig_lineno,
+							   NULL, 0);
+#endif
+						}
+						dbg = (zend_mm_debug_info*)((char*)dbg + bin_data_size[bin_num]);
+						j++;
+					}
+
+					i += bin_pages[bin_num];
+				} else /* ZEND_MM_IS_LRUN */ {
+					const int pages_count = ZEND_MM_LRUN_PAGES(p->map[i]);
+					const zend_mm_debug_info *dbg =
+						(zend_mm_debug_info*)((char*)p
+						                     + ZEND_MM_PAGE_SIZE * (i + pages_count)
+						                     - ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info)));
+					const void *addr = (void*)((char*)p + ZEND_MM_PAGE_SIZE * i);
+
+#ifdef ZEND_MM_TRACK_PHP_SOURCE
+					cb(user_data, addr, dbg->size,
+					   dbg->filename, dbg->lineno,
+					   dbg->orig_filename, dbg->orig_lineno,
+					   dbg->php_filename, dbg->php_lineno);
+#else
+					cb(user_data, addr, dbg->size,
+					   dbg->filename, dbg->lineno,
+					   dbg->orig_filename, dbg->orig_lineno,
+					   NULL, 0);
+#endif
+
+					i += pages_count;
+				}
+			} else {
+				i++;
+			}
+		}
+
+		p = p->next;
+	} while (p != heap->main_chunk);
+}
 #endif
 
 #if ZEND_MM_CUSTOM
@@ -2609,6 +2743,7 @@ ZEND_API size_t ZEND_FASTCALL _zend_mm_block_size(zend_mm_heap *heap, void *ptr 
 
 typedef struct _zend_alloc_globals {
 	zend_mm_heap *mm_heap;
+	bool is_oom;
 } zend_alloc_globals;
 
 #ifdef ZTS
@@ -2926,6 +3061,18 @@ ZEND_API bool zend_alloc_in_memory_limit_error_reporting(void)
 #else
 	return false;
 #endif
+}
+
+static void zend_mm_mark_oom_bailout(void)
+{
+	AG(is_oom) = true;
+}
+
+ZEND_API bool zend_alloc_pop_is_oom(void)
+{
+	bool is_oom = AG(is_oom);
+	AG(is_oom) = false;
+	return is_oom;
 }
 
 ZEND_API size_t zend_memory_usage(bool real_usage)

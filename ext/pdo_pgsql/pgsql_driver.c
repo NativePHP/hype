@@ -35,6 +35,230 @@
 
 static bool pgsql_handle_in_transaction(pdo_dbh_t *dbh);
 
+/* {{{ TrueAsync concurrent helpers */
+
+static bool pdo_pgsql_await_socket(PGconn *pgsql, async_poll_event events, zend_ulong timeout_ms)
+{
+	ZEND_ASSERT(pgsql != NULL);
+
+	zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+
+	if (coroutine == NULL) {
+		return false;
+	}
+
+	const php_socket_t socket = PQsocket(pgsql);
+
+	if (socket < 0) {
+		return false;
+	}
+
+	zend_async_poll_event_t *poll_event = ZEND_ASYNC_NEW_SOCKET_EVENT(socket, events);
+
+	if (poll_event == NULL || EG(exception) != NULL) {
+		return false;
+	}
+
+	zend_async_waker_new_with_timeout(coroutine, timeout_ms, NULL);
+
+	if (EG(exception) != NULL) {
+		ZEND_ASYNC_EVENT_RELEASE(&poll_event->base);
+		return false;
+	}
+
+	zend_async_resume_when(coroutine, &poll_event->base, true,
+		zend_async_waker_callback_resolve, NULL);
+
+	if (EG(exception) != NULL) {
+		zend_async_waker_clean(coroutine);
+		return false;
+	}
+
+	const bool suspend_result = ZEND_ASYNC_SUSPEND();
+
+	zend_async_waker_clean(coroutine);
+
+	return suspend_result && EG(exception) == NULL;
+}
+
+/* Check whether async path is available for this handle */
+#define PDO_PGSQL_ASYNC_AVAIL(H) \
+	(ZEND_ASYNC_CURRENT_COROUTINE != NULL && !(H)->is_sync)
+
+bool pdo_pgsql_flush(pdo_pgsql_db_handle *H)
+{
+	PGconn *pgsql = H->server;
+	int flush_result;
+
+	while ((flush_result = PQflush(pgsql)) > 0) {
+		if (!pdo_pgsql_await_socket(pgsql, ASYNC_WRITABLE, 0)) {
+			return false;
+		}
+	}
+
+	return flush_result >= 0;
+}
+
+PGresult *pdo_pgsql_get_result_concurrent(pdo_pgsql_db_handle *H)
+{
+	PGconn *pgsql = H->server;
+	ZEND_ASSERT(pgsql != NULL);
+
+	if (!PDO_PGSQL_ASYNC_AVAIL(H)) {
+		return PQgetResult(pgsql);
+	}
+
+	while (PQisBusy(pgsql)) {
+		if (!pdo_pgsql_await_socket(pgsql, ASYNC_READABLE, 0)) {
+			return NULL;
+		}
+		if (!PQconsumeInput(pgsql)) {
+			return NULL;
+		}
+	}
+
+	return PQgetResult(pgsql);
+}
+
+static PGresult *pdo_pgsql_collect_results(pdo_pgsql_db_handle *H)
+{
+	PGresult *last_result = NULL;
+	PGresult *result;
+
+	while ((result = pdo_pgsql_get_result_concurrent(H)) != NULL) {
+		if (last_result != NULL) {
+			PQclear(last_result);
+		}
+		last_result = result;
+
+		/* COPY IN/OUT results require the caller to handle the data transfer
+		 * before any further results become available. Continuing the loop
+		 * would deadlock: we'd wait for the server, while the server waits
+		 * for COPY data from us. */
+		ExecStatusType status = PQresultStatus(result);
+		if (status == PGRES_COPY_IN || status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH) {
+			break;
+		}
+	}
+
+	return last_result;
+}
+
+PGresult *pdo_pgsql_exec_concurrent(pdo_pgsql_db_handle *H, const char *query)
+{
+	PGconn *pgsql = H->server;
+	ZEND_ASSERT(pgsql != NULL);
+	ZEND_ASSERT(query != NULL);
+
+	if (!PDO_PGSQL_ASYNC_AVAIL(H)) {
+		return PQexec(pgsql, query);
+	}
+
+	if (!PQsendQuery(pgsql, query)) {
+		return NULL;
+	}
+
+	if (!pdo_pgsql_flush(H)) {
+		return NULL;
+	}
+
+	return pdo_pgsql_collect_results(H);
+}
+
+PGresult *pdo_pgsql_exec_params_concurrent(pdo_pgsql_db_handle *H, const char *query,
+		int nParams, const Oid *paramTypes, const char *const *paramValues,
+		const int *paramLengths, const int *paramFormats, int resultFormat)
+{
+	PGconn *pgsql = H->server;
+	ZEND_ASSERT(pgsql != NULL);
+	ZEND_ASSERT(query != NULL);
+
+	if (!PDO_PGSQL_ASYNC_AVAIL(H)) {
+		return PQexecParams(pgsql, query, nParams, paramTypes, paramValues,
+			paramLengths, paramFormats, resultFormat);
+	}
+
+	if (!PQsendQueryParams(pgsql, query, nParams, paramTypes, paramValues,
+			paramLengths, paramFormats, resultFormat)) {
+		return NULL;
+	}
+
+	if (!pdo_pgsql_flush(H)) {
+		return NULL;
+	}
+
+	return pdo_pgsql_collect_results(H);
+}
+
+PGresult *pdo_pgsql_prepare_concurrent(pdo_pgsql_db_handle *H, const char *stmtName,
+		const char *query, int nParams, const Oid *paramTypes)
+{
+	PGconn *pgsql = H->server;
+	ZEND_ASSERT(pgsql != NULL);
+
+	if (!PDO_PGSQL_ASYNC_AVAIL(H)) {
+		return PQprepare(pgsql, stmtName, query, nParams, paramTypes);
+	}
+
+	if (!PQsendPrepare(pgsql, stmtName, query, nParams, paramTypes)) {
+		return NULL;
+	}
+
+	if (!pdo_pgsql_flush(H)) {
+		return NULL;
+	}
+
+	return pdo_pgsql_collect_results(H);
+}
+
+PGresult *pdo_pgsql_exec_prepared_concurrent(pdo_pgsql_db_handle *H, const char *stmtName,
+		int nParams, const char *const *paramValues,
+		const int *paramLengths, const int *paramFormats, int resultFormat)
+{
+	PGconn *pgsql = H->server;
+	ZEND_ASSERT(pgsql != NULL);
+
+	if (!PDO_PGSQL_ASYNC_AVAIL(H)) {
+		return PQexecPrepared(pgsql, stmtName, nParams, paramValues,
+			paramLengths, paramFormats, resultFormat);
+	}
+
+	if (!PQsendQueryPrepared(pgsql, stmtName, nParams, paramValues,
+			paramLengths, paramFormats, resultFormat)) {
+		return NULL;
+	}
+
+	if (!pdo_pgsql_flush(H)) {
+		return NULL;
+	}
+
+	return pdo_pgsql_collect_results(H);
+}
+
+#ifdef HAVE_PQCLOSEPREPARED
+PGresult *pdo_pgsql_close_prepared_concurrent(pdo_pgsql_db_handle *H, const char *stmtName)
+{
+	PGconn *pgsql = H->server;
+	ZEND_ASSERT(pgsql != NULL);
+
+	if (!PDO_PGSQL_ASYNC_AVAIL(H)) {
+		return PQclosePrepared(pgsql, stmtName);
+	}
+
+	if (!PQsendClosePrepared(pgsql, stmtName)) {
+		return NULL;
+	}
+
+	if (!pdo_pgsql_flush(H)) {
+		return NULL;
+	}
+
+	return pdo_pgsql_collect_results(H);
+}
+#endif
+
+/* }}} */
+
 static char * _pdo_pgsql_trim_message(const char *message, int persistent)
 {
 	size_t i = strlen(message);
@@ -73,12 +297,52 @@ int _pdo_pgsql_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, int errcode, const char *
 {
 	pdo_pgsql_db_handle *H = (pdo_pgsql_db_handle *)dbh->driver_data;
 	pdo_error_type *pdo_err = stmt ? &stmt->error_code : &dbh->error_code;
-	pdo_pgsql_error_info *einfo = &H->einfo;
-	char *errmsg = PQerrorMessage(H->server);
+	pdo_pgsql_error_info *einfo;
+	char *errmsg;
+
+	/* Use statement's connection handle — dbh may be a pool template with NULL driver_data */
+	if (stmt) {
+		H = ((pdo_pgsql_stmt *)stmt->driver_data)->H;
+	}
+
+	einfo = &H->einfo;
+	errmsg = PQerrorMessage(H->server);
 
 	einfo->errcode = errcode;
 	einfo->file = file;
 	einfo->line = line;
+
+	/* Mark broken when the connection cannot be safely reused. */
+	{
+		PGTransactionStatusType txs = PQtransactionStatus(H->server);
+		bool broken = PQstatus(H->server) == CONNECTION_BAD
+			|| txs == PQTRANS_ACTIVE || txs == PQTRANS_UNKNOWN;
+
+		/* Also trust SQLSTATE: class 08 (connection exception),
+		 * 57P01/57P02/57P03 (admin shutdown / crash / cannot connect now),
+		 * class XX (internal error). PQstatus may still be OK at the moment
+		 * the error is reported, e.g. right after pg_terminate_backend. */
+		if (!broken && sqlstate != NULL) {
+			broken = strncmp(sqlstate, "08", 2) == 0
+				|| strncmp(sqlstate, "XX", 2) == 0
+				|| strcmp(sqlstate, "57P01") == 0
+				|| strcmp(sqlstate, "57P02") == 0
+				|| strcmp(sqlstate, "57P03") == 0;
+		}
+
+		/* sqlstate==NULL with PGRES_FATAL_ERROR means PQexec/PQexecParams
+		 * itself returned NULL — there is no PG result at all, so the
+		 * failure is at the libpq/connection layer (e.g. server gone) and
+		 * the connection cannot be reused. */
+		if (!broken && sqlstate == NULL && errcode == PGRES_FATAL_ERROR) {
+			broken = true;
+		}
+
+		if (broken) {
+			pdo_dbh_t *conn_dbh = (stmt && stmt->pooled_conn) ? stmt->pooled_conn : dbh;
+			conn_dbh->conn_broken = true;
+		}
+	}
 
 	if (einfo->errmsg) {
 		pefree(einfo->errmsg, dbh->is_persistent);
@@ -251,6 +515,12 @@ static void pgsql_handle_closer(pdo_dbh_t *dbh) /* {{{ */
 			pefree(H->lob_streams, dbh->is_persistent);
 			H->lob_streams = NULL;
 		}
+		if (H->stmt_cache) {
+			/* Connection is being closed — server-side state evaporates with it,
+			 * no DEALLOCATE needed. Just free our bookkeeping. */
+			pdo_pool_stmt_cache_destroy(H->stmt_cache);
+			H->stmt_cache = NULL;
+		}
 		pdo_pgsql_cleanup_notice_callback(H);
 		if (H->server) {
 			PQfinish(H->server);
@@ -332,6 +602,50 @@ static bool pgsql_handle_preparer(pdo_dbh_t *dbh, zend_string *sql, pdo_stmt_t *
 	}
 
 	if (!emulate && !execute_only) {
+		/* Try the per-conn prepared-statement cache first (opt-in via
+		 * PDO::ATTR_POOL_STMT_CACHE_SIZE). On hit reuse the existing
+		 * server-side prepared name and skip the deferred PQprepare.
+		 * Cursor stmts force emulate above so we never reach here for them. */
+		pdo_pool_stmt_cache_t *const cache = H->stmt_cache;
+		if (cache != NULL) {
+			pdo_pool_stmt_cache_entry_t *const entry = pdo_pool_stmt_cache_lookup(cache, S->query);
+			if (EXPECTED(entry != NULL)) {
+				S->stmt_name = estrdup(entry->server_stmt_name);
+				S->is_prepared = true;
+				S->from_cache = true;
+				return true;
+			}
+
+			/* Miss: allocate a fresh name and insert into cache. The deferred
+			 * PQprepare on first execute will materialize the server-side stmt. */
+			spprintf(&S->stmt_name, 0, "pdo_stmt_%08x", ++H->stmt_counter);
+
+			pdo_pool_stmt_cache_entry_t *evicted = NULL;
+			pdo_pool_stmt_cache_entry_t *const new_entry = pdo_pool_stmt_cache_insert(
+				cache, S->query, &evicted);
+			if (UNEXPECTED(evicted != NULL)) {
+				/* Best-effort DEALLOCATE on the evicted server-side stmt.
+				 * Failure is acceptable: worst case is a leaked plan until
+				 * the connection closes. */
+				PGresult *res;
+#ifndef HAVE_PQCLOSEPREPARED
+				char *q = NULL;
+				spprintf(&q, 0, "DEALLOCATE %s", evicted->server_stmt_name);
+				res = pdo_pgsql_exec_concurrent(H, q);
+				efree(q);
+#else
+				res = pdo_pgsql_close_prepared_concurrent(H, evicted->server_stmt_name);
+#endif
+				if (res) PQclear(res);
+				pdo_pool_stmt_cache_entry_free(evicted);
+			}
+			if (EXPECTED(new_entry != NULL)) {
+				new_entry->server_stmt_name = estrdup(S->stmt_name);
+				S->from_cache = true;
+			}
+			return true;
+		}
+
 		/* prepared query: set the query name and defer the
 		   actual prepare until the first execute call */
 		spprintf(&S->stmt_name, 0, "pdo_stmt_%08x", ++H->stmt_counter);
@@ -349,7 +663,7 @@ static zend_long pgsql_handle_doer(pdo_dbh_t *dbh, const zend_string *sql)
 
 	bool in_trans = pgsql_handle_in_transaction(dbh);
 
-	if (!(res = PQexec(H->server, ZSTR_VAL(sql)))) {
+	if (!(res = pdo_pgsql_exec_concurrent(H, ZSTR_VAL(sql)))) {
 		/* fatal error */
 		pdo_pgsql_error(dbh, PGRES_FATAL_ERROR, NULL);
 		return -1;
@@ -425,12 +739,12 @@ static zend_string *pdo_pgsql_last_insert_id(pdo_dbh_t *dbh, const zend_string *
 	ExecStatusType status;
 
 	if (name == NULL) {
-		res = PQexec(H->server, "SELECT LASTVAL()");
+		res = pdo_pgsql_exec_concurrent(H, "SELECT LASTVAL()");
 	} else {
 		const char *q[1];
 		q[0] = ZSTR_VAL(name);
 
-		res = PQexecParams(H->server, "SELECT CURRVAL($1)", 1, NULL, q, NULL, NULL, 0);
+		res = pdo_pgsql_exec_params_concurrent(H, "SELECT CURRVAL($1)", 1, NULL, q, NULL, NULL, 0);
 	}
 	status = PQresultStatus(res);
 
@@ -568,6 +882,27 @@ static zend_result pdo_pgsql_check_liveness(pdo_dbh_t *dbh)
 	}
 	return (PQstatus(H->server) == CONNECTION_OK) ? SUCCESS : FAILURE;
 }
+
+/* Non-blocking liveness probe used right before handing the conn to a
+ * coroutine. While the conn was idle the server may have closed it
+ * (e.g. pg_terminate_backend, idle-in-transaction timeout). PQconsumeInput
+ * drains any pending bytes and updates PQstatus to CONNECTION_BAD on EOF.
+ * Unlike check_liveness, we do NOT call PQreset — a broken slot must be
+ * destroyed so the pool can recreate it cleanly. */
+static bool pdo_pgsql_pool_before_acquire(pdo_dbh_t *dbh)
+{
+	pdo_pgsql_db_handle *H = (pdo_pgsql_db_handle *)dbh->driver_data;
+	if (UNEXPECTED(H == NULL || H->server == NULL)) {
+		return false;
+	}
+	if (UNEXPECTED(dbh->conn_broken)) {
+		return false;
+	}
+	if (!PQconsumeInput(H->server)) {
+		return false;
+	}
+	return PQstatus(H->server) == CONNECTION_OK;
+}
 /* }}} */
 
 static bool pgsql_handle_in_transaction(pdo_dbh_t *dbh)
@@ -583,7 +918,7 @@ static bool pdo_pgsql_transaction_cmd(const char *cmd, pdo_dbh_t *dbh)
 	PGresult *res;
 	bool ret = true;
 
-	res = PQexec(H->server, cmd);
+	res = pdo_pgsql_exec_concurrent(H, cmd);
 
 	if (PQresultStatus(res) != PGRES_COMMAND_OK) {
 		pdo_pgsql_error(dbh, PQresultStatus(res), pdo_pgsql_sqlstate(res));
@@ -690,10 +1025,10 @@ void pgsqlCopyFromArray_internal(INTERNAL_FUNCTION_PARAMETERS)
 	/* Obtain db Handle */
 	H = (pdo_pgsql_db_handle *)dbh->driver_data;
 
-	while ((pgsql_result = PQgetResult(H->server))) {
+	while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 		PQclear(pgsql_result);
 	}
-	pgsql_result = PQexec(H->server, query);
+	pgsql_result = pdo_pgsql_exec_concurrent(H, query);
 
 	efree(query);
 	query = NULL;
@@ -756,7 +1091,7 @@ void pgsqlCopyFromArray_internal(INTERNAL_FUNCTION_PARAMETERS)
 			RETURN_FALSE;
 		}
 
-		while ((pgsql_result = PQgetResult(H->server))) {
+		while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 			if (PGRES_COMMAND_OK != PQresultStatus(pgsql_result)) {
 				pdo_pgsql_error(dbh, PGRES_FATAL_ERROR, pdo_pgsql_sqlstate(pgsql_result));
 				command_failed = 1;
@@ -820,10 +1155,10 @@ void pgsqlCopyFromFile_internal(INTERNAL_FUNCTION_PARAMETERS)
 
 	H = (pdo_pgsql_db_handle *)dbh->driver_data;
 
-	while ((pgsql_result = PQgetResult(H->server))) {
+	while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 		PQclear(pgsql_result);
 	}
-	pgsql_result = PQexec(H->server, query);
+	pgsql_result = pdo_pgsql_exec_concurrent(H, query);
 
 	efree(query);
 
@@ -857,7 +1192,7 @@ void pgsqlCopyFromFile_internal(INTERNAL_FUNCTION_PARAMETERS)
 			RETURN_FALSE;
 		}
 
-		while ((pgsql_result = PQgetResult(H->server))) {
+		while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 			if (PGRES_COMMAND_OK != PQresultStatus(pgsql_result)) {
 				pdo_pgsql_error(dbh, PGRES_FATAL_ERROR, pdo_pgsql_sqlstate(pgsql_result));
 				command_failed = 1;
@@ -916,7 +1251,7 @@ void pgsqlCopyToFile_internal(INTERNAL_FUNCTION_PARAMETERS)
 		RETURN_FALSE;
 	}
 
-	while ((pgsql_result = PQgetResult(H->server))) {
+	while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 		PQclear(pgsql_result);
 	}
 
@@ -926,7 +1261,7 @@ void pgsqlCopyToFile_internal(INTERNAL_FUNCTION_PARAMETERS)
 	} else {
 		spprintf(&query, 0, "COPY %s TO STDIN WITH DELIMITER E'%c' NULL AS E'%s'", table_name, (pg_delim_len ? *pg_delim : '\t'), (pg_null_as_len ? pg_null_as : "\\\\N"));
 	}
-	pgsql_result = PQexec(H->server, query);
+	pgsql_result = pdo_pgsql_exec_concurrent(H, query);
 	efree(query);
 
 	if (pgsql_result) {
@@ -962,7 +1297,7 @@ void pgsqlCopyToFile_internal(INTERNAL_FUNCTION_PARAMETERS)
 		}
 		php_stream_close(stream);
 
-		while ((pgsql_result = PQgetResult(H->server))) {
+		while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 			PQclear(pgsql_result);
 		}
 		RETURN_TRUE;
@@ -1007,7 +1342,7 @@ void pgsqlCopyToArray_internal(INTERNAL_FUNCTION_PARAMETERS)
 
 	H = (pdo_pgsql_db_handle *)dbh->driver_data;
 
-	while ((pgsql_result = PQgetResult(H->server))) {
+	while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 		PQclear(pgsql_result);
 	}
 
@@ -1017,7 +1352,7 @@ void pgsqlCopyToArray_internal(INTERNAL_FUNCTION_PARAMETERS)
 	} else {
 		spprintf(&query, 0, "COPY %s TO STDIN WITH DELIMITER E'%c' NULL AS E'%s'", table_name, (pg_delim_len ? *pg_delim : '\t'), (pg_null_as_len ? pg_null_as : "\\\\N"));
 	}
-	pgsql_result = PQexec(H->server, query);
+	pgsql_result = pdo_pgsql_exec_concurrent(H, query);
 	efree(query);
 
 	if (pgsql_result) {
@@ -1045,7 +1380,7 @@ void pgsqlCopyToArray_internal(INTERNAL_FUNCTION_PARAMETERS)
 			}
 		}
 
-		while ((pgsql_result = PQgetResult(H->server))) {
+		while ((pgsql_result = pdo_pgsql_get_result_concurrent(H))) {
 			PQclear(pgsql_result);
 		}
 	} else {
@@ -1400,7 +1735,9 @@ static const struct pdo_dbh_methods pgsql_methods = {
 	pdo_pgsql_request_shutdown,
 	pgsql_handle_in_transaction,
 	NULL, /* get_gc */
-	pdo_pgsql_scanner
+	pdo_pgsql_scanner,
+	pdo_pgsql_pool_before_acquire,
+	NULL, /* pool_before_release */
 };
 
 static int pdo_pgsql_handle_factory(pdo_dbh_t *dbh, zval *driver_options) /* {{{ */
@@ -1474,7 +1811,17 @@ static int pdo_pgsql_handle_factory(pdo_dbh_t *dbh, zval *driver_options) /* {{{
 	PQsetNoticeProcessor(H->server, _pdo_pgsql_notice, (void *)dbh);
 
 	H->attached = 1;
+	H->is_sync = dbh->is_persistent ? 1 : 0;
 	H->pgoid = -1;
+
+	/* Pool slot connections: pick up cache capacity from the template dbh
+	 * (pool->user_data). Non-pool dbhs always have stmt_cache == NULL. */
+	if (dbh->pool != NULL) {
+		const pdo_dbh_t *template_dbh = (const pdo_dbh_t *)dbh->pool->user_data;
+		if (template_dbh && template_dbh->pool_stmt_cache_size > 0) {
+			H->stmt_cache = pdo_pool_stmt_cache_create(template_dbh->pool_stmt_cache_size);
+		}
+	}
 
 	dbh->methods = &pgsql_methods;
 	dbh->alloc_own_columns = 1;
@@ -1492,7 +1839,18 @@ cleanup:
 }
 /* }}} */
 
+static void pdo_pgsql_init_methods(pdo_dbh_t *dbh, bool *supports_pool)
+{
+	dbh->methods = &pgsql_methods;
+	dbh->alloc_own_columns = 1;
+	dbh->max_escaped_char_length = 2;
+	if (supports_pool) {
+		*supports_pool = true;
+	}
+}
+
 const pdo_driver_t pdo_pgsql_driver = {
 	PDO_DRIVER_HEADER(pgsql),
-	pdo_pgsql_handle_factory
+	pdo_pgsql_handle_factory,
+	pdo_pgsql_init_methods
 };

@@ -24,7 +24,7 @@ if (PHP_CURL != "no") {
 		)) {
 			WARNING("zstd in curl not enabled; library not found");
 		}
-		EXTENSION("curl", "interface.c multi.c share.c curl_file.c");
+		EXTENSION("curl", "interface.c multi.c share.c curl_file.c curl_async.c");
 		AC_DEFINE('HAVE_CURL', 1, "Define to 1 if the PHP extension 'curl' is available.");
 		ADD_FLAG("CFLAGS_CURL", "/D PHP_CURL_EXPORTS=1");
 		if (curl_location.match(/libcurl_a\.lib$/)) {

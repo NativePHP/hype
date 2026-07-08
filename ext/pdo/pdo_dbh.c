@@ -32,6 +32,7 @@
 #include "pdo_dbh_arginfo.h"
 #include "zend_observer.h"
 #include "zend_extensions.h"
+#include "pdo_pool.h"
 
 static bool pdo_dbh_attribute_set(pdo_dbh_t *dbh, zend_long attr, zval *value, uint32_t value_arg_num);
 
@@ -70,7 +71,7 @@ PDO_API bool php_pdo_stmt_valid_db_obj_handle(const pdo_stmt_t *stmt)
 
 void pdo_raise_impl_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, pdo_error_type sqlstate, const char *supp) /* {{{ */
 {
-	pdo_error_type *pdo_err = &dbh->error_code;
+	pdo_error_type *pdo_err = pdo_dbh_error_code(dbh);
 	const char *msg;
 
 	if (dbh->error_mode == PDO_ERRMODE_SILENT) {
@@ -128,7 +129,7 @@ void pdo_raise_impl_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, pdo_error_type sqlst
 
 PDO_API void pdo_handle_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt) /* {{{ */
 {
-	pdo_error_type *pdo_err = &dbh->error_code;
+	pdo_error_type *pdo_err = pdo_dbh_error_code(dbh);
 	const char *msg = "<<Unknown>>";
 	char *supp = NULL;
 	zend_long native_code = 0;
@@ -156,7 +157,20 @@ PDO_API void pdo_handle_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt) /* {{{ */
 
 		add_next_index_string(&info, *pdo_err);
 
-		dbh->methods->fetch_err(dbh, stmt, &info);
+		/* Route fetch_err through the connection that produced the error */
+		pdo_dbh_t *err_dbh = dbh;
+		if (stmt && stmt->pooled_conn) {
+			err_dbh = stmt->pooled_conn;
+		} else if (dbh->pool) {
+			pdo_dbh_t *slot_conn = pdo_pool_peek_conn(dbh);
+			if (slot_conn) {
+				err_dbh = slot_conn;
+			}
+		}
+		/* Skip fetch_err if err_dbh is the template (driver_data is NULL in pool mode) */
+		if (err_dbh->driver_data && err_dbh->methods && err_dbh->methods->fetch_err) {
+			err_dbh->methods->fetch_err(err_dbh, stmt, &info);
+		}
 
 		if ((item = zend_hash_index_find(Z_ARRVAL(info), 1)) != NULL
 				&& Z_TYPE_P(item) == IS_LONG) {
@@ -408,6 +422,15 @@ PDO_API void php_pdo_internal_construct_driver(INTERNAL_FUNCTION_PARAMETERS, zen
 			}
 		}
 
+		if (is_persistent && options && pdo_attr_lval(options, PDO_ATTR_POOL_ENABLED, 0)) {
+			if (hash_key) {
+				zend_string_release_ex(hash_key, false);
+			}
+			zend_throw_exception_ex(php_pdo_get_exception(), 0,
+				"PDO::ATTR_POOL_ENABLED cannot be used with PDO::ATTR_PERSISTENT");
+			RETURN_THROWS();
+		}
+
 		if (is_persistent) {
 			/* let's see if we have one cached.... */
 			if ((le = zend_hash_find_ptr(&EG(persistent_list), hash_key)) != NULL) {
@@ -484,6 +507,34 @@ PDO_API void php_pdo_internal_construct_driver(INTERNAL_FUNCTION_PARAMETERS, zen
 		goto options;
 	}
 
+	/* Pool mode: skip creating a real connection for the template.
+	 * driver_data stays NULL — connections come from the pool on demand. */
+	if (!is_persistent && options
+		&& pdo_attr_lval(options, PDO_ATTR_POOL_ENABLED, 0)
+		&& driver->db_handle_init_methods) {
+		bool supports_pool = false;
+		driver->db_handle_init_methods(dbh, &supports_pool);
+		if (UNEXPECTED(EG(exception))) {
+			/* Driver rejected the DSN/options for pool mode with its own message. */
+			dbh->methods = NULL;
+			zend_restore_error_handling(&zeh);
+			return;
+		}
+		if (!supports_pool) {
+			dbh->methods = NULL;
+			zend_throw_exception_ex(php_pdo_get_exception(), 0,
+				"Driver \"%s\" does not support PDO::ATTR_POOL_ENABLED",
+				driver->driver_name);
+			zend_restore_error_handling(&zeh);
+			return;
+		}
+		dbh->driver = driver;
+		/* Create pool before attribute processing so driver-specific
+		 * attributes can be dispatched through pooled connections */
+		pdo_pool_create(dbh, options);
+		goto options;
+	}
+
 	if (driver->db_handle_factory(dbh, options)) {
 		/* all set */
 
@@ -510,9 +561,20 @@ options:
 				}
 				ZVAL_DEREF(attr_value);
 
+				/* Skip pool attributes - handled separately */
+				if (long_key >= PDO_ATTR_POOL_ENABLED && long_key <= PDO_ATTR_POOL_HEALTHCHECK_INTERVAL) {
+					continue;
+				}
+
 				/* TODO: Should the constructor fail when the attribute cannot be set? */
 				pdo_dbh_attribute_set(dbh, long_key, attr_value, 3);
 			} ZEND_HASH_FOREACH_END();
+
+			/* Initialize connection pool if enabled (and not persistent).
+			 * Pool may already be created in the pool-mode constructor path. */
+			if (!is_persistent && !dbh->pool) {
+				pdo_pool_create(dbh, options);
+			}
 		}
 
 		zend_restore_error_handling(&zeh);
@@ -586,7 +648,9 @@ PHP_METHOD(PDO, prepare)
 {
 	pdo_stmt_t *stmt;
 	zend_string *statement;
-	zval *options = NULL, *value, *item, ctor_args;
+	zval *options = NULL, *value, *item;
+	zval ctor_args;
+	ZVAL_UNDEF(&ctor_args);
 	zend_class_entry *dbstmt_ce, *pce;
 	pdo_dbh_object_t *dbh_obj = Z_PDO_OBJECT_P(ZEND_THIS);
 	pdo_dbh_t *dbh = dbh_obj->inner;
@@ -645,7 +709,16 @@ PHP_METHOD(PDO, prepare)
 		ZVAL_COPY_VALUE(&ctor_args, &dbh->def_stmt_ctor_args);
 	}
 
+	HashTable *ctor_args_ht = Z_TYPE(ctor_args) == IS_ARRAY ? Z_ARRVAL(ctor_args) : NULL;
+
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
 	if (!pdo_stmt_instantiate(dbh, return_value, dbstmt_ce, &ctor_args)) {
+		pdo_pool_maybe_release(dbh);
 		RETURN_THROWS();
 	}
 	stmt = Z_PDO_STMT_P(return_value);
@@ -658,15 +731,19 @@ PHP_METHOD(PDO, prepare)
 	GC_ADDREF(&dbh_obj->std);
 	stmt->database_object_handle = &dbh_obj->std;
 
-	if (dbh->methods->preparer(dbh, statement, stmt, options)) {
-		if (Z_TYPE(ctor_args) == IS_ARRAY) {
-			pdo_stmt_construct(stmt, return_value, dbstmt_ce, Z_ARRVAL(ctor_args));
-		} else {
-			pdo_stmt_construct(stmt, return_value, dbstmt_ce, /* ctor_args */ NULL);
-		}
+	/* Track pooled connection on statement */
+	if (dbh->pool) {
+		stmt->pooled_conn = conn;
+		conn->pool_slot_refcount++;
+	}
+
+	if (conn->methods->preparer(conn, statement, stmt, options)) {
+		pdo_pool_sync_error(dbh, conn);
+		pdo_stmt_construct(stmt, return_value, dbstmt_ce, ctor_args_ht);
 		return;
 	}
 
+	pdo_pool_sync_error(dbh, conn);
 	PDO_HANDLE_DBH_ERR();
 
 	/* kill the object handle for the stmt here */
@@ -678,10 +755,15 @@ PHP_METHOD(PDO, prepare)
 
 
 static bool pdo_is_in_transaction(pdo_dbh_t *dbh) {
-	if (dbh->methods->in_transaction) {
-		return dbh->methods->in_transaction(dbh);
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		return false;
 	}
-	return dbh->in_txn;
+
+	if (conn->methods->in_transaction) {
+		return conn->methods->in_transaction(conn);
+	}
+	return conn->in_txn;
 }
 
 /* {{{ Initiates a transaction */
@@ -704,11 +786,19 @@ PHP_METHOD(PDO, beginTransaction)
 		RETURN_THROWS();
 	}
 
-	if (dbh->methods->begin(dbh)) {
-		dbh->in_txn = true;
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
+	if (conn->methods->begin(conn)) {
+		conn->in_txn = true;
+		pdo_pool_sync_error(dbh, conn);
 		RETURN_TRUE;
 	}
 
+	pdo_pool_sync_error(dbh, conn);
 	PDO_HANDLE_DBH_ERR();
 	RETURN_FALSE;
 }
@@ -728,11 +818,20 @@ PHP_METHOD(PDO, commit)
 		RETURN_THROWS();
 	}
 
-	if (dbh->methods->commit(dbh)) {
-		dbh->in_txn = false;
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
+	if (conn->methods->commit(conn)) {
+		conn->in_txn = false;
+		pdo_pool_sync_error(dbh, conn);
+		pdo_pool_maybe_release(dbh);
 		RETURN_TRUE;
 	}
 
+	pdo_pool_sync_error(dbh, conn);
 	PDO_HANDLE_DBH_ERR();
 	RETURN_FALSE;
 }
@@ -752,11 +851,20 @@ PHP_METHOD(PDO, rollBack)
 		RETURN_THROWS();
 	}
 
-	if (dbh->methods->rollback(dbh)) {
-		dbh->in_txn = false;
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
+	if (conn->methods->rollback(conn)) {
+		conn->in_txn = false;
+		pdo_pool_sync_error(dbh, conn);
+		pdo_pool_maybe_release(dbh);
 		RETURN_TRUE;
 	}
 
+	pdo_pool_sync_error(dbh, conn);
 	PDO_HANDLE_DBH_ERR();
 	RETURN_FALSE;
 }
@@ -772,6 +880,25 @@ PHP_METHOD(PDO, inTransaction)
 	PDO_CONSTRUCT_CHECK;
 
 	RETURN_BOOL(pdo_is_in_transaction(dbh));
+}
+/* }}} */
+
+/* {{{ Get connection pool (requires async extension) */
+PHP_METHOD(PDO, getPool)
+{
+	pdo_dbh_t *dbh = Z_PDO_DBH_P(ZEND_THIS);
+
+	ZEND_PARSE_PARAMETERS_NONE();
+
+	PDO_CONSTRUCT_CHECK;
+
+	zend_object *pool_obj = pdo_pool_get_wrapper(dbh);
+	if (pool_obj == NULL) {
+		RETURN_NULL();
+	}
+
+	GC_ADDREF(pool_obj);
+	RETURN_OBJ(pool_obj);
 }
 /* }}} */
 
@@ -887,7 +1014,11 @@ static bool pdo_dbh_attribute_set(pdo_dbh_t *dbh, zend_long attr, zval *value, u
 			}
 			dbh->stringify = bval;
 			if (dbh->methods->set_attribute) {
-				dbh->methods->set_attribute(dbh, attr, value);
+				pdo_dbh_t *s_conn = pdo_pool_acquire_conn(dbh);
+				if (s_conn && s_conn->driver_data) {
+					s_conn->methods->set_attribute(s_conn, attr, value);
+					pdo_pool_maybe_release(dbh);
+				}
 			}
 			return true;
 
@@ -949,9 +1080,20 @@ static bool pdo_dbh_attribute_set(pdo_dbh_t *dbh, zend_long attr, zval *value, u
 		goto fail;
 	}
 
-	PDO_DBH_CLEAR_ERR();
-	if (dbh->methods->set_attribute(dbh, attr, value)) {
-		return true;
+	{
+		pdo_dbh_t *attr_conn = pdo_pool_acquire_conn(dbh);
+		if (UNEXPECTED(attr_conn == NULL || attr_conn->driver_data == NULL)) {
+			goto fail;
+		}
+
+		PDO_DBH_CLEAR_ERR();
+		if (attr_conn->methods->set_attribute(attr_conn, attr, value)) {
+			pdo_pool_sync_error(dbh, attr_conn);
+			pdo_pool_maybe_release(dbh);
+			return true;
+		}
+		pdo_pool_sync_error(dbh, attr_conn);
+		pdo_pool_maybe_release(dbh);
 	}
 
 fail:
@@ -1028,6 +1170,25 @@ PHP_METHOD(PDO, getAttribute)
 		case PDO_ATTR_STRINGIFY_FETCHES:
 			RETURN_BOOL(dbh->stringify);
 
+		case PDO_ATTR_POOL_ENABLED:
+			RETURN_BOOL(dbh->pool != NULL);
+
+		case PDO_ATTR_POOL_MIN:
+			if (dbh->pool) {
+				RETURN_LONG(dbh->pool->min_size);
+			}
+			RETURN_FALSE;
+
+		case PDO_ATTR_POOL_MAX:
+			if (dbh->pool) {
+				RETURN_LONG(dbh->pool->max_size);
+			}
+			RETURN_FALSE;
+
+		case PDO_ATTR_POOL_HEALTHCHECK_INTERVAL:
+			pdo_raise_impl_error(dbh, NULL, "IM001", "PDO::ATTR_POOL_HEALTHCHECK_INTERVAL is a construction-only attribute and cannot be read at runtime");
+			RETURN_FALSE;
+
 		default:
 			break;
 	}
@@ -1037,19 +1198,31 @@ PHP_METHOD(PDO, getAttribute)
 		RETURN_FALSE;
 	}
 
-	switch (dbh->methods->get_attribute(dbh, attr, return_value)) {
-		case -1:
-			PDO_HANDLE_DBH_ERR();
+	{
+		pdo_dbh_t *attr_conn = pdo_pool_acquire_conn(dbh);
+		if (UNEXPECTED(attr_conn == NULL || attr_conn->driver_data == NULL)) {
+			pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
 			RETURN_FALSE;
+		}
 
-		case 0:
-			pdo_raise_impl_error(dbh, NULL, "IM001", "driver does not support that attribute");
-			RETURN_FALSE;
+		switch (attr_conn->methods->get_attribute(attr_conn, attr, return_value)) {
+			case -1:
+				pdo_pool_sync_error(dbh, attr_conn);
+				pdo_pool_maybe_release(dbh);
+				PDO_HANDLE_DBH_ERR();
+				RETURN_FALSE;
 
-		default:
-			/* No error state, just return as the return_value has been assigned
-			 * by the get_attribute handler */
-			return;
+			case 0:
+				pdo_pool_maybe_release(dbh);
+				pdo_raise_impl_error(dbh, NULL, "IM001", "driver does not support that attribute");
+				RETURN_FALSE;
+
+			default:
+				pdo_pool_maybe_release(dbh);
+				/* No error state, just return as the return_value has been assigned
+				 * by the get_attribute handler */
+				return;
+		}
 	}
 }
 /* }}} */
@@ -1072,7 +1245,17 @@ PHP_METHOD(PDO, exec)
 
 	PDO_DBH_CLEAR_ERR();
 	PDO_CONSTRUCT_CHECK;
-	ret = dbh->methods->doer(dbh, statement);
+
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
+	ret = conn->methods->doer(conn, statement);
+	pdo_pool_sync_error(dbh, conn);
+	pdo_pool_maybe_release(dbh);
+
 	if (ret == -1) {
 		PDO_HANDLE_DBH_ERR();
 		RETURN_FALSE;
@@ -1102,7 +1285,16 @@ PHP_METHOD(PDO, lastInsertId)
 		pdo_raise_impl_error(dbh, NULL, "IM001", "driver does not support lastInsertId()");
 		RETURN_FALSE;
 	}
-	last_id = dbh->methods->last_id(dbh, name);
+
+	pdo_dbh_t *conn = pdo_pool_peek_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		/* Pool mode: connection already released, lastInsertId unavailable */
+		RETURN_FALSE;
+	}
+
+	last_id = conn->methods->last_id(conn, name);
+	pdo_pool_sync_error(dbh, conn);
+
 	if (!last_id) {
 		PDO_HANDLE_DBH_ERR();
 		RETURN_FALSE;
@@ -1120,19 +1312,17 @@ PHP_METHOD(PDO, errorCode)
 
 	PDO_CONSTRUCT_CHECK;
 
-	if (dbh->query_stmt) {
-		RETURN_STRING(dbh->query_stmt->error_code);
+	pdo_stmt_t *failed_stmt = pdo_dbh_get_last_failed_query_stmt(dbh);
+	if (failed_stmt) {
+		RETURN_STRING(failed_stmt->error_code);
 	}
 
-	if (dbh->error_code[0] == '\0') {
+	pdo_error_type *err = pdo_dbh_error_code(dbh);
+	if ((*err)[0] == '\0') {
 		RETURN_NULL();
 	}
 
-	/**
-	 * Making sure that we fallback to the default implementation
-	 * if the dbh->error_code is not null.
-	 */
-	RETURN_STRING(dbh->error_code);
+	RETURN_STRING(*err);
 }
 /* }}} */
 
@@ -1151,16 +1341,22 @@ PHP_METHOD(PDO, errorInfo)
 
 	array_init(return_value);
 
-	if (dbh->query_stmt) {
-		add_next_index_string(return_value, dbh->query_stmt->error_code);
-		if(!strncmp(dbh->query_stmt->error_code, PDO_ERR_NONE, sizeof(PDO_ERR_NONE))) goto fill_array;
+	pdo_stmt_t *failed_stmt = pdo_dbh_get_last_failed_query_stmt(dbh);
+	if (failed_stmt) {
+		add_next_index_string(return_value, failed_stmt->error_code);
+		if(!strncmp(failed_stmt->error_code, PDO_ERR_NONE, sizeof(PDO_ERR_NONE))) goto fill_array;
 	} else {
-		add_next_index_string(return_value, dbh->error_code);
-		if(!strncmp(dbh->error_code, PDO_ERR_NONE, sizeof(PDO_ERR_NONE))) goto fill_array;
+		pdo_error_type *err = pdo_dbh_error_code(dbh);
+		add_next_index_string(return_value, *err);
+		if(!strncmp(*err, PDO_ERR_NONE, sizeof(PDO_ERR_NONE))) goto fill_array;
 	}
 
 	if (dbh->methods->fetch_err) {
-		dbh->methods->fetch_err(dbh, dbh->query_stmt, return_value);
+		/* Route fetch_err through existing slot connection (peek, never acquire) */
+		pdo_dbh_t *err_conn = pdo_pool_peek_conn(dbh);
+		if (err_conn && err_conn->methods && err_conn->methods->fetch_err) {
+			err_conn->methods->fetch_err(err_conn, failed_stmt, return_value);
+		}
 	}
 
 fill_array:
@@ -1208,7 +1404,14 @@ PHP_METHOD(PDO, query)
 
 	PDO_DBH_CLEAR_ERR();
 
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
 	if (!pdo_stmt_instantiate(dbh, return_value, dbh->def_stmt_ce, &dbh->def_stmt_ctor_args)) {
+		pdo_pool_maybe_release(dbh);
 		RETURN_THROWS();
 	}
 	stmt = Z_PDO_STMT_P(return_value);
@@ -1222,7 +1425,13 @@ PHP_METHOD(PDO, query)
 	GC_ADDREF(&dbh_obj->std);
 	stmt->database_object_handle = &dbh_obj->std;
 
-	if (dbh->methods->preparer(dbh, statement, stmt, NULL)) {
+	/* Track pooled connection on statement */
+	if (dbh->pool) {
+		stmt->pooled_conn = conn;
+		conn->pool_slot_refcount++;
+	}
+
+	if (conn->methods->preparer(conn, statement, stmt, NULL)) {
 		PDO_STMT_CLEAR_ERR();
 		if (fetch_mode_is_null || pdo_stmt_setup_fetch_mode(stmt, fetch_mode, 2, args, num_args)) {
 			/* now execute the statement */
@@ -1236,6 +1445,7 @@ PHP_METHOD(PDO, query)
 					stmt->executed = 1;
 				}
 				if (ret) {
+					pdo_pool_sync_error(dbh, conn);
 					if (Z_TYPE(dbh->def_stmt_ctor_args) == IS_ARRAY) {
 						pdo_stmt_construct(stmt, return_value, dbh->def_stmt_ce, Z_ARRVAL(dbh->def_stmt_ctor_args));
 					} else {
@@ -1246,12 +1456,13 @@ PHP_METHOD(PDO, query)
 			}
 		}
 		/* something broke */
-		dbh->query_stmt = stmt;
-		dbh->query_stmt_obj = Z_OBJ_P(return_value);
+		pdo_dbh_set_last_failed_query_stmt(dbh, stmt, Z_OBJ_P(return_value));
 		GC_DELREF(stmt->database_object_handle);
 		stmt->database_object_handle = NULL;
+		pdo_pool_sync_error(dbh, conn);
 		PDO_HANDLE_STMT_ERR();
 	} else {
+		pdo_pool_sync_error(dbh, conn);
 		PDO_HANDLE_DBH_ERR();
 		zval_ptr_dtor(return_value);
 	}
@@ -1282,7 +1493,16 @@ PHP_METHOD(PDO, quote)
 		pdo_raise_impl_error(dbh, NULL, "IM001", "driver does not support quoting");
 		RETURN_FALSE;
 	}
-	quoted = dbh->methods->quoter(dbh, str, paramtype);
+
+	pdo_dbh_t *conn = pdo_pool_acquire_conn(dbh);
+	if (UNEXPECTED(conn == NULL)) {
+		pdo_raise_impl_error(dbh, NULL, "HY000", "Failed to acquire connection from pool");
+		RETURN_FALSE;
+	}
+
+	quoted = conn->methods->quoter(conn, str, paramtype);
+	pdo_pool_sync_error(dbh, conn);
+	pdo_pool_maybe_release(dbh);
 
 	if (quoted == NULL) {
 		PDO_HANDLE_DBH_ERR();
@@ -1508,7 +1728,7 @@ static HashTable *dbh_get_gc(zend_object *object, zval **gc_data, int *gc_count)
 	pdo_dbh_t *dbh = php_pdo_dbh_fetch_inner(object);
 	zend_get_gc_buffer *gc_buffer = zend_get_gc_buffer_create();
 	zend_get_gc_buffer_add_zval(gc_buffer, &dbh->def_stmt_ctor_args);
-	if (dbh->methods && dbh->methods->get_gc) {
+	if (dbh->methods && dbh->methods->get_gc && dbh->driver_data) {
 		dbh->methods->get_gc(dbh, gc_buffer);
 	}
 	zend_get_gc_buffer_use(gc_buffer, gc_data, gc_count);
@@ -1538,11 +1758,10 @@ static void dbh_free(pdo_dbh_t *dbh, bool free_persistent)
 {
 	int i;
 
-	if (dbh->query_stmt) {
-		OBJ_RELEASE(dbh->query_stmt_obj);
-		dbh->query_stmt_obj = NULL;
-		dbh->query_stmt = NULL;
-	}
+	/* Release stash before pool — its stmt may reference a pooled conn. */
+	pdo_dbh_release_last_failed_query_stmt(dbh);
+
+	pdo_pool_destroy(dbh);
 
 	if (dbh->is_persistent) {
 #if ZEND_DEBUG
@@ -1553,7 +1772,9 @@ static void dbh_free(pdo_dbh_t *dbh, bool free_persistent)
 		}
 	}
 
-	if (dbh->methods) {
+	/* Pool templates carry no driver_data but may carry driver_pool_data
+	 * (e.g. SQLite UDF registry). Either is enough to require closer(). */
+	if (dbh->methods && (dbh->driver_data || dbh->driver_pool_data)) {
 		dbh->methods->closer(dbh);
 	}
 
@@ -1594,7 +1815,7 @@ static void pdo_dbh_free_storage(zend_object *std)
 		return;
 	}
 
-	if (dbh->driver_data && dbh->methods && dbh->methods->rollback && pdo_is_in_transaction(dbh)) {
+	if (dbh->driver_data && dbh->methods && dbh->methods->rollback && dbh->in_txn) {
 		dbh->methods->rollback(dbh);
 		dbh->in_txn = false;
 	}

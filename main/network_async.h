@@ -1,0 +1,49 @@
+/*
++----------------------------------------------------------------------+
+  | Copyright (c) The PHP Group                                          |
+  +----------------------------------------------------------------------+
+  | This source file is subject to version 3.01 of the PHP license,      |
+  | that is bundled with this package in the file LICENSE, and is        |
+  | available through the world-wide-web at the following url:           |
+  | https://www.php.net/license/3_01.txt                                 |
+  | If you did not receive a copy of the PHP license and are unable to   |
+  | obtain it through the world-wide-web, please send a note to          |
+  | license@php.net so we can mail you a copy immediately.               |
+  +----------------------------------------------------------------------+
+  | Author: Edmond                                                       |
+  +----------------------------------------------------------------------+
+*/
+#ifndef NETWORK_ASYNC_H
+#define NETWORK_ASYNC_H
+
+#include "php_network.h"
+
+BEGIN_EXTERN_C()
+
+ZEND_API bool network_async_set_socket_blocking(php_socket_t socket, bool blocking, php_netstream_data_t *sock_data);
+ZEND_API bool network_async_ensure_socket_nonblocking(php_socket_t socket);
+ZEND_API void network_async_wait_socket(php_socket_t socket, const zend_ulong events, const zend_ulong timeout);
+ZEND_API int network_async_await_stream_socket(php_netstream_data_t *netdata, async_poll_event events, struct timeval *timeout);
+ZEND_API zend_async_poll_proxy_t* php_netstream_get_async_event(php_netstream_data_t *netdata, async_poll_event events);
+
+ZEND_API int php_socket_check_liveness(php_socket_t socket, bool is_blocked, bool nonblocking_applied);
+ZEND_API int php_poll2_async(php_pollfd *ufds, unsigned int nfds, int timeout);
+ZEND_API int php_select_async(php_socket_t max_fd, fd_set *rfds, fd_set *wfds, fd_set *efds, struct timeval *tv);
+ZEND_API int network_async_stream_select(zval *read_streams, zval *write_streams, zval *except_streams, struct timeval *tv);
+
+ZEND_API php_socket_t network_async_accept_incoming(php_netstream_data_t *netdata,
+		zend_string **textaddr, struct sockaddr **addr, socklen_t *addrlen,
+		struct timeval *timeout, zend_string **error_string, int *error_code, int tcp_nodelay);
+
+ZEND_API int network_async_connect_socket(php_netstream_data_t *netdata, php_socket_t sockfd,
+		const struct sockaddr *addr, socklen_t addrlen, int asynchronous,
+		struct timeval *timeout, zend_string **error_string, int *error_code);
+
+ZEND_API int php_network_getaddrinfo_async(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
+ZEND_API struct hostent* php_network_gethostbyname_async(const char *name);
+ZEND_API zend_string* php_network_gethostbyaddr_async(const char *ip);
+ZEND_API int php_network_getaddresses_async(const char *host, int socktype, struct sockaddr ***sal, zend_string **error_string);
+
+END_EXTERN_C()
+
+#endif //NETWORK_ASYNC_H

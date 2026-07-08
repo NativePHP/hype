@@ -1,5 +1,9 @@
 --TEST--
 Test unfinished fiber with finally block
+--SKIPIF--
+<?php
+if (!function_exists("Async\\spawn")) die("skip TrueAsync runtime required");
+?>
 --FILE--
 <?php
 
@@ -26,5 +30,5 @@ echo "done\n";
 ?>
 --EXPECT--
 fiber
-finally
 done
+finally

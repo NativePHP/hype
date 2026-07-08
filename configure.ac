@@ -863,6 +863,57 @@ AS_VAR_IF([PHP_DEBUG_ASSERTIONS], [yes], [
   CXXFLAGS="$CXXFLAGS -UNDEBUG"
 ])
 
+dnl ---------------------------------------------------------------------
+dnl --enable-mm-php-source-track
+dnl
+dnl When enabled on top of --enable-debug, every emalloc/erealloc records
+dnl the executing PHP script's filename + line number into
+dnl zend_mm_debug_info, alongside the C source location it already
+dnl tracks. Surfaced at runtime via zend_mm_dump_live_allocations().
+dnl
+dnl Adds ~16 bytes per live allocation and one EG(current_execute_data)
+dnl read per alloc. Off by default because the read costs in even a
+dnl debug build are non-trivial under heavy churn (large interp_test_*
+dnl suites).
+dnl ---------------------------------------------------------------------
+PHP_ARG_ENABLE([mm-php-source-track],
+  [whether to record PHP source location on each Zend MM allocation],
+  [AS_HELP_STRING([--enable-mm-php-source-track],
+    [Record PHP file:line on every emalloc (requires --enable-debug)])],
+  [no],
+  [no])
+
+AS_VAR_IF([PHP_MM_PHP_SOURCE_TRACK], [yes], [
+  AS_VAR_IF([ZEND_DEBUG], [yes], [
+    AC_DEFINE([ZEND_MM_TRACK_PHP_SOURCE], [1],
+      [Record PHP script:line on each Zend MM allocation.])
+  ], [
+    AC_MSG_ERROR([--enable-mm-php-source-track requires --enable-debug])
+  ])
+])
+
+dnl libbacktrace for C backtraces in debug builds (ZEND_ASSERT, exception traces).
+AS_VAR_IF([ZEND_DEBUG], [yes], [
+  PKG_CHECK_MODULES([LIBBACKTRACE], [libbacktrace], [
+    PHP_EVAL_INCLINE([$LIBBACKTRACE_CFLAGS])
+    PHP_EVAL_LIBLINE([$LIBBACKTRACE_LIBS], [])
+    AC_DEFINE([HAVE_LIBBACKTRACE], [1],
+      [Define to 1 if libbacktrace is available for C backtrace support.])
+  ], [
+    AC_CHECK_HEADER([backtrace.h], [
+      AC_CHECK_LIB([backtrace], [backtrace_create_state], [
+        EXTRA_LIBS="$EXTRA_LIBS -lbacktrace"
+        AC_DEFINE([HAVE_LIBBACKTRACE], [1],
+          [Define to 1 if libbacktrace is available for C backtrace support.])
+      ], [
+        AC_MSG_WARN([libbacktrace library not found. C backtraces will be disabled.])
+      ])
+    ], [
+      AC_MSG_WARN([backtrace.h not found. C backtraces in ZEND_ASSERT and exception traces will be disabled.])
+    ])
+  ])
+])
+
 AC_ARG_ENABLE([zts],
   [AS_HELP_STRING([--enable-zts],
     [Enable thread safety])],
@@ -1668,6 +1719,9 @@ PHP_ADD_SOURCES([main], m4_normalize([
   ]),
   [-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1])
 
+PHP_ADD_SOURCES([main], m4_normalize([network_async.c]),
+  [-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1])
+
 if printf "#if __ELF__\nelf\n#endif\n" | $CC -E - | grep elf > /dev/null; then
   PHP_ADD_SOURCES([main], [debug_gdb_scripts.c])
 
@@ -1806,6 +1860,9 @@ PHP_ADD_SOURCES([Zend], m4_normalize([
     zend.c
   ]),
   [-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 $fiber_asm_cflag])
+
+  PHP_ADD_SOURCES([Zend], m4_normalize([zend_async_API.c]),
+    [-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 $fiber_asm_cflag])
 
 PHP_ADD_MAKEFILE_FRAGMENT([$abs_srcdir/scripts/Makefile.frag],
   [$abs_srcdir/scripts],

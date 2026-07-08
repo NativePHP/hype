@@ -134,6 +134,15 @@ typedef struct _php_output_handler {
 	} func;
 } php_output_handler;
 
+typedef struct _php_output_context_s {
+	zend_stack handlers;
+	php_output_handler *active;
+	php_output_handler *running;
+	zend_string *output_start_filename;
+	int output_start_lineno;
+	int flags;
+} php_output_context_t;
+
 ZEND_BEGIN_MODULE_GLOBALS(output)
 	zend_stack handlers;
 	php_output_handler *active;
@@ -152,9 +161,33 @@ PHPAPI ZEND_EXTERN_MODULE_GLOBALS(output)
 # define OG(v) (output_globals.v)
 #endif
 
+#include "Zend/zend_async_API.h"
+/* Async-aware output context accessor */
+# define ASYNC_OG(v) ((php_output_get_async_context())->v)
+
+extern uint32_t php_output_context_key;
+
+static inline php_output_context_t* php_output_get_async_context(void) {
+	zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+	if (coroutine && php_output_context_key) {
+		zval *ctx_zval = ZEND_ASYNC_INTERNAL_CONTEXT_FIND(coroutine, php_output_context_key);
+		if (ctx_zval && Z_TYPE_P(ctx_zval) == IS_PTR) {
+			return (php_output_context_t*)Z_PTR_P(ctx_zval);
+		}
+	}
+	/* Fallback to global context - structures are identical */
+	return (php_output_context_t *) &OG(handlers);
+}
+
+void php_output_init_async_context(php_output_context_t *ctx);
+void php_output_free_async_context(php_output_context_t *ctx);
+
+PHPAPI size_t php_output_write_with_coroutine(const char *str, size_t len, zend_coroutine_t *coro);
+
 /* convenience macros */
 #define PHPWRITE(str, str_len)		php_output_write((str), (str_len))
 #define PHPWRITE_H(str, str_len)	php_output_write_unbuffered((str), (str_len))
+#define PHPWRITE_CORO(str, str_len, coro)	php_output_write_with_coroutine((str), (str_len), (coro))
 
 #define PUTC(c)						php_output_write((const char *) &(c), 1)
 #define PUTC_H(c)					php_output_write_unbuffered((const char *) &(c), 1)

@@ -28,6 +28,8 @@
 #define shutdown(s,n)	/* nothing */
 #endif
 
+#include <Zend/zend_async_API.h>
+
 #ifdef PHP_WIN32
 # ifdef EWOULDBLOCK
 #  undef EWOULDBLOCK
@@ -141,6 +143,7 @@ typedef struct _php_pollfd {
 	short revents;
 } php_pollfd;
 
+ZEND_API extern int php_poll2_async(php_pollfd *ufds, unsigned int nfds, int timeout);
 PHPAPI int php_poll2(php_pollfd *ufds, unsigned int nfds, int timeout);
 
 #ifndef POLLIN
@@ -160,7 +163,19 @@ PHPAPI int php_poll2(php_pollfd *ufds, unsigned int nfds, int timeout);
 #define PHP_POLLREADABLE	(POLLIN|POLLERR|POLLHUP)
 
 #ifndef PHP_USE_POLL_2_EMULATION
-# define php_poll2(ufds, nfds, timeout)		poll(ufds, nfds, timeout)
+ZEND_API extern int php_poll2_async(php_pollfd *ufds, unsigned int nfds, const int timeout);
+
+static zend_always_inline int _php_poll2_async(php_pollfd *ufds, unsigned int nfds, int timeout)
+{
+	// Use context switching only if a timeout is specified
+	// and we are not in the scheduler context (which cannot suspend).
+	if(UNEXPECTED(timeout > 0 && ZEND_ASYNC_IS_ACTIVE && !ZEND_ASYNC_IS_SCHEDULER_CONTEXT)) {
+		return php_poll2_async(ufds, nfds, timeout);
+	} else {
+		return poll(ufds, nfds, timeout);
+	}
+}
+# define php_poll2(ufds, nfds, timeout)		_php_poll2_async(ufds, nfds, timeout)
 #endif
 
 /* timeval-to-timeout (for poll(2)) */
@@ -265,6 +280,9 @@ typedef struct {
 } php_sockaddr_storage;
 #endif
 
+struct _php_netstream_data_t;
+typedef struct _php_netstream_data_t php_netstream_data_t;
+
 #define PHP_SOCKVAL_TCP_NODELAY   (1 << 0)
 #define PHP_SOCKVAL_TCP_KEEPIDLE  (1 << 1)
 #define PHP_SOCKVAL_TCP_KEEPCNT   (1 << 2)
@@ -288,7 +306,8 @@ PHPAPI void php_network_freeaddresses(struct sockaddr **sal);
 
 PHPAPI php_socket_t php_network_connect_socket_to_host_ex(const char *host, unsigned short port,
 		int socktype, int asynchronous, struct timeval *timeout, zend_string **error_string,
-		int *error_code, const char *bindto, unsigned short bindport, long sockopts, php_sockvals *sockvals
+		int *error_code, const char *bindto, unsigned short bindport, long sockopts,
+		php_sockvals *sockvals, php_netstream_data_t *netdata
 		);
 
 PHPAPI php_socket_t php_network_connect_socket_to_host(const char *host, unsigned short port,
@@ -357,8 +376,13 @@ struct _php_netstream_data_t	{
 	bool timeout_event;
 	struct timeval timeout;
 	size_t ownsize;
+	zend_async_poll_event_t *poll_event;
+	zend_async_poll_proxy_t *read_event;
+	zend_async_poll_proxy_t *write_event;
+	unsigned nonblocking_applied:1;
+	unsigned is_sync:1;
+	unsigned _reserved:30;
 };
-typedef struct _php_netstream_data_t php_netstream_data_t;
 PHPAPI extern const php_stream_ops php_stream_socket_ops;
 extern const php_stream_ops php_stream_generic_socket_ops;
 #define PHP_STREAM_IS_SOCKET	(&php_stream_socket_ops)

@@ -1,5 +1,9 @@
 --TEST--
 GH-15330 003: Do not scan generator frames more than once
+--SKIPIF--
+<?php
+if (!function_exists("Async\\spawn")) die("skip TrueAsync runtime required");
+?>
 --FILE--
 <?php
 
@@ -53,5 +57,5 @@ object(Canary)#%d (1) {
   }
 }
 string(3) "foo"
-string(18) "Canary::__destruct"
 ==DONE==
+string(18) "Canary::__destruct"

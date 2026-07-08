@@ -74,7 +74,10 @@ PDO_API int pdo_parse_params(pdo_stmt_t *stmt, zend_string *inquery, zend_string
 	int (*scan)(pdo_scanner_t *s);
 	struct custom_quote custom_quote = {NULL, 0};
 
-	scan = stmt->dbh->methods->scanner ? stmt->dbh->methods->scanner : default_scanner;
+	/* Use pooled connection for scanner/quoter if available */
+	pdo_dbh_t *active_dbh = stmt->pooled_conn ? stmt->pooled_conn : stmt->dbh;
+
+	scan = active_dbh->methods->scanner ? active_dbh->methods->scanner : default_scanner;
 
 	s.cur = ZSTR_VAL(inquery);
 	s.end = s.cur + ZSTR_LEN(inquery) + 1;
@@ -229,7 +232,7 @@ safe:
 				pdo_raise_impl_error(stmt->dbh, stmt, "HY093", "parameter was not defined");
 				goto clean_up;
 			}
-			if (stmt->dbh->methods->quoter) {
+			if (active_dbh->methods->quoter) {
 				zval *parameter;
 				if (Z_ISREF(param->parameter)) {
 					parameter = Z_REFVAL(param->parameter);
@@ -248,7 +251,7 @@ safe:
 							buf = ZSTR_EMPTY_ALLOC();
 						}
 
-						plc->quoted = stmt->dbh->methods->quoter(stmt->dbh, buf, param->param_type);
+						plc->quoted = active_dbh->methods->quoter(active_dbh, buf, param->param_type);
 
 						if (buf) {
 							zend_string_release_ex(buf, 0);
@@ -256,7 +259,7 @@ safe:
 						if (plc->quoted == NULL) {
 							/* bork */
 							ret = -1;
-							strncpy(stmt->error_code, stmt->dbh->error_code, 6);
+							strncpy(stmt->error_code, active_dbh->error_code, 6);
 							goto clean_up;
 						}
 
@@ -293,15 +296,15 @@ safe:
 							if (EG(exception)) {
 								/* bork */
 								ret = -1;
-								strncpy(stmt->error_code, stmt->dbh->error_code, 6);
+								strncpy(stmt->error_code, active_dbh->error_code, 6);
 								goto clean_up;
 							}
 
-							plc->quoted = stmt->dbh->methods->quoter(stmt->dbh, buf, param_type);
+							plc->quoted = active_dbh->methods->quoter(active_dbh, buf, param_type);
 							if (plc->quoted == NULL) {
 								/* bork */
 								ret = -1;
-								strncpy(stmt->error_code, stmt->dbh->error_code, 6);
+								strncpy(stmt->error_code, active_dbh->error_code, 6);
 								goto clean_up;
 							}
 						}

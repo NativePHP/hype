@@ -64,6 +64,7 @@ extern void __res_ndestroy(res_state statp);
 #define HOST_NAME_MAX 255
 #endif
 
+#include "network_async.h"
 #include "php_dns.h"
 
 /* type compat */
@@ -151,7 +152,13 @@ PHP_FUNCTION(gethostbyaddr)
 		Z_PARAM_PATH(addr, addr_len)
 	ZEND_PARSE_PARAMETERS_END();
 
-	hostname = php_gethostbyaddr(addr);
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		hostname = php_network_gethostbyaddr_async(addr);
+	} else {
+		hostname = php_gethostbyaddr(addr);
+	}
+
+
 
 	if (hostname == NULL) {
 #ifdef HAVE_IPV6

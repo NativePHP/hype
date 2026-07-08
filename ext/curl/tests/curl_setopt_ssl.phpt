@@ -83,6 +83,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     check_response($response, $clientCertSubject);
@@ -97,6 +98,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     check_response($response, $clientCertSubject);
@@ -111,6 +113,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     check_response($response, $clientCertSubject);
@@ -125,6 +128,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     check_response($response, $clientCertSubject);
@@ -141,6 +145,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     check_response($response, $clientCertSubject);
@@ -157,6 +162,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     check_response($response, $clientCertSubject);
@@ -173,6 +179,7 @@ try {
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true));
     var_dump(curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
     $response = curl_exec($ch);
     var_dump((is_string($response) && strpos($response, $clientCertSubject) !== false) === $rejectsZeroLengthBlobs);

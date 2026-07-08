@@ -169,6 +169,12 @@ struct _zend_compiler_globals {
 #endif
 };
 
+typedef struct {
+	bool is_started;
+	void *coroutine;
+	uint32_t num_elements;
+	uint32_t idx;
+} zend_shutdown_context_t;
 
 struct _zend_executor_globals {
 	zval uninitialized_zval;
@@ -190,6 +196,7 @@ struct _zend_executor_globals {
 	int error_reporting;
 
 	bool fatal_error_backtrace_on;
+	bool exception_c_backtrace;
 	zval last_fatal_error_backtrace;
 
 	int exit_status;
@@ -264,6 +271,9 @@ struct _zend_executor_globals {
 	zend_object *exception;
 	const zend_op *opline_before_exception;
 	zend_op exception_op[3];
+
+	// Used to track the state of shutdown destructors in coroutines
+	zend_shutdown_context_t shutdown_context;
 
 	struct _zend_module_entry *current_module;
 

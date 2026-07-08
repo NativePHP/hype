@@ -29,6 +29,7 @@ extern ZEND_API zend_class_entry *zend_ce_throwable;
 extern ZEND_API zend_class_entry *zend_ce_exception;
 extern ZEND_API zend_class_entry *zend_ce_error_exception;
 extern ZEND_API zend_class_entry *zend_ce_error;
+extern ZEND_API zend_class_entry *zend_ce_cancellation;
 extern ZEND_API zend_class_entry *zend_ce_compile_error;
 extern ZEND_API zend_class_entry *zend_ce_parse_error;
 extern ZEND_API zend_class_entry *zend_ce_type_error;
@@ -40,6 +41,35 @@ extern ZEND_API zend_class_entry *zend_ce_unhandled_match_error;
 extern ZEND_API zend_class_entry *zend_ce_request_parse_body_exception;
 
 ZEND_API void zend_exception_set_previous(zend_object *exception, zend_object *add_previous);
+
+static zend_always_inline void zend_exception_save_fast(
+		zend_object **exception_ptr,
+		zend_object **prev_exception_ptr
+)
+{
+	if (UNEXPECTED(*prev_exception_ptr)) {
+		zend_exception_set_previous(*exception_ptr, *prev_exception_ptr);
+	}
+	if (UNEXPECTED(*exception_ptr)) {
+		*prev_exception_ptr = *exception_ptr;
+	}
+	*exception_ptr = NULL;
+}
+
+static zend_always_inline void zend_exception_restore_fast(
+		zend_object **exception_ptr,
+		zend_object **prev_exception_ptr
+)
+{
+	if (UNEXPECTED(*prev_exception_ptr)) {
+		if (*exception_ptr) {
+			zend_exception_set_previous(*exception_ptr, *prev_exception_ptr);
+		} else {
+			*exception_ptr = *prev_exception_ptr;
+		}
+		*prev_exception_ptr = NULL;
+	}
+}
 
 ZEND_API ZEND_COLD void zend_throw_exception_internal(zend_object *exception);
 

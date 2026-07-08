@@ -220,6 +220,10 @@ struct _php_stream  {
 	/* whether fatal error happened and all operations should terminates as soon as possible */
 	uint16_t fatal_error:1;
 
+	/* set when _php_stream_free was called but ref_count > 0; the last
+	 * async-op holder finishes the efree when ref_count drops to 0. */
+	uint16_t pending_free:1;
+
 	char mode[16];			/* "rwb" etc. ala stdio */
 
 	uint32_t flags;	/* PHP_STREAM_FLAG_XXX */
@@ -438,6 +442,8 @@ PHPAPI int _php_stream_set_option(php_stream *stream, int option, int value, voi
 
 #define php_stream_set_chunk_size(stream, size) _php_stream_set_option((stream), PHP_STREAM_OPTION_SET_CHUNK_SIZE, (size), NULL)
 
+PHPAPI void php_stream_detach_async_io(void);
+
 END_EXTERN_C()
 
 
@@ -512,6 +518,21 @@ END_EXTERN_C()
 
 #define php_stream_sync_supported(stream)	(_php_stream_set_option((stream), PHP_STREAM_OPTION_SYNC_API, PHP_STREAM_SYNC_SUPPORTED, NULL) == PHP_STREAM_OPTION_RETURN_OK ? 1 : 0)
 
+/* Get or create async event handle for socket streams.
+ * value = events mask, ptrparam = zend_async_poll_event_t** */
+#define PHP_STREAM_OPTION_ASYNC_EVENT_HANDLE	15
+
+/* Align internal stream position after external fd manipulation (e.g. copy_file_range).
+ * ptrparam = zend_off_t* pointing to the new position */
+#define PHP_STREAM_OPTION_ALIGN_POSITION		16
+
+/* Retrieve the async IO handle from a stream.
+ * ptrparam = zend_async_io_t** (output) */
+#define PHP_STREAM_OPTION_ASYNC_IO				17
+
+/* Detach all async IO resources from this stream.
+ * The stream becomes synchronous-only. No parameters. */
+#define PHP_STREAM_OPTION_DETACH_ASYNC_IO		18
 
 #define PHP_STREAM_OPTION_RETURN_OK			 0 /* option set OK */
 #define PHP_STREAM_OPTION_RETURN_ERR		-1 /* problem setting option */

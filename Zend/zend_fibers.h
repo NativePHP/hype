@@ -20,6 +20,7 @@
 #define ZEND_FIBERS_H
 
 #include "zend_API.h"
+#include "zend_async_API.h"
 #include "zend_types.h"
 
 #define ZEND_FIBER_GUARD_PAGES 1
@@ -54,6 +55,7 @@ void zend_fiber_shutdown(void);
 extern ZEND_API zend_class_entry *zend_ce_fiber;
 
 typedef struct _zend_fiber_stack zend_fiber_stack;
+typedef struct _zend_fiber_event zend_fiber_event;
 
 /* Encapsulates data needed for a context switch. */
 typedef struct _zend_fiber_transfer {
@@ -105,18 +107,50 @@ struct _zend_fiber {
 	/* Flags are defined in enum zend_fiber_flag. */
 	uint8_t flags;
 
+	/* Associated coroutine, if any. */
+	zend_coroutine_t *coroutine;
+
+	/* The event for resuming a Fiber.
+	 * This is the event the Fiber’s internal coroutine waits for in order to continue execution!. */
+	zend_fiber_event *resume_event;
+
+	/* The event for yielding a Fiber.
+	 * Other coroutines listen to this event to catch the yield operation.
+	*/
+	zend_fiber_event *yield_event;
+
 	/* Native C fiber context. */
 	zend_fiber_context context;
 
-	/* Fiber that resumed us. */
-	zend_fiber_context *caller;
+	/* Fiber/coroutine that resumed us. */
+	union {
+		zend_fiber_context *caller;            /* non-coroutine mode */
+		zend_coroutine_t *caller_coroutine;    /* coroutine mode */
+	};
 
 	/* Fiber that suspended us. */
 	zend_fiber_context *previous;
 
-	/* Callback and info / cache to be used when fiber is started. */
+	/*
+	 * Callback and info / cache to be used when fiber is started.
+	 * IMPORTANT: When fiber->coroutine != NULL, these fields are NOT USED.
+	 * Instead, fiber->fcall is used (see below).
+	 * Only used for non-coroutine path (fiber->coroutine == NULL).
+	 */
 	zend_fcall_info fci;
 	zend_fcall_info_cache fci_cache;
+
+	/*
+	 * Pointer to allocated zend_fcall_t structure for coroutine path.
+	 * OWNERSHIP:
+	 *   - Fiber allocates on creation and TEMPORARILY owns it
+	 *   - coroutine_entry_point TAKES ownership (sets fiber->fcall to NULL)
+	 *   - coroutine_entry_point FREES it at the end
+	 * NULL when:
+	 *   - fiber->coroutine == NULL (non-coroutine path)
+	 *   - Ownership already taken by coroutine_entry_point
+	 */
+	zend_fcall_t *fcall;
 
 	/* Current Zend VM execute data being run by the fiber. */
 	zend_execute_data *execute_data;
@@ -127,8 +161,24 @@ struct _zend_fiber {
 	/* Active fiber vm stack. */
 	zend_vm_stack vm_stack;
 
-	/* Storage for fiber return value. */
+	/*
+	 * Storage for fiber return value.
+	 * IMPORTANT: When fiber->coroutine != NULL, this field is NOT USED.
+	 * Result is stored in coroutine->result instead.
+	 * Only used for non-coroutine path (fiber->coroutine == NULL).
+	 */
 	zval result;
+};
+
+/**
+ * An event for waiting on a Fiber,
+ * used in the coroutine that creates the Fiber.
+ */
+struct _zend_fiber_event {
+	zend_async_event_t base;
+	zend_fiber *fiber;
+	/* Whether the fiber is currently suspended. */
+	bool is_suspended;
 };
 
 ZEND_API zend_result zend_fiber_start(zend_fiber *fiber, zval *return_value);

@@ -52,6 +52,16 @@ typedef struct _zend_mm_debug_info {
 	const char        *orig_filename;
 	uint32_t               lineno;
 	uint32_t               orig_lineno;
+#ifdef ZEND_MM_TRACK_PHP_SOURCE
+	/* PHP script:line of the executing user code at the time of
+	 * allocation. NULL/0 when allocation happened outside user PHP
+	 * (internal function, RINIT, opcache compile, etc.). Recorded
+	 * from EG(current_execute_data) in _zend_mm_alloc; surfaced by
+	 * zend_mm_dump_live_allocations(). Off by default — enabled via
+	 * --enable-mm-php-source-track on top of --enable-debug. */
+	const char        *php_filename;
+	uint32_t           php_lineno;
+#endif
 } zend_mm_debug_info;
 
 # define ZEND_MM_OVERHEAD ZEND_MM_ALIGNED_SIZE(sizeof(zend_mm_debug_info))
@@ -217,6 +227,10 @@ ZEND_API ZEND_ATTRIBUTE_MALLOC char * __zend_strdup(const char *s);
 ZEND_API zend_result zend_set_memory_limit(size_t memory_limit);
 ZEND_API bool zend_alloc_in_memory_limit_error_reporting(void);
 
+/* Returns true (and clears the flag) if the most recent zend_bailout()
+ * propagating out was triggered by an Out-Of-Memory error from Zend MM. */
+ZEND_API bool zend_alloc_pop_is_oom(void);
+
 ZEND_API void start_memory_manager(void);
 ZEND_API void shutdown_memory_manager(bool silent, bool full_shutdown);
 ZEND_API void refresh_memory_manager(void);
@@ -267,6 +281,26 @@ ZEND_API zend_mm_heap *zend_mm_set_heap(zend_mm_heap *new_heap);
 ZEND_API zend_mm_heap *zend_mm_get_heap(void);
 
 ZEND_API size_t zend_mm_gc(zend_mm_heap *heap);
+
+#if ZEND_DEBUG
+/* Read-only walk over every live emalloc on @heap. Mirrors the page
+ * decoding in zend_mm_check_leaks but never mutates the heap.
+ * `php_filename` / `php_lineno` are populated only when the build was
+ * configured with --enable-mm-php-source-track; otherwise NULL/0. */
+typedef void (*zend_mm_live_callback_t)(
+		void       *user_data,
+		const void *addr,
+		size_t      size,
+		const char *filename,
+		uint32_t    lineno,
+		const char *orig_filename,
+		uint32_t    orig_lineno,
+		const char *php_filename,
+		uint32_t    php_lineno);
+
+ZEND_API void zend_mm_for_each_live(zend_mm_heap *heap,
+		zend_mm_live_callback_t cb, void *user_data);
+#endif
 
 #define ZEND_MM_CUSTOM_HEAP_NONE  0
 #define ZEND_MM_CUSTOM_HEAP_STD   1

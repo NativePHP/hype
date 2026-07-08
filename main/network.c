@@ -55,6 +55,8 @@
 
 #include "php_network.h"
 
+#include "network_async.h"
+
 #if defined(PHP_WIN32) || defined(__riscos__)
 #undef AF_UNIX
 #endif
@@ -156,6 +158,11 @@ PHPAPI int php_network_getaddresses(const char *host, int socktype, struct socka
 	if (host == NULL) {
 		return 0;
 	}
+
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		return php_network_getaddresses_async(host, socktype, sal, error_string);
+	}
+
 #ifdef HAVE_GETADDRINFO
 	memset(&hints, '\0', sizeof(hints));
 
@@ -392,6 +399,8 @@ PHPAPI int php_network_connect_socket(php_socket_t sockfd,
 	while (true) {
 		n = php_pollfd_for(sockfd, events, timeout ? &working_timeout : NULL);
 		if (n < 0) {
+			// We need to update the error information because we called some functions before this.
+			error = errno;
 			if (errno == EINTR) {
 #ifdef HAVE_GETTIMEOFDAY
 				if (timeout) {
@@ -856,7 +865,17 @@ PHPAPI php_socket_t php_network_accept_incoming_ex(php_socket_t srvsock,
 		*error_code = error;
 	}
 	if (error_string) {
-		*error_string = php_socket_error_str(error);
+		if(EG(exception)) {
+			zval rv;
+			const zval *message =
+					zend_read_property_ex(EG(exception)->ce, EG(exception), zend_known_strings[ZEND_STR_MESSAGE], 0, &rv);
+
+			if (message != NULL && Z_TYPE_P(message) == IS_STRING) {
+				*error_string = zend_string_copy(Z_STR_P(message));
+			}
+		} else {
+			*error_string = php_socket_error_str(error);
+		}
 	}
 
 	return clisock;
@@ -883,9 +902,11 @@ PHPAPI php_socket_t php_network_accept_incoming(php_socket_t srvsock,
  * enable non-blocking mode on the socket.
  * Returns the connected (or connecting) socket, or -1 on failure.
  * */
+/* {{{ php_network_connect_socket_to_host */
 php_socket_t php_network_connect_socket_to_host_ex(const char *host, unsigned short port,
 		int socktype, int asynchronous, struct timeval *timeout, zend_string **error_string,
-		int *error_code, const char *bindto, unsigned short bindport, long sockopts, php_sockvals *sockvals
+		int *error_code, const char *bindto, unsigned short bindport, long sockopts,
+		php_sockvals *sockvals, php_netstream_data_t *netdata
 		)
 {
 	int num_addrs, n, fatal = 0;
@@ -1043,9 +1064,23 @@ php_socket_t php_network_connect_socket_to_host_ex(const char *host, unsigned sh
 #endif
 		}
 
-		n = php_network_connect_socket(sock, sa, socklen, asynchronous,
-				timeout ? &working_timeout : NULL,
-				error_string, error_code);
+		if (ZEND_ASYNC_IS_ACTIVE && netdata != NULL && !netdata->is_sync) {
+			netdata->socket = sock;
+
+			n = network_async_connect_socket(netdata, sock, sa, socklen, asynchronous,
+					timeout ? &working_timeout : NULL,
+					error_string, error_code);
+
+			if (UNEXPECTED(n == -1)) {
+				sock = -1;
+				netdata->socket = -1;
+				fatal = 1;
+			}
+		} else {
+			n = php_network_connect_socket(sock, sa, socklen, asynchronous,
+					timeout ? &working_timeout : NULL,
+					error_string, error_code);
+		}
 
 		if (n != -1) {
 			goto connected;
@@ -1090,14 +1125,16 @@ connected:
 	return sock;
 }
 
+/* {{{ php_network_connect_socket_to_host */
 php_socket_t php_network_connect_socket_to_host(const char *host, unsigned short port,
 		int socktype, int asynchronous, struct timeval *timeout, zend_string **error_string,
 		int *error_code, const char *bindto, unsigned short bindport, long sockopts
 		)
 {
 	return php_network_connect_socket_to_host_ex(host, port, socktype, asynchronous, timeout,
-			error_string, error_code, bindto, bindport, sockopts, NULL);
+			error_string, error_code, bindto, bindport, sockopts, NULL, NULL);
 }
+/* }}} */
 
 /* {{{ php_any_addr
  * Fills any (wildcard) address into php_sockaddr_storage
@@ -1283,6 +1320,7 @@ PHPAPI php_stream *_php_stream_sock_open_from_socket(php_socket_t socket, const 
 	sock->timeout.tv_sec = FG(default_socket_timeout);
 	sock->timeout.tv_usec = 0;
 	sock->socket = socket;
+	sock->is_sync = persistent_id ? 1 : 0;
 
 	stream = php_stream_alloc_rel(&php_stream_generic_socket_ops, sock, persistent_id, "r+");
 
@@ -1375,6 +1413,19 @@ PHPAPI void _php_emit_fd_setsize_warning(int max_fd)
 
 PHPAPI int php_poll2(php_pollfd *ufds, unsigned int nfds, int timeout)
 {
+	if (UNEXPECTED(ZEND_ASYNC_IS_ACTIVE)) {
+		if (EXPECTED(!ZEND_ASYNC_IS_SCHEDULER_CONTEXT)) {
+			return php_poll2_async(ufds, nfds, timeout);
+		}
+
+		/* Scheduler context cannot suspend — fall back to synchronous
+		 * select() but cap the timeout to avoid blocking the event loop
+		 * indefinitely (default: 5 minutes). */
+		if (timeout < 0) {
+			timeout = 300000;
+		}
+	}
+
 	fd_set rset, wset, eset;
 	php_socket_t max_fd = SOCK_ERR; /* effectively unused on Windows */
 	unsigned int i;
@@ -1518,6 +1569,9 @@ static struct hostent * gethostname_re (const char *host,struct hostent *hostbuf
 #endif
 
 PHPAPI struct hostent*	php_network_gethostbyname(const char *name) {
+	if (ZEND_ASYNC_IS_ACTIVE) {
+		return php_network_gethostbyname_async(name);
+	}
 #if !defined(HAVE_GETHOSTBYNAME_R)
 	return gethostbyname(name);
 #else

@@ -50,6 +50,8 @@ int _pdo_mysql_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, const char *file, int lin
 		S = (pdo_mysql_stmt*)stmt->driver_data;
 		pdo_err = &stmt->error_code;
 		einfo   = &S->einfo;
+		/* Use statement's connection handle — dbh may be a pool template with NULL driver_data */
+		H = S->H;
 	} else {
 		pdo_err = &dbh->error_code;
 		einfo   = &H->einfo;
@@ -59,6 +61,14 @@ int _pdo_mysql_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, const char *file, int lin
 		einfo->errcode = mysql_stmt_errno(S->stmt);
 	} else {
 		einfo->errcode = mysql_errno(H->server);
+	}
+
+	/* Mark connection as broken on fatal connection errors.
+	 * Pool will destroy instead of reusing.
+	 * In pool mode with stmt, dbh is template — use stmt->pooled_conn for the real connection. */
+	if (einfo->errcode == CR_SERVER_GONE_ERROR || einfo->errcode == CR_SERVER_LOST) {
+		pdo_dbh_t *conn_dbh = (stmt && stmt->pooled_conn) ? stmt->pooled_conn : dbh;
+		conn_dbh->conn_broken = true;
 	}
 
 	einfo->file = file;
@@ -150,6 +160,12 @@ static void mysql_handle_closer(pdo_dbh_t *dbh)
 	PDO_DBG_ENTER("mysql_handle_closer");
 	PDO_DBG_INF_FMT("dbh=%p", dbh);
 	if (H) {
+		if (H->stmt_cache) {
+			/* Connection is closing — server-side stmts vanish with the session,
+			 * no COM_STMT_CLOSE needed. Entry dtors will free MYSQL_STMT* clients. */
+			pdo_pool_stmt_cache_destroy(H->stmt_cache);
+			H->stmt_cache = NULL;
+		}
 		if (H->server) {
 			mysql_close(H->server);
 			H->server = NULL;
@@ -201,6 +217,32 @@ static bool mysql_handle_preparer(pdo_dbh_t *dbh, zend_string *sql, pdo_stmt_t *
 		PDO_DBG_RETURN(false);
 	}
 
+	/* Per-conn prepared-statement cache (opt-in via PDO::ATTR_POOL_STMT_CACHE_SIZE).
+	 * Checkout model: on hit we take the MYSQL_STMT* out of the cache, on dtor we
+	 * insert it back (or close on eviction). Two concurrent stmts on the same SQL
+	 * cannot share a single MYSQL_STMT* (client-side state), so the second is a
+	 * miss and prepares fresh; on its dtor it replaces the cached entry. */
+	if (H->stmt_cache != NULL) {
+		zend_string *const key = nsql ? nsql : sql;
+		pdo_pool_stmt_cache_entry_t *const entry = pdo_pool_stmt_cache_take(H->stmt_cache, key);
+		if (entry != NULL) {
+			S->stmt = entry->driver_data;
+			/* detach payload before freeing the entry shell */
+			entry->driver_data = NULL;
+			entry->driver_data_dtor = NULL;
+			pdo_pool_stmt_cache_entry_free(entry);
+
+			S->from_cache = 1;
+			S->query = zend_string_copy(key);
+			if (nsql) {
+				zend_string_release(nsql);
+			}
+
+			S->num_params = mysql_stmt_param_count(S->stmt);
+			goto cache_hit_finalize;
+		}
+	}
+
 	if (!(S->stmt = mysql_stmt_init(H->server))) {
 		pdo_mysql_error(dbh);
 		if (nsql) {
@@ -223,11 +265,21 @@ static bool mysql_handle_preparer(pdo_dbh_t *dbh, zend_string *sql, pdo_stmt_t *
 		pdo_mysql_error(dbh);
 		PDO_DBG_RETURN(false);
 	}
+
+	/* Mark this stmt as cacheable so the dtor will try to insert it.
+	 * Capture the canonical SQL as the key. */
+	if (H->stmt_cache != NULL) {
+		S->from_cache = 1;
+		S->query = zend_string_copy(nsql ? nsql : sql);
+	}
+
 	if (nsql) {
 		zend_string_release(nsql);
 	}
 
 	S->num_params = mysql_stmt_param_count(S->stmt);
+
+cache_hit_finalize:
 
 	if (S->num_params) {
 #ifdef PDO_USE_MYSQLND
@@ -658,7 +710,9 @@ static const struct pdo_dbh_methods mysql_methods = {
 	pdo_mysql_request_shutdown,
 	pdo_mysql_in_transaction,
 	NULL, /* get_gc */
-    pdo_mysql_scanner
+    pdo_mysql_scanner,
+	NULL, /* pool_before_acquire */
+	NULL, /* pool_before_release */
 };
 /* }}} */
 
@@ -972,6 +1026,18 @@ static int pdo_mysql_handle_factory(pdo_dbh_t *dbh, zval *driver_options)
 
 	H->attached = 1;
 
+	/* Pool slot connections: pick up cache capacity from the template dbh
+	 * (pool->user_data). Allocated unconditionally — the preparer skips the
+	 * cache when emulate_prepare is true, and emulate may only be turned off
+	 * by a later set_attribute on the slot (options aren't propagated to the
+	 * factory). */
+	if (dbh->pool != NULL) {
+		const pdo_dbh_t *template_dbh = (const pdo_dbh_t *)dbh->pool->user_data;
+		if (template_dbh && template_dbh->pool_stmt_cache_size > 0) {
+			H->stmt_cache = pdo_pool_stmt_cache_create(template_dbh->pool_stmt_cache_size);
+		}
+	}
+
 	dbh->alloc_own_columns = 1;
 	dbh->max_escaped_char_length = 2;
 	dbh->methods = &mysql_methods;
@@ -991,7 +1057,18 @@ cleanup:
 }
 /* }}} */
 
+static void pdo_mysql_init_methods(pdo_dbh_t *dbh, bool *supports_pool)
+{
+	dbh->methods = &mysql_methods;
+	dbh->alloc_own_columns = 1;
+	dbh->max_escaped_char_length = 2;
+	if (supports_pool) {
+		*supports_pool = true;
+	}
+}
+
 const pdo_driver_t pdo_mysql_driver = {
 	PDO_DRIVER_HEADER(mysql),
-	pdo_mysql_handle_factory
+	pdo_mysql_handle_factory,
+	pdo_mysql_init_methods
 };

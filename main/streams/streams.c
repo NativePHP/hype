@@ -98,6 +98,20 @@ PHP_RSHUTDOWN_FUNCTION(streams)
 	return SUCCESS;
 }
 
+PHPAPI void php_stream_detach_async_io(void)
+{
+	zend_resource *res;
+
+	ZEND_HASH_FOREACH_PTR(&EG(regular_list), res) {
+		if (res->type == le_stream || res->type == le_pstream) {
+			php_stream *stream = (php_stream *)res->ptr;
+			if (stream != NULL) {
+				php_stream_set_option(stream, PHP_STREAM_OPTION_DETACH_ASYNC_IO, 0, NULL);
+			}
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
 PHPAPI php_stream *php_stream_encloses(php_stream *enclosing, php_stream *enclosed)
 {
 	php_stream *orig = enclosed->enclosing_stream;
@@ -342,7 +356,11 @@ fprintf(stderr, "stream_free: %s:%p[%s] preserve_handle=%d release_cast=%d remov
 		}
 
 		ret = stream->ops->close(stream, preserve_handle ? 0 : 1);
-		stream->abstract = NULL;
+		/* When ops->close set stream->pending_free, it kept the abstract
+		 * alive for a parked coroutine to finalize; do not clear abstract. */
+		if (!stream->pending_free) {
+			stream->abstract = NULL;
+		}
 
 		/* tidy up any FILE* that might have been fdopened */
 		if (release_cast && stream->fclose_stdiocast == PHP_STREAM_FCLOSE_FDOPEN && stream->stdiocast) {
@@ -396,7 +414,12 @@ fprintf(stderr, "stream_free: %s:%p[%s] preserve_handle=%d release_cast=%d remov
 			stream->orig_path = NULL;
 		}
 
-		pefree(stream, stream->is_persistent);
+		if (UNEXPECTED(stream->pending_free)) {
+			/* Async coroutines still hold this pointer; the last unpin
+			 * will efree the stream. */
+		} else {
+			pefree(stream, stream->is_persistent);
+		}
 	}
 
 	if (context) {
@@ -563,8 +586,10 @@ PHPAPI zend_result _php_stream_fill_read_buffer(php_stream *stream, size_t size)
 					stream->readbuflen - stream->writepos
 					);
 			if (justread < 0) {
-				retval = FAILURE;
-				goto out_check_eof;
+				/* Async: stream may have been freed by another coroutine
+				 * while ops->read was parked. Skip the EOF check on the
+				 * (possibly freed) stream. */
+				return FAILURE;
 			}
 			stream->writepos += justread;
 			retval = SUCCESS;
@@ -1614,6 +1639,10 @@ PHPAPI zend_result _php_stream_copy_to_stream_ex(php_stream *src, php_stream *de
 
 				src->position += nbytes;
 				dest->position += nbytes;
+
+				/* Align async IO internal positions after copy_file_range moved fd offsets directly */
+				php_stream_set_option(src, PHP_STREAM_OPTION_ALIGN_POSITION, 0, &src->position);
+				php_stream_set_option(dest, PHP_STREAM_OPTION_ALIGN_POSITION, 0, &dest->position);
 
 				if ((maxlen != PHP_STREAM_COPY_ALL && nbytes == maxlen) || php_stream_eof(src)) {
 					/* the whole request was satisfied or end-of-file reached - done */
