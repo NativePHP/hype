@@ -1,0 +1,576 @@
+# Changelog
+
+All notable changes to the Async extension for PHP will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.7.9] - 2026-07-07
+
+### Fixed
+- **Race-safe `remote_future_dispose`.** Disposing a remote future while its producer thread was still completing it raced: the cross-thread trigger was closed and the state ref dropped without first marking the state completed or detaching `target_future`, so a concurrent `async_future_shared_state_complete()` could ring a closing handle or resolve a freed future. It now mirrors `async_future_state_object_free` — under the shared-state mutex it grabs the trigger, NULLs it, sets `completed=1` and clears `target_future`, then disposes the trigger outside the lock — so a late completion is a clean no-op. Lets an owner dispose an unresolved remote future safely (e.g. the HTTP server reaping per-worker completion futures on pool shutdown, true-async/server#93).
+
+## [0.7.8] - 2026-07-07
+
+### Fixed
+- **Connection-pool healthcheck timer kept the reactor loop alive, blocking a graceful worker shutdown (true-async/server#93).** `pool_start_healthcheck_timer()` armed the pool's background heartbeat as an ordinary reactor event, so it counted toward `active_event_count`. An idle pool — e.g. a warmed PDO pool with `PDO::ATTR_POOL_HEALTHCHECK_INTERVAL > 0` — therefore held `ZEND_ASYNC_REACTOR_LOOP_ALIVE()` true after every coroutine had been cancelled on graceful shutdown. On worker hot-reload the scheduler fiber then tripped `ZEND_ASSERT(REACTOR_LOOP_ALIVE() == false)` in `fiber_entry` (debug build); on release builds the idle heartbeat needlessly kept the retiring worker's loop alive. The timer is now marked `ZEND_ASYNC_EVENT_F_HIDDEN` — its documented purpose ("background timers, e.g. health checks") — so it still fires but no longer counts as application work for loop-alive / deadlock accounting.
+
+## [0.7.7] - 2026-07-06
+
+### Fixed
+- **#176 Nested closures shared across worker threads → cross-thread `run_time_cache` use-after-free (SEGV).** A transferred closure's nested closures (`op_array.dynamic_func_defs`) stayed shared with the persistent snapshot, so instantiating one on multiple workers raced on its run-time cache (e.g. a coroutine spawned in a `ThreadPool` bootloader across `reload()`). The load path now deep-copies the op_array per worker when it carries nested definitions. This was also the root cause of the intermittent rotation SIGSEGV noted as a known follow-up in 0.7.6's reload() hardening (true-async/server#102).
+- **#173 Reactor: use-after-free when an IO request is disposed while its libuv operation is still in flight** (seen as an intermittent access violation on Windows process teardown in `io/042`). An awaiter that abandons its request — `stream_set_timeout()` + `fgets()` where the timer wins, or a cancelled coroutine parked on a write/flush/stat/sendfile — called `req->dispose(req)` while libuv still referenced the request, leaving several distinct UAFs:
+  - *Armed stream read* (the `io/042` crash): `libuv_io_req_dispose` freed the request but left `io->active_req` pointing at it with `uv_read_start` still armed. The subsequent `fclose()` took the no-subscribers path in `libuv_io_close` (the timeout had already cleaned the waker), so the stale pointer survived until the `uv_close` callback drained — often as late as request shutdown — where the `active_req` backstop in `libuv_io_event_dispose` called `dispose()` through freed memory. Dispose now stops the reader and detaches `io->active_req`. The same detach was added to `udp_req_dispose` for an abandoned `recvfrom` (armed `uv_udp_recv_start`).
+  - *In-flight `uv_write` / `uv_fs_read` / `uv_fs_write` / `uv_fs_fsync` / `uv_fs_fstat` / sendfile*: these cannot be cancelled synchronously, so dispose now defers the free with an `UV_IN_FLIGHT`/`DISPOSE_PENDING` rendezvous (mirroring the existing UDP-sendto and DNS ones) — the completion callback finishes the deferred dispose and skips the NOTIFY; a queued-but-not-started threadpool op is `uv_cancel`ed outright. `io_file_stat_cb` additionally skips writing the stat result into the vanished awaiter's buffer.
+  - *FILE io freed under a threadpool op*: FILE-type handles have no `uv_close` rendezvous, so an owner dispose could free the `async_io_t` itself while a completion callback still reached through it (offset bookkeeping, event count, write-queue drain). Every fs submission (and `fs_open`'s pending io, and both sendfile ios) now holds an event reference for the duration of the op, released in the callback.
+  - *Latent: disposing a not-yet-closed stream/UDP io*: `libuv_io_event_dispose` ran `libuv_io_close` (which schedules `uv_close` holding a fresh reference) and then freed the io anyway, leaving the pending close callback with a dangling handle. The final teardown is now transferred to `io_close_cb`.
+- **`ThreadPool`: a retiring sync-mode worker could hang `HttpServer::reload()` forever.** A sync-mode worker posts its reload exit-token only after its scheduler drain empties, but a long-lived coroutine left running in the worker's main scope by the bootloader (e.g. an async DB-pool healthcheck timer) never lets the drain finish. The worker's `done:` path now force-starts graceful shutdown before the drain for sync-mode pools only, cancelling main-scope stragglers so the worker retires (true-async/server#93).
+
+## [0.7.6] - 2026-07-03
+
+Hardening of the live worker-pool reload path (true-async/server#93), plus a
+worker thread-stack leak fix.
+
+### Added
+- **`ThreadPool` rolling reload matured into a single `reload()` ABI.** The
+  initial `respawnWorker()` / `requestWorkerExit()` primitives were replaced by a
+  channel-swap `reload()` — the pool retires the old cohort onto a fresh task
+  channel and 1:1-replaces workers as they drain — hardened with identity-gated
+  exit tokens (a stale token can no longer retire a fresh worker) and
+  serialized+coalesced handling of overlapping calls (concurrent `reload()`s fold
+  into one follow-up rotation). In-flight tasks always complete
+  (true-async/server#93).
+- **`FileSystemWatcher` recursive watch + built-in debounce.** Recursive watching
+  on Linux/inotify and BSD/kqueue (one watch per directory, subtrees
+  auto-added/dropped; on kqueue, which names only the changed directory, each
+  directory keeps a snapshot diffed per notification to recover the changed name),
+  with `debounceMs` / `maxHoldMs` collapsing a change burst into a single event
+  (true-async/server#93).
+- **`pcntl` / Zend signal handlers routed through the reactor** — signals are
+  delivered on the reactor thread so a handler runs on the main coroutine instead
+  of an arbitrary interrupted context (true-async/server#93).
+
+### Fixed
+- **Every exited pool worker leaked its 8 MB stack.** Worker threads were never
+  detached, so their stacks were retained after exit — a steady leak across reload
+  rotations. Pool workers are now detached (portable: `pthread_detach` on unix,
+  `uv_thread_detach` where libuv ≥ 1.50 is available) (true-async/server#93).
+
+### Changed
+- De-flaked the coroutine-mode `ThreadPool::reload()` bootloader test (075): ZTS
+  `SKIPIF`s and wider CI timing margins (true-async/server#93).
+
+## [0.7.5] - 2026-07-01
+
+### Added
+- **Android platform support.** `zend_async_call_on_main_stack_fn` (ABI v0.21) runs a C callback on the main coroutine's OS-thread stack via a naked SP-only switch (arm64 + x86_64, the `asmcgocall` pattern), for foreign calls that trip a runtime's stack-pointer guard when made from a fiber stack — e.g. ART throws `StackOverflowError` at the JNI→Java boundary. If the current coroutine is already main, the call goes straight through. This is the extension-side counterpart of the `ZEND_ASYNC_CALL_ON_MAIN_STACK` API added in php-src; together with the Android/Bionic build fixes there (TSRM TLS model, `getdtablesize`), it unblocks embedding TrueAsync PHP in Android apps (JNI).
+
+### Fixed
+- **(true-async/server#2) Reactor: io-completion exception freed mid-broadcast (UAF/heap corruption).** `io_pipe_read_cb`/`io_pipe_write_cb` broadcast `req->base.exception` to every callback subscribed on the shared `io->event`, but the exception is owned by `req` and dies with it. A consumer — e.g. a connection's persistent multishot read listener — could legitimately release its req's exception and dispose the req inside the same notify pass, while a sibling write-filter for a parked writer still forwarded that same object to `async_coroutine_resume`, add-reffing freed memory. Fixed in `libuv_reactor.c` by having the producer capture the exception into a local, `GC_ADDREF` before `NOTIFY` and `OBJ_RELEASE` after, so it survives even if a consumer frees the req mid-notify.
+
+## [0.7.4] - 2026-06-25
+
+### Added
+- **`FileSystemWatcher`: `recursive: true` now works on Linux/inotify and BSD/kqueue** — emulated with one watch per directory (subtrees auto-added/dropped, symlinks skipped, `$filename` relative to the watched root). On kqueue/event-ports backends, which name only the changed directory and not the child entry, each directory keeps a snapshot that is diffed per notification to recover the changed name. New constructor args `debounceMs`/`maxHoldMs`/`extensions` collapse a change burst into a single `filename = null` event (true-async/server#93).
+- **`ThreadPool::reload()`** — rolling blue-green reload of a live pool's workers (fresh cohort on a new task channel, 1:1 replacements as old workers drain; ABI v0.22). Overlapping calls serialize and coalesce into one follow-up rotation; in-flight tasks always complete (true-async/server#93).
+
+### Fixed
+- **`pcntl_signal()` under a running reactor now keeps working.** A signal whose OS handler is already owned by the reactor is routed through a `zend_sigaction` delegate (ABI v0.23.0): the reactor keeps its own handler armed and forwards each delivery to the Zend handler chain, so a pcntl handler registered after the reactor starts still fires, and a pre-registered `SA_SIGINFO` handler receives a valid `siginfo` instead of a NULL that crashed. The signal's OS handler is released only once no reactor waiters and no Zend-chain subscribers remain. Tests `signal/013`–`015`.
+- **#162 `ThreadChannel`/`spawn_thread`: a worker parked on `recv()`/`send()` hung process shutdown when the owning side finished without `close()`.** A non-awaited worker thread kept the parent scheduler alive by itself, so the parent never reached shutdown, and the worker blocked forever (no output, no diagnostic). Two changes: (1) the thread completion event is now **transparent** — it only keeps the parent loop alive while a coroutine actually `await`s the thread — so a non-awaited worker no longer pins the parent, which finishes and proceeds to shutdown; (2) each thread now tracks the `ThreadChannel`s it created (thread-local, in `ASYNC_G`) and **closes them at its own shutdown**, so any worker still parked on `recv()`/`send()` wakes with `Async\ThreadChannelException` and exits. Awaited threads still block the parent as before; works for fan-out (any number of workers).
+
+### Changed
+- **phpredis async pool: `connect()`/`pconnect()` is now rejected in pool mode — configure `host`/`port` in the constructor options.** A pooled `Redis` object is a template, not a single live connection, so `connect()` has no meaning there: the pool's own connections are created elsewhere and silently ignored the `connect()` target, which dialed `127.0.0.1` and failed wherever Redis lives on a service hostname (e.g. `failed to acquire connection` inside Docker). Calling `connect()` on a pooled instance now throws `Redis::connect() is not supported in pool mode; set 'host' and 'port' in the constructor options`. Use `new Redis(['host' => 'redis', 'port' => 6379, 'pool' => [...]])`. This is consistent for both the checkout pool (`mux = 0`) and eager multiplex lanes (`mux > 0`, opened in the constructor). Fixed in phpredis `redis.c`/`redis_pool.c`; test `tests/async/008-pool_connect_host.phpt`.
+
+## [0.7.3] - 2026-06-25
+
+### Fixed
+- **`ThreadChannel`/`spawn_thread`/`ThreadPool`: object with declared-only properties wrongly rejected after `var_dump()`** — the cross-thread transfer guard rejected any object whose lazy properties table had been materialized (by `var_dump()`, `get_object_vars()`, `foreach`, array cast, etc.), reporting `Cannot transfer object with dynamic properties between threads` even when the object had no dynamic properties. The check counted every entry in `zend_object.properties`, but a materialized table stores declared properties as `IS_INDIRECT` slots into `properties_table`; it now rejects only genuine (non-indirect) dynamic properties. Regression tests `tests/thread_channel/040`–`041`, `tests/thread_pool/069`.
+
+## [0.7.2] - 2026-06-12
+
+### Fixed
+- **#161 `spawn_thread`/`ThreadPool`/`ThreadChannel`: transferred closures lost their class scope** — a `static` closure declared inside a class arrived in the worker unscoped, so its first `self::`/`static::` threw `Cannot access "self" when no class scope is active`; a `$this`-bound closure got `Z_OBJCE($this)` instead of its declaring class, breaking `self::` and private-member visibility under inheritance. The snapshot now carries `scope`/`called_scope` by name and re-resolves them in the target thread; a missing class throws `Cannot restore closure scope: class "X" not found in the target thread` instead of silently dropping the scope. Closures scoped to anonymous classes are rejected at transfer time. Tests `tests/thread/072`–`073`; `057` re-pinned to native scope semantics.
+- **ext/curl async DNS hangs on libcurl 8.20.x — `curl_exec()` / `curl_multi_*()` fail with "Resolving timed out"** — libcurl 8.20.0 replaced the per-easy-handle threaded DNS resolver with a thread **pool** owned by the multi handle that signals resolve completion through a single internal socketpair. That socketpair is **not** surfaced via `CURLMOPT_SOCKETFUNCTION`, so the async curl integration — which drives the multi handle purely with `curl_multi_socket_action()` (event-loop mode, never `curl_multi_poll`/`wait`) — never receives the resolve result: the timer callbacks keep polling `curl_multi_socket_action(CURL_SOCKET_TIMEOUT)` while the resolver thread has long finished, `running_handles` stays pinned, and DNS ends in `CURLE_OPERATION_TIMEDOUT`. Worked on ≤ 8.19 (the per-handle socketpair was exposed through the socket callback, so completion arrived as a readable event). Fixed in `curl_async.c` by running the resolver's result processing with `curl_multi_perform()` in both timer callbacks (`timer_callback`, single mode; `multi_timer_callback`, multi mode); the transfer phase is unaffected (verified: DNS, a large multi-packet download with byte-identical body, and concurrent `curl_exec`). The workaround is `#if`-scoped to the affected range only — `LIBCURL_VERSION_NUM >= 0x081400 && < 0x081500` (the 8.20 series) — so it compiles out on 8.12–8.19 (native socketpair path) and on 8.21+, where libcurl itself fixes it ([curl/curl#21476](https://github.com/curl/curl/issues/21476), *"asyn-thrdd: fix result processing without wakeup socketpair"*, for 8.21.0). Verified end-to-end by linking a libcurl 8.20.0 build (reproduces the hang; the guard's `curl_multi_perform()` resolves it) and a libcurl 8.21.0 snapshot (the guard compiles the workaround out and DNS completes via curl's own fix).
+
+## [0.7.1] - 2026-06-08
+
+### Fixed
+- **`ThreadPool` synchronous task: snapshot use-after-free when the task spawns an un-awaited coroutine** — a sync-mode task body ran inline in the worker and its per-task snapshot arena (which backs every spawned closure's op_array) was freed the instant the body returned, while a coroutine the body had spawned was still pending; running it later dereferenced freed memory (Windows debug-heap crash; ASAN-caught on Linux). The body now runs as a coroutine in its own per-task **nursery** `Scope`: `Async\spawn()` inside the body lands in that scope on its own (no scope-pointer hijacking), and on task exit the scope is cancelled and *drained* — awaited until every spawned coroutine is physically disposed — before the snapshot is freed. ABI bumped to v0.20.0: new `zend_async_scope_await_after_cancellation_fn` exposes the C core of `Scope::awaitAfterCancellation` so the worker reuses the canonical zombie-aware drain instead of hand-rolling it. Regression test `tests/thread_pool/065-task_scope_nursery_no_uaf.phpt`.
+- **`ThreadPool`: fatal in a task no longer leaves a use-after-free or a leaked libuv loop** — a fatal (e.g. OOM) in a task body now rejects the future with `ThreadTransferException` and tears the pool down cleanly. The snapshot's op_array name strings (`function_name`, `filename`) are materialized into refcounted heap strings so holders that outlive the snapshot arena (the closure, `PG(last_error_file)`) are freed by refcount instead of dangling. The `zend_bailout()` that a fatal re-raises through a parked `ThreadChannel` send/recv or the worker's slot wait is now caught so the channel/slot trigger is disposed before re-raising — an undisposed trigger's open `uv_async` would block `uv_loop_close` and leak the reactor's loop internals. Debug builds dump any libuv handle that survives reactor shutdown. Regression tests `tests/thread_pool/066`–`068`.
+- **`ThreadPool` coroutine-mode task: a fatal now reports its cause instead of resolving to `null`** — in `coroutine: true` mode a task that hit a fatal/OOM (or `exit()`/`die()`) resolved its future to a silent `null`, because the completion path only checked for a thrown exception and a bailout is not one. It now detects the bailout (no exception, `UNDEF` result) and rejects the future with a `ThreadTransferException` carrying the fatal message, matching synchronous mode. Tests `tests/thread_pool/067`, `068`.
+- **`spawn_thread`/`ThreadPool`: cross-thread use-after-free of a closure's captured-variable names** — a transferred closure's `use`-variable names were copied with `zend_string_dup()`, which returns interned strings unchanged; the variable names are interned in the parent thread, so the worker's snapshot held pointers into the parent's interned-string table. When the parent aborted/ended its request (`zend_interned_strings_deactivate`) while a worker was still building the closure, the worker read freed memory in `async_thread_create_closure` (ASAN `heap-use-after-free`). The keys are now copied into private persistent strings owned by the snapshot. Regression tests `tests/thread/050`, `052`.
+- **`TaskSet`/`TaskGroup(scope: $scope)` use-after-free on teardown** — the group held only an event refcount on a PHP-supplied scope, which is shared with coroutine bookkeeping, so a finishing coroutine could free the scope while `group->scope` still pointed at it (`task_group.c:486`, seen as `zend_mm_heap corrupted`). The group now holds a strong ref to the external Scope object for its lifetime, so the scope can't be disposed while in use. Test `tests/task_group/043-task_group_external_scope_uaf.phpt`.
+
+## [0.7.0] - 2026-06-02
+
+### Changed
+- **BREAKING — `new Scope()` defaults to Not-Safe disposal** — a user-created root `Scope` no longer sets the `DISPOSE_SAFELY` flag automatically. Calling `dispose()` on a fresh `new Scope()` now cancels its coroutines synchronously instead of letting them outlive the scope as zombies. Main scope and any `Scope::inherit(...)` chain are **unchanged** (inheritance still propagates the parent's flag; `Scope::inherit()` at the top level falls back to the main scope so it stays Safe). Migration: chain `->allowZombies()` on the constructor to keep the old behavior, e.g. `(new Scope())->allowZombies()`.
+
+### Added
+- **`Scope::allowZombies(): Scope`** — opt back into safe disposal on a scope (sets `DISPOSE_SAFELY`); returns `$this` for chaining. Inverse of the existing `asNotSafely()`. Use after `new Scope()` when the scope is expected to outlive coroutines parked in `delay()`/`recv()`/etc., turning them into zombies instead of cancelling them at dispose time.
+
+### Fixed
+- **file → socket `sendfile` silently dropped the body on Windows** — `ZEND_ASYNC_IO_SENDFILE` is documented as "Windows `TransmitFile`" (see the API entry under Added), but the implementation routed every platform through `uv_fs_sendfile`, whose Windows backend writes the destination via CRT `_write()`. A TCP destination is a Winsock `SOCKET`, not a CRT file descriptor — three distinct Windows descriptor namespaces (HANDLE / SOCKET / CRT fd) that POSIX collapses into one `int`, which is exactly why `uv_fs_sendfile(out->crt_fd, …)` works on Linux and writes nowhere on Windows. Headers (sent via `uv_write`) arrived; the file body vanished — so any static file above the 64 KiB slurp threshold served an empty/garbage body over plaintext HTTP/1 and HTTP/2. Fixed in `libuv_reactor.c`: `libuv_io_sendfile` now dispatches socket destinations to the real `TransmitFile` — destination socket from `descriptor.socket`, source as a Win32 `HANDLE` via `_get_osfhandle(crt_fd)` (never the conflated `crt_fd`-as-socket value) — run synchronously on a libuv threadpool worker (`uv_queue_work`), exactly as `uv_fs_sendfile` runs its own copy loop off-loop, so completion still arrives on the loop thread through the unchanged `sendfile_complete()` notify path. POSIX is untouched (the new path is entirely under `#ifdef PHP_WIN32`). Regression backstop: true-async/server `tests/phpt/server/static/011-static-precompressed-cache-uaf.phpt` (96 KiB precompressed sidecar over plain TCP).
+- **#154 `ThreadPool` worker crash on `exit()`/`die()` in a task or bootloader** — a graceful `exit()`/`die()` inside a submitted task or the bootloader threw an unwind-exit token that the worker either passed to `reject()` or re-raised via `zend_bailout()` — both crash the worker fiber with `"Error transfer requires a throwable value"` (assert + ASAN stack-use-after-return at `zend_fibers.c:491`). Fixed in `thread_pool.c`: the sync task call and the bootloader call now run under a `zend_try`, and the worker checks `zend_is_unwind_exit()`/`zend_is_graceful_exit()` on `EG(exception)`. Behaviour: `exit()`/`die()` in a **task** is graceful "this task is done" — the worker's request survives it, so the task's future resolves to **`null`** and the worker keeps serving subsequent tasks (verified mixing `exit()` with throwing and normal tasks on a single worker). A real fatal error (e.g. OOM `zend_bailout`) or `exit()`/`die()` in the **bootloader** instead delivers an `Async\ThreadTransferException` to pending awaiters and tears the pool down — the worker can't safely continue. Regression tests `tests/thread_pool/061-bootloader_exit.phpt`, `062-task_exit_sync.phpt`, `064-task_exit_worker_survives.phpt`.
+- **#154 `ThreadPool` swallowed the real error when a `$this`-bound bootloader could not load on the worker** — a bootloader bound to `$this` of a class not defined on the worker (or whose body threw) had its exception converted to an `E_WARNING` and discarded, while pending tasks were rejected with a generic `"task was cancelled before execution"` cancellation — hiding the cause. `thread_pool_drain_tasks` gained a `reject_with` parameter so the worker now propagates the actual error (e.g. `Cannot load transferred object: class "C" not found`, or the thrown exception) to every awaiter. Regression tests `tests/thread_pool/060-bootloader_this_transfer_error.phpt`, `063-bootloader_exception.phpt`.
+- **#146 Thread-pool task freed under a still-running worker (cross-thread UAF)** — `libuv_queue_task` took no reference on the `zend_async_task_t` it handed to `uv_queue_work`; the work wrapper held only a raw pointer. A coroutine awaiting the task that was **cancelled while the worker thread was still inside the task's `run()`** (e.g. blocked in a contended `flock()`) released its refs and freed the task — and its inline-tail data — out from under the detached worker. When the worker's syscall returned it wrote into freed memory (`heap-use-after-free in php_stdiop_flock_task_run`, `main/streams/plain_wrapper.c:1208`). Only reproducible under real multi-core scheduling (CI Linux x64 ASAN), not single-host WSL2. Fixed in `ext/async/libuv_reactor.c`: the in-flight work now owns a reference — `ZEND_ASYNC_EVENT_ADD_REF` after `uv_queue_work`, matched by `ZEND_ASYNC_EVENT_RELEASE` in `libuv_task_after_work_cb` (which libuv runs only after the worker returns). The task now outlives its worker regardless of coroutine cancellation — a general fix for every thread-pool task, not just `flock()`. This completes the earlier #146 work (inline-tail task data + pin-across-SUSPEND in php-src `plain_wrapper.c`), which was necessary but did not cover the cancel-vs-blocked-worker race. Regression backstop: the cancel-mid-flock scenarios in `fuzzy-tests/io/flock_chaos.feature`.
+- **#139 Late await() on coroutine that finished with an exception no longer double-throws** — when a coroutine body threw without an awaiter subscribed at that moment, `coroutine.c` rethrew the exception immediately into the parent frame *and* stored it on the handle. A subsequent `await($coro)` then delivered a second copy through future-replay, the catch ran, but the first copy surfaced as `Uncaught Fatal` once the catch unwound. Reworked to Future-style semantics: the exception is held on the coroutine and only surfaced (a) immediately when nobody can ever observe it — refcount ≤ 1 or `{main}` — or (b) at handle destruction via fire-and-forget safety net. Sticky observation tracked via the existing `EXC_CAUGHT` event flag, lifted from per-NOTIFY `EXCEPTION_HANDLED` after `CALLBACKS_NOTIFY` and set by `zend_async_resume_when` on every await subscription. Edge case verified: when a scope dies before its coroutine throws, child coroutines receive `AsyncCancellation` (handled by spec), so the refcount heuristic cannot misfire. Regression test `tests/coroutine/039-await_after_finished_with_exception.phpt`.
+- **#143 Async\iterate: heap-use-after-free with refcounted values/keys (e.g. generator yielding fresh strings)** — `iterate()`'s userland-callback path had two refcount bugs colliding in `ext/async/iterator.c`. (1) After `zval_ptr_dtor(&fci.params[0])` the slot was not reset to `IS_UNDEF`, so the post-loop cleanup at line 487 dtor'd the same slot a second time → UAF on the just-freed string. (2) `ZVAL_COPY_VALUE(&fci.params[1], &key)` aliased the key into params[1] without bumping refcount, but both `&key` (line 450) and `&fci.params[1]` (line 472) were dtor'd → double-free on string keys. Both bugs were silent for int values / interned-string keys (the existing 009-iterate_generator test used `'a'/'b'/'c' => 100/200/300`), so neither was caught until the chaos suite started yielding `FAST_CONCAT` strings. Surfaced as `heap-use-after-free in zend_gc_delref` from `zend_generator_free_storage` under ASAN. Fix: `ZVAL_UNDEF(&fci.params[0])` after dtor, and `ZVAL_COPY` (not `_VALUE`) for params[1] — symmetric with params[0]. Regression test `tests/iterate/015-iterate_generator_refcounted_values.phpt`.
+- **#145 curl_multi_select: heap corruption when AsyncCancellation interrupts the select** — `curl_async_select` early-returned `CURLM_INTERNAL_ERROR` on SUSPEND failure, skipping the `finally:` label that calls `zend_async_waker_clean()`. On cancel-mid-select the coroutine's resolve callback stayed subscribed to the multi event; the user's PHP `finally` then drove `curl_multi_close()` → libcurl → `multi_socket_cb(CURL_POLL_REMOVE)` → `CALLBACKS_NOTIFY` on the multi event → `async_coroutine_resume` re-pushed the still-running coroutine into the scheduler runqueue ("still in the queue" warning), and the next dequeue dereferenced its freed fcall (heap-use-after-free in `zend_call_function`). Fixed in php-src by routing the SUSPEND-failure path through `finally:` so `waker_clean()` unsubscribes before the user's finally can drive libcurl into NOTIFY. Regression test `tests/curl/069-multi_select_cancel_uaf.phpt`.
+- **curl async read: dangling subscription on stream io.event after curl_close** — `curl_async_read_dispatch` (CURLOPT_INFILE) and `curl_async_read_cb` (CURLFile) subscribed an `io_cb` on the stream's `io->event` but `curl_async_read_state_free` freed the state without calling `del_callback`. After `unset($ch); fclose($fp)` the stream's event still held the callback, fired it on the now-freed state and corrupted `zend_mm` (bin_num=8). Surfaced on musl/macOS where the allocator does not mask the UAF; on glibc it was silent. Fixed by storing `io_cb` on `state->file.io_cb` at subscription time and removing it from `io->event` in `curl_async_read_state_free` before `efree`. Reproduced in Alpine `tests/curl/028-read_file_basic.phpt` and `030-read_file_large.phpt` under DEBUG ZTS — both green after fix; full `ext/async/tests/curl/` suite 66/68 PASS (2 skipped).
+- **#144 libuv: close-mid-read leaves parked reader hung forever** — `libuv_io_close` ran `uv_read_stop` without notifying the parked `active_req`. Closing a STREAM-type IO handle (PIPE/TCP/TTY) while a coroutine was parked in `fread()` silently dropped the read watcher; the reader hung until the deadlock detector aborted the request, then UAFed on the freed stream when it finally resumed (the resource dtor had `pefree`'d both stream and abstract data while it waited). Typical trigger: `proc_open` + a coroutine reading the child's stdout pipe + another coroutine calling `proc_close`. Fixed by walking event subscribers before tearing the watcher down: `libuv_io_close` now marks the active req `io_closed`, builds an `InputOutputException`, and `ZEND_ASYNC_CALLBACKS_NOTIFY`s the event so every parked reader/writer wakes. ABI bumped to v0.19.0 — `zend_async_io_req_t` and `zend_async_udp_req_t` gained a `bool io_closed` field so consumers (`php_stdiop_read`/`php_stdiop_write` in php-src) can early-return without touching the freed stream. Regression test `tests/exec/025-proc_close_wakes_parked_fread.phpt`.
+- **OOM bailout no longer surfaces a noisy second warning** — when a coroutine body bailed out because Zend MM hit `memory_limit`, the coroutine `exit` handler ran `ZEND_ASYNC_SHUTDOWN()`. That second pass also hit OOM, was caught, and printed `Warning: A critical error was detected during the initiation of the graceful shutdown mode.` on top of the original `Fatal: Allowed memory size of N bytes exhausted`. Graceful shutdown is doomed when the allocator is still at its limit, so it's now skipped on OOM bailouts via the new `zend_alloc_pop_is_oom()` PHPAPI (php-src). Regression test `Zend/tests/fibers/gh19983.phpt` under `--asan` (`USE_TRACKED_ALLOC=1`).
+- **#141 Pool deadlock on broken-release with parked waiters** — when `beforeRelease` returned false (e.g. PDO marked the connection broken after a Toxiproxy `reset_peer`), the pool destroyed the resource and decremented `active_count` but never woke a parked waiter. The slot was conceptually free but nothing could claim it: the next acquire path requires a fresh factory call, and only a `release()` wakes waiters. With every connection in flight failing, the pool wedged until the global `Async\DeadlockError` detector fired. Fixed in `zend_async_pool_release` — after destroying a broken resource we now `pool_wake_waiter(pool)`, letting the cascade drain (each waiter retries the factory and propagates its own exception). Defensive fix in `zend_async_pool_acquire`: factory failures on the slot-reservation path now also wake one waiter and throw `PoolException` when the factory returns false silently, so the caller fails fast instead of falling through to `pool_wait_for_resource` with no one able to wake it.
+- **#138 Stop event once per waker cycle** — multiple coroutines reading the same PHP stream share one cached poll proxy; cancellation went through both `stop_waker_events` (preemptive bulk stop) and `waker_events_dtor` (per-trigger stop) and double-decremented the proxy's `loop_ref_count`. Last cancel ran the LAST-stop body and removed the proxy from the libuv poll list, leaving sibling readers parked forever. Fixed via an `events_stopped:1` bit on `zend_async_waker_t` that the dtor checks; the bit is set by `stop_waker_events` and reset by `start_waker_events`. Each trigger gained a `waker` back-pointer so the dtor reads the bit in O(1). ABI bumped to v0.18.0. See `fuzzy-tests/FINDINGS.md`.
+
+### Added
+- **#127 I/O chaos: EvilPeer + transport×logic crossing** — new `fuzzy-tests/_peers/EvilPeer.php`, a deliberately misbehaving network peer driven by a declarative fault table. Toxics: payload slicing, inter-chunk drip delay, abrupt mid-stream close (`reset`); parameters accept the seeded-random fuzz syntax (`random:N`, `1|5`). New chaos topic `fuzzy-tests/io/`: `evil_peer.feature` (sliced/dripped stream reassembled exactly), `abrupt_close.feature` (dropped connection → clean payload prefix, no hang), and `combined_chaos.feature` — **crosses transport chaos with logic chaos**: toxic-selection mutation blocks × client-logic mutation blocks × the random scheduler, all checked against a fixed payload oracle. On a failure the executor prints a **chaos event log** — the exact low-level toxic sequence the EvilPeer played out plus each client's I/O trace. Harness gains `defineEvilPeer()` + a prep-phase that binds each peer's listening socket and serves it from a coroutine.
+- **#129 I/O chaos: Toxiproxy transport-level fault injection** — new `fuzzy-tests/_peers/ToxiproxyClient.php`, a minimal HTTP-API client for [Toxiproxy](https://github.com/Shopify/toxiproxy). An EvilPeer can now be fronted by a Toxiproxy proxy (`client → proxy → peer`), injecting transport faults a pure-PHP peer cannot reproduce precisely: real bandwidth throttling, latency with jitter, TCP-segment slicing, `limit_data` byte-counted truncation, `reset_peer` timed RST. New steps `evil peer "EP" is fronted by Toxiproxy` / `Toxiproxy throttles|adds latency to|slices|cuts off|resets peer "EP" …`; new feature `fuzzy-tests/io/toxiproxy.feature`. Opt-in by design: every generated `.phpt` carries a `--SKIPIF--` probe (`SKIP_RULES['toxiproxy']`) and skips wherever no Toxiproxy admin endpoint answers — so the suite never gates per-PR CI. A dedicated `nightly-io-chaos.yml` workflow stands Toxiproxy up and runs the suite under FIFO + four random scheduler seeds. Closes the last item of #129.
+- **#107 `ThreadPool` workers auto-detect** — `workers` is optional (default `0` → `Async\available_parallelism()`).
+- **#107 `ThreadPool` `bootloader` closure** — per-worker startup hook; bootloader throw fails the pool.
+- **#107 `ThreadPool` `coroutine: true` mode** — each task runs as a coroutine in its own child scope under a per-worker pool scope; tasks may `await`/use channels/IO without blocking the worker.
+- **#105 request-level scope** — new `request_scope` field on `zend_async_scope_t`, inherited from `parent_scope`. O(1) access via `ZEND_ASYNC_REQUEST_SCOPE`. PHP: `Async\request_context(): ?Context`.
+- **Channel deadlock protection** (3 layers): per-channel `noProducerTimeout`/`noConsumerTimeout` (ms, default 5000, `hardTimeouts=false`); global resolver for soft-timer channels; owner-scope auto-close on dispose/cancel. Typed `Async\ChannelCloseReason` enum on `ChannelException::$reason`.
+- **`ThreadPool::submit_internal` (C-only)** — submit a C handler (`void (*)(zend_async_event_t*, void*)`) without the closure-snapshot pipeline; caller owns `ctx`.
+- **Cross-thread top-level zval helpers** — `zend_async_thread_{transfer,load,release_transferred}_zval_toplevel_fn` plus `ZEND_ASYNC_THREAD_*_TOPLEVEL` macros.
+- **PDO Pool: opt-in prepared-statement cache** — `PDO::ATTR_POOL_STMT_CACHE_SIZE => N`. Per-physical-conn LRU; hit reuses server-side stmt with zero wire traffic. Drivers: `pdo_pgsql`, `pdo_mysql`, `pdo_sqlite`. Plan-invalidation (PG `0A000`/`26000`; MySQL `1243`/`1615`/`2057`) handled with one transparent retry. Bypassed for `PDO_CURSOR_SCROLL`, `EMULATE_PREPARES=true`, `PGSQL_ATTR_DISABLE_PREPARES`. Measured ~2.9× on a tight `prepare+execute+fetch` loop; details in `docs/pdo-pool-stmt-cache-perf.md`.
+- **CPU usage probes** — `Async\CpuSnapshot::now()` (raw monotonic counters), `Async\cpu_usage()` (delta percentages), `Async\loadavg()` (POSIX 1/5/15-min, `null` on Windows). Linux: `clock_gettime`/`getrusage`/`/proc/stat`; Windows: `Query{Performance,Process,System}*`. ZTS-safe.
+- **`Async\available_parallelism(): int`** — CPUs usable by the process (respects cgroup quotas, affinity). Backed by `uv_available_parallelism` with `uv_cpu_info` fallback.
+- **Timer rearm API** — `zend_async_timer_rearm_fn` / `ZEND_ASYNC_TIMER_REARM`. Opt-in via `ZEND_ASYNC_TIMER_F_MULTISHOT`; multishot timers don't self-close on fire.
+- **PDO_SQLite connection pool** (`PDO::ATTR_POOL_ENABLED`) — per-coroutine `sqlite3*`. Template-registered UDFs/aggregates/collations apply to every slot; registry freezes on first acquire. Single-conn methods (`setAuthorizer`, `openBlob`, `loadExtension`) and unshareable in-memory DSNs throw. New driver hooks `pool_before_acquire`/`pool_before_release`.
+- **`TaskGroup` / `TaskSet`: `queueLimit` parameter** — backpressure for pending queue. `spawn()` suspends when limit reached. Default `null` → `2 × concurrency`; `0` = legacy unbounded; ignored when `concurrency = 0`.
+- **`Async\ThreadPool`** (new class) — pool of OS threads for PHP closures. `submit()`, `map()`, `close()` (graceful), `cancel()` (rejects backlog with `CancellationException`); counters; `Countable`.
+- **`Async\ThreadPoolException`** — thrown from `submit`/`map` when pool closed.
+- **`Async\ThreadChannel`** — thread-safe channel via deep-copy snapshot; send/recv suspend the coroutine, not the OS thread.
+- **`Async\ThreadChannelException`**.
+- **Async file → socket zero-copy** — `zend_async_io_sendfile_t` + `ZEND_ASYNC_IO_SENDFILE(out, in, offset, length)`. libuv via `uv_fs_sendfile` (Linux/BSD `sendfile`, Windows `TransmitFile`). Pure zero-copy — bypass for user-space-encrypted transports.
+- **Async `open(2)`** — `zend_async_fs_open_t` + `ZEND_ASYNC_FS_OPEN(path, flags, mode)`. Returns pending `zend_async_io_t *` immediately; thread-pool worker fills fd; libuv flips `READABLE` on completion.
+- **#125 chaos coverage: `Coroutine` introspection accessors** — new `fuzzy-tests/coroutine/introspection.feature` exercises `getSpawnFileAndLine`/`getSpawnLocation`/`getSuspendFileAndLine`/`getSuspendLocation`/`getAwaitingInfo`/`getContext`/`isQueued`/`asHiPriority` under the random scheduler. `Coroutine` API coverage now 20/20.
+- **#125 chaos coverage: `Context` get/set/has/find/unset** — new `fuzzy-tests/context/context.feature` covers per-coroutine isolation, scope inheritance (inheriting vs `*Local` accessors), local override, the `replace=false` collision throw and `unset`. New harness support: `defineContextSeed()` seeds a scope context in `run()`'s prep-phase. `Context` API coverage now 8/8.
+- **#125 chaos coverage: `TaskGroup` result accessors** — new `fuzzy-tests/task_group/getters.feature` covers `spawnWithKey` (incl. duplicate-key throw), `getResults`/`getErrors` partitioning, `suppressErrors`, the `getIterator` foreach path and the direct-call guard. `TaskGroup` API coverage now 17/17.
+- **#125 chaos coverage: `ThreadPool` counters + `Channel`/`ThreadChannel` capacity** — new `fuzzy-tests/thread_pool/counters.feature` (`getWorkerCount`/`getPendingCount`/`getRunningCount`/`getCompletedCount` drained-snapshot invariants) and `fuzzy-tests/channel/capacity.feature` (`Channel::capacity`/`ThreadChannel::capacity`).
+- **#125 chaos coverage: `Future`/`FutureState` location accessors** — new `fuzzy-tests/future/locations.feature` exercises `getCreatedFileAndLine`/`getCreatedLocation`/`getCompletedFileAndLine`/`getCompletedLocation` on both classes; inspectors race the producer.
+- **#125 chaos coverage: `TaskSet` join API** — new `fuzzy-tests/task_set/joins.feature` covers `joinAll`/`joinNext`/`joinAny` (incl. the all-fail `CompositeException` path). New harness support: `defineTaskSet()` plus a teardown dispose. `TaskSet` API coverage now 14/14.
+- **#125 chaos coverage: `Pool` + circuit breaker** — new `fuzzy-tests/pool/pool.feature` covers `acquire`/`tryAcquire`/`release`, `count`/`idleCount`/`activeCount`, the `CircuitBreaker` state machine (`getState`/`activate`/`deactivate`/`recover`) and `CircuitBreakerStrategy` (`reportSuccess`/`reportFailure`/`shouldRecover`). New harness support: `definePool()` + a `ChaosCircuitBreakerStrategy`; `coverage.php` now credits callback-interface methods implemented by the harness. `Pool` 13/13, `CircuitBreaker` 4/4, `CircuitBreakerStrategy` 3/3.
+- **#125 chaos coverage: `Scope` extras, `SpawnStrategy`, `CompositeException`, `RemoteException`** — new `fuzzy-tests/scope/extras.feature` (`asNotSafely`/`provideScope`/`getChildScopes`/`setChildScopeExceptionHandler`/`awaitAfterCancellation`/`disposeAfterTimeout`), `fuzzy-tests/spawn_with/strategy.feature` (`spawn_with` driving the `SpawnStrategy` hooks via a `ChaosSpawnStrategy`), `fuzzy-tests/exceptions/composite.feature` (`CompositeException::addException`/`getExceptions`) and a `RemoteException` scenario in `thread/spawn_thread.feature` (`getRemoteClass`/`getRemoteException`). **Chaos test API coverage now 167/167 (100%).**
+
+- **#125 CI: chaos suite runs under randomised schedulers** — `build-linux.yml` gains a step that replays the generated chaos suite under `TRUE_ASYNC_SCHED=random:{1,7,42,1337}` (ZTS non-ASAN builds), on top of the deterministic FIFO run. Catches interleaving-dependent regressions per-PR.
+- **#125 chaos coverage: cross-thread `ThreadChannel` + restored `await_any` row** — new `fuzzy-tests/thread_channel/multi_thread.feature` drives a real `spawn_thread()` worker against a `ThreadChannel` shared with the main thread (worker sends / receives / parks on a closed channel). Reinstated the `| F2 | 2 |` Examples row in `await/await_any.feature` (the issue #103 deadlock is fixed).
+- **#125 chaos harness: mutation blocks** — `.feature` scenarios can now declare `One of:` / `Any of:` step blocks; the generator expands them combinatorially into one `.phpt` per variant (capped at 20, deterministically sampled; override via `# @chaos-max N`). Mutation blocks multiply with each other and with `Examples:` rows. Lets one scenario describe a whole family of execution shapes ("create the future one way, then one thing happens to it"). Demo: `fuzzy-tests/future/mutated.feature`. Investigation notes from the chaos suite live in `fuzzy-tests/FINDINGS.md`.
+
+### Changed
+- **`TaskGroup` / `TaskSet`: `seal()` → `close()`, `isSealed()` → `isClosed()`** — renamed to align with the broader close/closed terminology used across the API. Error messages updated accordingly ("Cannot spawn tasks on a closed TaskGroup", "TaskGroup must be closed before calling awaitCompletion()"). Internal `ASYNC_TASK_GROUP_F_SEALED` flag kept as-is.
+- **ABI bumped through 0.15.0 → 0.16.0** — unified `zend_async_new_thread_pool_t` factory `(workers, queue, bootloader, coroutine_mode)` plus `concurrency` (0.16.0). Macros `ZEND_ASYNC_NEW_THREAD_POOL(w,q)` / `_EX(w,q,b,c)` cover both forms.
+- **`zend_async_io_register` extended signature** — adds `sendfile_fn` and `fs_open_fn` slots between `seek_fn` and `udp_sendto_fn`. Out-of-tree reactors must mirror.
+- **`ThreadPool::cancel()` in coroutine mode** actually kills in-flight tasks: atomic `cancel_requested` set before channel close; worker calls `ZEND_ASYNC_SCOPE_CANCEL(pool_scope, NULL, false, false)`, AFTER_MAIN cascades through child task scopes. `close()` keeps soft semantics.
+- **`fuzzy_tests/` → `fuzzy-tests/`** — directory renamed for consistency.
+- **Closures with class/function declarations rejected at thread transfer** — `spawn_thread()` / `ThreadPool::submit()` scan op_array for `ZEND_DECLARE_{CLASS,ANON_CLASS,FUNCTION}` and throw with file:line. Cached via private `fn_flags2` bit. Mirrors parallel's policy.
+
+### Performance
+- **Static TSRMLS cache for ext/async sources** — added `-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1` to `PHP_NEW_EXTENSION`. Every `EG()` / `ASYNC_G()` / `ZEND_ASYNC_G()` becomes a single `__thread` load instead of `pthread_getspecific`. Measured +32% RPS on a minimal HTTP handler.
+
+### Fixed
+- **#129 concurrent async writes to one file lost data on macOS / Windows** — the reactor dispatched every `uv_fs_write` immediately with `offset=-1`, so several writes to the same handle ran on libuv thread-pool workers at once, each reading and advancing the *shared* kernel file offset. Linux serializes that in-kernel (`f_pos_lock`); macOS and Windows do not, so concurrent writers overwrote each other and bytes were silently lost (`tests/io/083` saw 922–999 of 1000 lines). File writes are now serialized per handle: `libuv_io_write` keeps at most one `uv_fs_write` in flight and queues the rest in a FIFO (`async_io_t::write_q_*`), which `io_file_write_cb` drains one at a time on completion. The offset model is unchanged (`offset=-1`, dup'd-fd safe); exactly one write in flight makes it race-free on every platform. Stream writes (pipe/TTY/TCP via `uv_write`) were never affected — libuv already serializes those per handle. Found by the #129 I/O chaos suite running on CI.
+- **#129 concurrent async writes to one descriptor corrupted the heap** — every coroutine writing the same descriptor (e.g. several coroutines logging to `STDERR`) parked on the shared per-handle async-IO event, so any single write's completion `NOTIFY`'d them all. A spuriously woken coroutine in `php_stdiop_write()` disposed its own request while that request's `uv_write` was still in flight → libuv wrote into freed memory (heap corruption / SEGV in `uv__async_io`). `php_stdiop_write()` / `php_stdiop_read()` now re-suspend until their own request completed. Found via the #129 I/O chaos work — a new SO_LINGER hard-reset toxic in `EvilPeer` (`fuzzy-tests/io/hard_reset.feature`) exercised concurrent async writers. Regression test `tests/io/083-concurrent_async_write.phpt`. A proper per-request-event redesign that removes the broadcast entirely is tracked in #130.
+- **#129 writer hung when the peer reset the connection** — a coroutine suspended in `fwrite()` on a full send buffer (parked on `ASYNC_WRITABLE`) never woke after the peer abruptly closed the socket. libuv reports the resulting `POLLERR` as `UV_EBADF`, which `on_poll_event` turns into a bare `ASYNC_DISCONNECT`; `async_poll_notify_proxies` then woke only proxies whose mask intersected the triggered events, and a write proxy's mask is `ASYNC_WRITABLE` only (a read proxy's includes `ASYNC_DISCONNECT`, which is why reads were unaffected). A disconnect/error is now treated as terminal for the descriptor — every proxy on it is released, reader or writer. Found by the #129 `io/backpressure` chaos suite; regression test `tests/stream/046-write_wakes_on_peer_reset.phpt`.
+- **#127 `Channel(0)` split-brain: `close()` racing a parked `send()`** — on an unbuffered channel a `send()` copies its value into the rendezvous slot and parks. If `close()` ran before any receiver arrived, the parked sender was failed with the close exception — but the value was left in the slot, so a receiver running afterwards still took it. Result: the receiver got the value while `send()` threw (lost/duplicated data). `channel_close()` now rolls back an *uncommitted* rendezvous value; a *committed* one (receiver already woken) is left to complete. New `rendezvous_committed` flag tracks the woken-but-not-yet-taken window. Found by the #127 chaos suite under the random scheduler; regression test `tests/channel/069-channel0_send_close_split_brain.phpt`.
+- **#125 `Pool` leaked on a reference cycle through any callable handler** — `async_pool_get_gc()` reported only idle resources, omitting the `factory`/`destructor`/`healthcheck`/`beforeAcquire`/`beforeRelease` callables and the circuit breaker strategy object. A cycle through any of them (e.g. a factory closure capturing an object that owns the pool — including the implicit `$this` bind of a closure created inside a method) was invisible to the cycle collector and leaked the `Pool`. `get_gc` now reports all callable handlers and the strategy. Found by the #125 chaos suite; regression test `tests/pool/053-pool_gc_factory_cycle.phpt`.
+- **#125 `Scope::disposeAfterTimeout()` leaked its cancellation exception** — `scope_timeout_coroutine_entry()` created a fresh `AsyncCancellation` and passed it to `ZEND_ASYNC_SCOPE_CANCEL` with `transfer_error = false`, so ownership was never handed over and the exception was never released. Now passes `transfer_error = true`. Regression test `tests/scope/057-scope_disposeAfterTimeout_no_leak.phpt`.
+- **OpenSSL 3 per-thread RCU state leaked from every spawned worker** — `php_openssl_backend_init_libctx` creates a custom `OSSL_LIB_CTX` per worker GINIT and calls `CONF_modules_load_file_ex` on it, which allocates ~240 B per-thread RCU reader state. OpenSSL's pthread_key destructor only cleans up state allocated against the *default* libctx, so the custom-libctx state survives `OSSL_LIB_CTX_free` and the thread's natural exit. Verified standalone repro: pthread + main-thread `CONF_modules_load(NULL,...)` + worker custom libctx ⇒ 240 B leak; explicit `OPENSSL_thread_stop()` in worker ⇒ no leak. `async_thread_run` now calls `OPENSSL_thread_stop()` (weak external — no hard libcrypto dependency) before `ts_free_thread`. Not visible on Alpine/musl-libcrypto.
+- **Cross-thread snapshot leaked persistent transit memory on `$this` self-cycles** — `thread_release_transferred_object`/`_hash_table` short-circuited on `GC_DELREF > 0`, so on `$x->self = $x` the cycle back-edge kept refcount at 1 forever and `pefree` was skipped. Snapshot release is now a graph walk with a per-snapshot visited-set keyed by node address; each pemalloc-block is freed exactly once and cycles short-circuit on revisit. Build-error partial releases still go through refcount-based `thread_release_subgraph_*` helpers so xlat-shared pieces survive until the snapshot's full release. Surfaced by Alpine ASAN on test 059.
+- **Cross-thread enum cases lost singleton identity** — `Color::Green` transferred into a worker was reconstructed via the generic object-alloc path, so `$value === Color::Green` (and therefore `match`) failed in the worker because the receiving side held a fresh object instead of the canonical case. `thread_load_object_default` now detects `ZEND_ACC_ENUM` classes and resolves the canonical case by name via `zend_enum_get_case` (property 0 of the transit object is the case name); xlat is populated with the singleton so further references through the same transfer ctx return the same instance.
+- **Cross-thread object cycles deep-recursed until `THREAD_TRANSFER_MAX_DEPTH`** — `thread_transfer_object` / `thread_load_object` registered the src→dst xlat mapping *after* recursing into properties, so self-referential typed objects (`$x->self = $x`, doubly-linked nodes) looped instead of resolving the back-edge through xlat. Mapping is now installed inside the `_default` helpers right after the shallow object alloc, before property recursion. Surfaced by the new `$this` transfer with self-cycle test (053–067).
+- **`spawn_thread` SEGV when transferred closure binds `$this`** — closure was recreated in the worker with `this_ptr=NULL` while op_array still carried `ZEND_ACC_USES_THIS`; `FETCH_OBJ_R UNUSED` then dereferenced `EX(This).value.obj` as a NULL object. `$this` is now deep-copied through the same transfer ctx as `use()` vars (identity preserved when the same object is captured both ways); the worker frame is pushed with `ZEND_CALL_HAS_THIS` so `EX(This)` is set before `zend_execute_ex`. Mutations to `$this` in the worker do not propagate to the parent (thread-isolation semantics).
+- **`async_coroutine_execute` left `fiber_context->execute_data` stale after C-entry coroutine returned** — PHP-entry branch synced, C-entry branch didn't. Subsequent readers (`getTrace`, finally, scope cancel-path → `async_new_exception → zend_default_exception_new → zend_get_executed_filename_ex`) deref'd a freed frame under mixed coroutine load. Sync is now unconditional for both branches.
+- **`async_thread_run` leaked `PG(last_error_message)` across thread teardown** — if `php_request_shutdown` bailed out, `zend_first_try` caught it but `clear_last_error` never ran. Worker teardown now mirrors `clear_last_error()` unconditionally before `ts_free_thread`.
+- **`ThreadPool::submit`/`map` SEGV from non-coroutine context with full channel** — backpressure suspend deref'd NULL coroutine. Now launches the scheduler first, like `Async\spawn`.
+- **#118 curl `XFERINFOFUNCTION` / `PROGRESSFUNCTION` exception leak (macOS)** — callbacks left `EG(exception)` set; libcurl kept driving the transfer; dangling exception surfaced as Fatal at engine top-level. Both callbacks now hand off via `curl_async_event_set_callback_exception()` and return 1 to abort.
+- **#118 `getaddrinfo` event-struct leak on reactor shutdown (NTS)** — `UV_RUN_NOWAIT`-only drain didn't wait for libuv threadpool cancel-completion. Two-phase bounded drain: `UV_RUN_NOWAIT` then `UV_RUN_ONCE`. If a worker is still wedged past budget, leave the loop open (UAF > leak).
+- **#118 Tracing-JIT SEGV in `Async\Chaos` fuzz tests (`FAST_CONCAT` deref of `0x1`)** — `zend_jit_leave_func`: after `RSTORE(ZREG_FP, prev)`, `ir_GUARD*` triggered `jit_SNAPSHOT()` against the now-caller FP, materialising a callee live SSA value into a caller CV slot at the same offset → corruption. Clear callee `STACK_REF[]` before the FP swap. Writeup: `docs/118-tracing-jit-stale-fp-spill.md`.
+- **Segfault on shutdown while a spawned thread is still running** — child reached `event->notify_parent(event)` after main freed the event. `zend_async_thread_context_t` gained atomic `event` back-pointer + `event_mutex`; child stages result/exception in persistent storage and does a single locked handoff; parent's dispose stores NULL and drains the mutex before freeing. Adds `zend_atomic_ptr` type.
+- **`Async\signal()` killed worker threads** (#109) — `zend_signal_activate()` re-installed `zend_signal_handler_defer` on every `php_request_startup()`, clobbering libuv's. Now early-returns when `zend_async_reactor_is_enabled()`; `zend_sigaction` unchanged for pcntl-only flows.
+- **PDO MySQL `010-pdo_resource_cleanup` false-failed under `-jN`** (#114) — counted leaks against server-global `Threads_connected`. Replaced with process-local check via `information_schema.PROCESSLIST` for own IDs.
+- **PDO PgSQL pool leaked killed-but-idle connections** (#114) — `_pdo_pgsql_error` now treats `sqlstate=NULL && PGRES_FATAL_ERROR` as connection-level failure; new `pdo_pgsql_pool_before_acquire` runs non-blocking `PQconsumeInput`+`PQstatus` probe on hand-out.
+- **Channel(0) `send()` returned without a waiting receiver** (#108) — broke Go-style rendezvous. `send` on cap=0 now blocks in `waiting_senders` until `recv` takes the value; chain-wakes next sender to refill on consumption. `sendAsync` unchanged.
+- **`Async\Signal` enum values broken on Darwin/FreeBSD** — enum bakes Linux signums at compile time (SIGUSR1=10), BSD uses 30/31. Two `zend_always_inline` translation shims in `zend_common.h`; identity on Linux.
+- **`Async\signal()` leaked libuv signal handle when the returned Future was dropped** — `signal_cb` held a raw future pointer; dispose freed the future while signal_event stayed armed → UAF on next signal. Future now reserves `async_signal_future_extra_t`; overridden `dispose` stops the signal_event before chaining.
+- **`Channel::recvAsync()` heap corruption when the returned Future was dropped before completion** — raw `waiter->future` pointer; dropped future was freed while waiter stayed queued. Future now reserves `channel_recv_future_extra_t`; overridden `dispose` removes the waiter from `waiting_receivers` and releases the callback ref.
+- **Scheduler asserted on graceful shutdown when libuv had pending close-callbacks** — `do-while` escape valve in `fiber_entry()` exited while handles were still in `closing` state. Drain reactor up to 8 `UV_RUN_NOWAIT` ticks before the assert.
+- **`op_array_to_emalloc` didn't deep-copy `arg_info[i].type`** — class-name `zend_string` of every class typehint pointed into the parent's persistent arena. After `async_thread_snapshot_destroy`, the first `zend_call_function` hitting a class type-check read garbage as `len` → `_emalloc()` of exabytes → bailout → worker quietly retired (~175k → ~12k req/s under sustained load). New `op_array_emalloc_copy_type()` mirrors the arena path; recurses into `ZEND_TYPE_HAS_LIST`. Tests `thread_pool/029-031`.
+- **`bailout_all_coroutines` left popped coroutines flagged `WAKER_QUEUED` / `WAKER_IGNORED`** — `async_coroutine_finalize` then warned "still in the queue". Widened the predicate to the `ZEND_ASYNC_WAKER_IN_QUEUE()` macro so popped coroutines are normalised regardless of enqueue path.
+- **`active_event_count` underflow on double-stop in `EVENT_STOP_PROLOGUE`** — the prologue had a guard only for the symmetric double-start case. Second stop ran `DECREASE_EVENT_COUNT` again and "stole" from another live event → false-positive deadlock detection cancelled in-flight I/O. Early `return true` at top of prologue makes every `*_stop` idempotent. Regression: `mysqli/009-mysqli_cancellation`.
+- **Windows: TCP accept broken in `libuv_io_create()`** — TCP branch ran the incoming `io_fd` through `_get_osfhandle()`, which returns `INVALID_HANDLE_VALUE` for native `SOCKET`s. TCP/UDP path now passes the native `zend_socket_t` as-is, matching POSIX.
+- **TaskGroup owned-scope UAF on worker-thread shutdown** — owned scope's +1 refcount was consumed by the first parent `scope_dispose`; the second dispose freed the scope and `task_group_dtor_object` deref'd dangling `scope->event`. New `ZEND_ASYNC_SCOPE_F_OWNER_PINNED` flag refuses disposal in `scope_can_be_disposed()`; TaskGroup sets in `__construct` / clears in dtor. `curl_async_get_scope()` uses the same pattern.
+- **`Async\Timeout::cancel()` double-released the backing object** — `async_timeout_event_dispose()` ran `OBJ_RELEASE(object)` against a raw pointer with no matching `GC_ADDREF`. `cancel()` now clears `timeout_ext->std` before dispose.
+- **`pool_strategy_report_failure()` captured a dangling exception pointer** — `zend_throw_exception` + immediate `zend_clear_exception` freed the exception; the subsequent `ZVAL_OBJ(&error_zval, ex)` captured a dangling ptr → `zend_mm_heap corrupted`. Now constructs via `object_init_ex(zend_ce_exception)` + property update; explicit `zval_ptr_dtor` after the report.
+- **`Async\Scope::disposeAfterTimeout()` leaked scope refcount** — timer callback bumped `ref_count` but nothing released it. Replaced raw `ref_count++` with `ZEND_ASYNC_EVENT_ADD_REF`; new `scope_timeout_callback_dispose` releases on free-without-fire; fire path transfers ownership to the cancellation coroutine which releases after `SCOPE_CANCEL`.
+- **`Async\CompositeException` wrote to hard-coded `properties_table[7]`** — the slot didn't match the inherited layout. Read/write `$exceptions` via `zend_read_property`/`zend_update_property` by name. `getExceptions()` uses `BP_VAR_IS` so an empty composite returns `[]` instead of the typed-uninit fatal.
+- **`TaskGroup::all()` / `race()` / `any()` UAF in synchronous-settled path** — sync paths created a waiter via `task_group_waiter_future_new()` but never removed it from `waiter_events[]`. Shutdown's force-dispose `efree`'d the waiter; later Future-wrapper release touched freed memory. Added `task_group_waiter_event_remove(waiter)` at the end of each sync-resolve branch.
+- **`Thread::finally()` on a still-running thread NULL-scope crash** — `async_call_finally_handlers()` deref'd NULL `context->scope`. Thread now captures `ZEND_ASYNC_CURRENT_SCOPE` at spawn (`async_thread_object_t::parent_scope`) holding an event refcount; dtor passes it to the finally dispatcher. Added `thread_finally_handlers_dtor()` to pair `GC_ADDREF`/`OBJ_RELEASE` (fixes 72-byte leak per dtor-time finally).
+
+## [0.6.7] - 2026-04-13
+
+### Added
+- **PDO Pool: `getAttribute()` support for pool attributes**: `$pdo->getAttribute(PDO::ATTR_POOL_ENABLED)` now returns `true`/`false` depending on whether the connection pool is active. `PDO::ATTR_POOL_MIN` and `PDO::ATTR_POOL_MAX` return the configured pool size limits (or `false` when pooling is disabled). `PDO::ATTR_POOL_HEALTHCHECK_INTERVAL` is a construction-only attribute and raises an error if read at runtime.
+
+### Fixed
+- **Heap-use-after-free in `await_all()`/`await_*()` with string keys**: When any `await_*` function received an array with non-interned string keys (e.g. from `json_decode()` or `str_repeat()`), the returned results/errors arrays had incorrect refcount on those keys. The root cause: `async_waiting_callback_dispose` was called twice per callback (once from `zend_async_callbacks_remove` during `del_callback`, once from `ZEND_ASYNC_EVENT_CALLBACK_RELEASE`), but did not check `ref_count` — it unconditionally called `zval_ptr_dtor` on the key each time, decrementing the string refcount twice instead of once. When the calling function's local variables were freed (`i_free_compiled_variables`), the already-freed string was accessed again — heap-use-after-free. Fixed by adding ref_count guard to `async_waiting_callback_dispose`: when `ref_count > 1`, decrement and return without touching resources; only perform cleanup on the final dispose (`ref_count == 1`).
+
+## [0.6.6] - 2026-04-03
+
+### Added
+- **PDO Pool: broken connection detection**: Pooled connections that lose server contact or get interrupted (e.g. cancelled coroutine, server restart, DBA kill) are now automatically detected and destroyed instead of being returned to the pool. This prevents the next coroutine from receiving a broken connection ("MySQL server has gone away", "another command is already in progress"). Works for both MySQL and PostgreSQL.
+- **PDO Pool: transparent reconnect after broken connection**: When a coroutine catches an error from a broken connection and retries a query on the same `$pdo`, the pool automatically discards the broken connection and acquires a fresh one. No manual reconnection needed.
+- **PDO Pool: error state isolation between coroutines**: `$pdo->errorCode()` and `$pdo->errorInfo()` no longer leak error state from one coroutine to another. Each coroutine sees only its own errors.
+- **PDO Pool: `errorCode()` returns `"00000"` on first query**: Previously could return `NULL` when multiple coroutines ran their first query concurrently on fresh connections.
+
+### Fixed
+- **Heap-use-after-free in DNS resolve on cancellation**: When a coroutine was cancelled while a DNS resolve (`gethostbyname`, database connect) was in flight, the DNS event memory was freed immediately in `dispose()` while the libuv thread pool callback was still pending. When libuv later invoked the callback, it accessed freed memory — crash or corruption. Fixed by deferring the free to the libuv callback itself: `dispose()` sets a `DISPOSE_PENDING` flag and the callback checks it on completion, taking ownership of the memory cleanup.
+- **Pool `max_size` not enforced during concurrent connection creation**: When multiple coroutines tried to open connections simultaneously (e.g. on application startup), the pool could create more connections than `max_size` allowed. Now the limit is strictly enforced — excess coroutines wait until a connection becomes available.
+- **`Scope::awaitCompletion()` not marking cancellation Future as used**: The cancellation token passed to `awaitCompletion()` was never marked with `RESULT_USED` / `EXC_CAUGHT`, causing a spurious "Future was never used" warning when the Future was destroyed. Additionally, early return paths (scope already finished, closed, or cancelled) skipped the marking entirely. Fixed by setting flags immediately after parameter parsing, before any early returns.
+- **`Scope::awaitAfterCancellation()` not marking cancellation Future as used**: Same issue as `awaitCompletion()` — the optional cancellation Future was only marked when the method reached `resume_when`, but early returns bypassed it. Fixed identically.
+- **Heap-use-after-free in `stream_socket_accept()` during coroutine cancellation**: When a coroutine blocked in `stream_socket_accept()` was cancelled during graceful shutdown, `network_async_accept_incoming()` extracted the exception's message string into `*error_string` without incrementing its refcount (`*error_string = Z_STR_P(message)`). The caller then called `zend_string_release_ex()`, freeing the string while the exception object still referenced it. On exception destruction, `zend_object_std_dtor` accessed the freed string — heap-use-after-free. Fixed by using `zend_string_copy()` to properly addref the borrowed string. Same bug existed in the synchronous path `php_network_accept_incoming_ex()` in `main/network.c` — fixed there too.
+
+## [0.6.5] - 2026-03-29
+
+### Changed
+- **ZEND_ASYNC_SUSPEND** No longer throws an error when called with an empty array of events.
+- **Waker inline storage optimization**: Embedded 2 trigger slots and 2 callback slots directly into the Waker struct, eliminating heap allocations for the most common case (1-2 events per await). Uses `capacity == 0` to mark inline triggers and `base.callback == NULL` to mark free inline callback slots. When more than 1 callback per event is needed, the inline trigger automatically promotes to a heap-allocated one. Benchmarks show ~3× speedup across all hot paths (`await`: 2.13 → 0.67 μs, `await_all` x2: 3.88 → 1.38 μs, Channel: 1.48 → 0.50 μs) with zero memory overhead.
+- **Adaptive fiber pool sizing**: The fiber context pool now grows dynamically based on coroutine queue pressure instead of being limited to a fixed size of 4. When demand exceeds the pool (queue size > pool count), the pool grows via `circular_buffer_push_ptr_with_resize`. When demand is low, excess fibers are destroyed instead of returned to the pool. A minimum of 4 fibers (`ASYNC_FIBER_POOL_SIZE`) is always retained. This eliminates costly fiber create/destroy cycles under bursty workloads, yielding a 10–15% improvement in context switch throughput (10k coroutines × 10 suspends: 490 → 566 switches/ms).
+
+### Fixed
+- **SIGSEGV in pool healthcheck callback**: The healthcheck timer callback was registered by casting the pool pointer directly to `zend_async_event_callback_t`, corrupting the pool's event structure fields and leaving the `dispose` function pointer uninitialized. When the pool was closed, `zend_async_callbacks_free` called the garbage dispose pointer, causing a segfault. Fixed by embedding a proper `zend_async_event_callback_t` inside `async_pool_t` and using `offsetof` to recover the pool pointer in the callback.
+- **`proc_close()` crash when child process already reaped**: When a child process was killed by a signal and its zombie was reaped externally (e.g. by a host runtime calling `waitpid(-1)`), `async_wait_process()` fell through to `libuv_process_event_start()` which threw `AsyncException: Failed to monitor process N: No child processes`. Fixed by handling `ECHILD` in both `async_wait_process()` (early return) and `libuv_process_event_start()` (treat as exited with unknown status).
+- **Pool acquire with failed factory caused use-after-free**: When `pool_create_resource()` threw an exception, `zend_async_pool_acquire()` fell through to `pool_wait_for_resource()` with a live `EG(exception)`, registering a coroutine callback on the pool event. At shutdown, the coroutine was freed first, leaving a dangling pointer that `pool_dispose` tried to dereference. Fixed by checking `EG(exception)` after factory failure and returning immediately.
+- **Missing exception checks in pool error paths**: `pool_destroy_resource()` and `pool_create_resource()` exceptions were not checked in healthcheck loop, `beforeAcquire` failure path, and `try_acquire`. Added `EG(exception)` checks to break/return on error instead of continuing with live exceptions.
+- **Pool close now chains destructor exceptions via `previous`**: When multiple resource destructors throw during `pool->close()`, all resources are still destroyed and exceptions are chained using `zend_exception_set_previous()` so no error is silently lost.
+- **Pool destructor exceptions now propagate**: Resource destructor exceptions were silently discarded by `zend_clear_exception()`. Removed the suppression so exceptions propagate normally to the caller.
+
+## [0.6.4] - 2026-03-25
+
+### Fixed
+- **NULL `driver_data` crash in PDO PgSQL pool mode**: `pgsql_stmt_execute()` called `in_transaction()` on `stmt->dbh`, which in pool mode is the template PDO object with `driver_data == NULL`. This caused a segfault when dereferencing `H->server` via `PQtransactionStatus()`. Fixed by using `stmt->pooled_conn` (the actual pooled connection) when available.
+
+## [0.6.3] - 2026-03-25
+
+### Fixed
+- **`Scope::awaitCompletion()` ignoring completion**: `async_scope_notify_coroutine_finished()` was missing the call to `scope_check_completion_and_notify()`, so `awaitCompletion()` never woke up when all coroutines finished and always waited until the timeout expired.
+- **`Scope::awaitAfterCancellation()` cleanup**: Replaced `zend_async_waker_clean()` with `ZEND_ASYNC_WAKER_DESTROY()` on error paths, and switched to checking the return value of `zend_async_resume_when()` instead of `EG(exception)`.
+- **Negative stream timeout causing poll event leak**: When a stream context timeout was negative (e.g. `PHP_INT_MIN`), the signed `tv_sec` overflowed to a huge positive value when cast to `zend_ulong` milliseconds. This created an async waker with a timer event that held an extra reference to the poll event (refcount 3 instead of 2), causing it to leak. Fixed by checking `tv_sec < 0` before the conversion and falling back to synchronous `php_pollfd_for()`.
+
+## [0.6.2] - 2026-03-24
+
+### Added
+- **Non-blocking `flock()`**: `flock()` no longer blocks the event loop. The lock operation is offloaded to the libuv thread pool via `zend_async_task_t`, allowing other coroutines to continue executing while waiting for a file lock.
+- **`zend_async_task_new()` API**: New factory function for creating thread pool tasks, registered through the reactor like timer and IO events. Replaces manual `pecalloc` + field initialization.
+
+### Fixed
+- **`await_*()` deadlock with already-completed awaitables**: When a coroutine or Future passed to `await_all()`, `await_any_or_fail()`, or other `await_*()` functions had already completed, it was skipped entirely (`ZEND_ASYNC_EVENT_IS_CLOSED` → `continue`), but `resolved_count` was never incremented. Since `total` still counted the skipped awaitable, `resolved_count` could never reach `total`, causing a deadlock. Fixed by using `ZEND_ASYNC_EVENT_REPLAY` to synchronously replay the stored result/exception through the normal callback path, correctly updating all counters. Additionally, when replay satisfies the waiting condition early (e.g. `await_any_or_fail` needs only one result), the loop now breaks immediately instead of subscribing to remaining awaitables and suspending unnecessarily.
+
+## [0.6.1] - 2026-03-15
+
+### Fixed
+- **`feof()` on sockets unreliable on Windows**: `WSAPoll(timeout=0)` fails to detect FIN packets on Windows, causing `feof()` to return false on closed sockets. Fixed by skipping poll for liveness checks (`value==0`) and going directly to `recv(MSG_PEEK)`. On Windows, `MSG_DONTWAIT` is unavailable, so non-blocking mode is temporarily toggled via `ioctlsocket`. Errno is saved immediately after `recv` because `ioctlsocket` clears `WSAGetLastError()`. Shared logic extracted into `php_socket_check_liveness()` in `network_async.c` to eliminate duplication between `xp_socket.c` and `xp_ssl.c`.
+- **Pipe close error on Windows**: `php_select()` incorrectly skipped signaled pipe handles when `num_read_pipes >= n_handles`, causing pipe-close events to be missed and `proc_open` reads to hang. Fixed by removing the `num_read_pipes < n_handles` guard so `PeekNamedPipe` is always called for signaled handles.
+
+## [0.6.0] - 2026-03-14
+
+### Fixed
+- **Async file IO position tracking**: Replaced bare `lseek`/`_lseeki64` with `zend_lseek` across reactor. Rewrote `libuv_io_seek` to accept `whence` and return position, eliminating double lseek in `php_stdiop_seek`. Fixed append-mode offset init and fseek behavior. On Windows, append writes now query real EOF via `lseek(SEEK_END)` before dispatch to avoid stale cached offsets.
+- **Windows concurrent append (XFAIL)**: On Windows, `WriteFile` via libuv ignores CRT `_O_APPEND` because `FILE_WRITE_DATA` coexists with `FILE_APPEND_DATA` on the HANDLE. Removing `FILE_WRITE_DATA` would fix atomic append but breaks `ftruncate`/`SetEndOfFile`. Concurrent append from multiple coroutines remains a known limitation (test 069 marked XFAIL).
+- **Reactor deadlock on pending file I/O requests**: `uv_fs_read`, `uv_fs_write`, `uv_fs_fsync`, and `uv_fs_fstat` are libuv requests (not handles) that keep `uv_loop_alive()` true but were invisible to `ZEND_ASYNC_ACTIVE_EVENT_COUNT`. The reactor loop exited prematurely (`has_handles && active_event_count > 0` → false) while file I/O callbacks were still pending, causing deadlocks in async file writes (e.g. `CURLOPT_FILE` with async I/O). Fixed by adding `ZEND_ASYNC_INCREASE_EVENT_COUNT` after successful `uv_fs_*` submission and `ZEND_ASYNC_DECREASE_EVENT_COUNT` in their completion callbacks (`io_file_read_cb`, `io_file_write_cb`, `io_file_flush_cb`, `io_file_stat_cb`).
+- **Generator segfault in fiber-coroutine mode**: Generators running inside fiber coroutines were not marked with `ZEND_GENERATOR_IN_FIBER` because `EG(active_fiber)` is not set in coroutine mode. This caused shutdown destructors to close generators while the coroutine was still suspended, leading to a NULL `execute_data` dereference in `zend_generator_resume`. Fixed by also checking `ZEND_ASYNC_CURRENT_COROUTINE` with `ZEND_COROUTINE_IS_FIBER` when setting the `IN_FIBER` flag on generators.
+
+### Added
+- **`Async\OperationCanceledException`**: New exception class extending `AsyncCancellation`, thrown when an awaited operation is interrupted by a cancellation token. The original exception from the token is always available via `$previous`. This allows distinguishing token-triggered cancellations from exceptions thrown by the awaitable itself. Affects all cancellable APIs: `await()`, `await_*()` family, `Future::await()`, `Channel::send()`/`recv()`, `Scope::awaitCompletion()`/`awaitAfterCancellation()`, and `signal()`.
+- **TaskGroup** (`Async\TaskGroup`): Task pool with queue, concurrency control, and structured completion via `all()`, `race()`, `any()`, `awaitCompletion()`, `cancel()`, `seal()`, `finally()`, and `foreach` iteration
+- **TaskSet** (`Async\TaskSet`): Mutable task collection with automatic cleanup semantics. Completed entries are removed after results are consumed. Provides `joinNext()`, `joinAny()`, `joinAll()` methods (replacing `race()`/`any()`/`all()` with join semantics), plus `foreach` iteration with per-entry cleanup.
+- **Deadlock diagnostics** (`async.debug_deadlock` INI option): When enabled (default: on), prints detailed diagnostic info on deadlock detection — coroutine list with spawn/suspend locations and the events each coroutine is waiting for. All event types now implement `info` method for human-readable descriptions.
+- **TCP/UDP Socket I/O**: Efficient non-blocking TCP/UDP socket functions without poll overhead via libuv handles. Includes `sendto`/`recvfrom` for UDP, socket options API (`broadcast`, `multicast`, TCP `nodelay`/`keepalive`), and unified close callback for all I/O handle types.
+- **Async File and Pipe I/O**: Non-blocking I/O for plain files and pipes via `php_stdiop_read`/`php_stdiop_write` async path. Supported functions: `fread`, `fwrite`, `fseek`, `ftell`, `rewind`, `fgets`, `fgetc`, `fgetcsv`, `fputcsv`, `ftruncate`, `fflush`, `fscanf`, `file_get_contents`, `file_put_contents`, `file()`, `copy`, `tmpfile`, `readfile`, `fpassthru`, `stream_get_contents`, `stream_copy_to_stream`
+- **Pipe/Stream Read Timeout**: `stream_set_timeout()` now works for pipe streams (`proc_open` pipes, TTY). In async mode, timeout is enforced via waker timer competing with IO event — whoever fires first wins. `stream_get_meta_data()['timed_out']` correctly reports timeout state. The pipe handle remains usable after timeout. Also fixed `libuv_io_event_stop` to properly cancel pending reads via `uv_read_stop` without destroying the handle.
+- **Async IO Seek API**: `ZEND_ASYNC_IO_SEEK` for syncing libuv file offset after `fseek`/`rewind`
+- **Async IO Append Flag**: `ZEND_ASYNC_IO_APPEND` flag for correct append-mode file offset initialization
+- **Future Support**: Full Future/FutureState implementation with `map()`, `catch()`, `finally()` chains and proper flag propagation
+- **Channel**: CSP-style message passing between coroutines with buffered/unbuffered modes, timeout support, and iterator interface
+- **Pool**: Resource pool implementation with CircuitBreaker pattern support
+  - `Async\Pool` class for managing reusable resources (connections, handles, etc.)
+  - Configurable min/max pool size with automatic pre-warming
+  - `acquire()` / `tryAcquire()` / `release()` methods for resource management
+  - Blocking acquire with timeout support in coroutine context
+  - Callbacks: `factory`, `destructor`, `healthcheck`, `beforeAcquire`, `beforeRelease`
+  - `CircuitBreakerInterface` implementation with state management (ACTIVE/INACTIVE/RECOVERING)
+  - `CircuitBreakerStrategyInterface` for custom recovery strategies
+  - `ServiceUnavailableException` when circuit breaker is INACTIVE
+  - C API: `ZEND_ASYNC_NEW_POOL()`, `ZEND_ASYNC_POOL_ACQUIRE()`, etc. macros for internal use
+- **TrueAsync ABI**: Extended `zend_async_API.h` with Pool support
+  - Added `zend_async_pool_t` structure with CircuitBreaker state
+  - Added `zend_async_circuit_state_t` enum and strategy types
+  - Added Pool API function pointers and registration mechanism
+  - Added `ZEND_ASYNC_CLASS_POOL` and `ZEND_ASYNC_EXCEPTION_SERVICE_UNAVAILABLE` to class enum
+- **PDO Connection Pooling**: Transparent connection pooling for PDO with per-coroutine dispatch and automatic lifecycle management
+- **PDO PgSQL**: Non-blocking query execution for PostgreSQL PDO driver
+- **PostgreSQL**: Concurrent `pg_*` query execution with separate connections per async context
+- **`Async\iterate()` function**: Iterates over an iterable, calling the callback for each element with optional concurrency limit. Supports `cancelPending` parameter (default: `true`) that controls whether coroutines spawned inside the callback are cancelled or awaited after iteration completes.
+- **`Async\FileSystemWatcher` class**: Persistent filesystem watcher with `foreach` iteration support, suspend/resume on new events, two storage modes (coalesce with HashTable deduplication, raw with circular buffer), `close()`/`isClosed()` lifecycle, and `Awaitable` interface via `ZEND_ASYNC_EVENT_REF_FIELDS` pattern. Replaces the one-shot `Async\watch_filesystem()` function.
+- **`Async\signal()` function**: One-shot signal handler that returns a `Future` resolved when the specified signal is received. Supports optional `Cancellation` for early cancellation.
+- **Acting coroutine for error context** (`zend_async_globals_t.acting_coroutine`): New field in async globals that allows scheduler-context code to attribute errors to a suspended coroutine. When set, `zend_get_executed_filename_ex()`, `zend_get_executed_lineno()`, and `get_active_function_name()` in `Zend/zend_execute_API.c` fall back to the coroutine's suspended `execute_data` for file, line, and function name. Zero-cost: the execute_data is only read when an error actually occurs. Macros: `ZEND_ASYNC_ACTING_COROUTINE`, `ZEND_ASYNC_ACT_AS_START(coroutine)`, `ZEND_ASYNC_ACT_AS_END()`.
+
+### Changed
+- **Bailout handling**: Added `ZEND_ASYNC_EVENT_F_BAILOUT` flag (bit 11) on `zend_async_event_t`. During bailout (e.g. OOM), PHP-level handlers are no longer called — finally handlers on coroutines and scopes are destroyed without execution, scope exception handlers (`try_to_handle_exception`) are skipped. C-level callbacks (`ZEND_ASYNC_CALLBACKS_NOTIFY`) continue to work normally. Convenience macros: `ZEND_COROUTINE_SET_BAILOUT`/`ZEND_COROUTINE_IS_BAILOUT`, `ZEND_ASYNC_SCOPE_SET_BAILOUT`/`ZEND_ASYNC_SCOPE_IS_BAILOUT`.
+- **Removed "Graceful shutdown mode" warning**: The `Warning: Graceful shutdown mode was started` message is no longer emitted during bailout (OOM/stack overflow). The graceful shutdown still happens, but without the warning output.
+- **Breaking Change: `onFinally()` renamed to `finally()`** on both `Async\Coroutine` and `Async\Scope` classes,
+  aligning with the Promise/A+ convention (`.then()`, `.catch()`, `.finally()`).
+  - **Migration**: Replace `->onFinally(function() { ... })` with `->finally(function() { ... })`.
+- **Breaking Change: `Async\CancellationError` renamed to `Async\AsyncCancellation`** and now extends `\Cancellation` instead of `\Error`.
+  `\Cancellation` is a new PHP core root class implementing `\Throwable` (alongside `\Exception` and `\Error`), added per the [True Async RFC](https://wiki.php.net/rfc/true_async).
+  This prevents cancellation exceptions from being accidentally caught by `catch(\Exception)` or `catch(\Error)` blocks.
+  - **Migration**: Replace `catch(Async\CancellationError $e)` with `catch(Async\AsyncCancellation $e)` or `catch(\Cancellation $e)` for broader matching.
+- **Hidden Events**: Added `ZEND_ASYNC_EVENT_F_HIDDEN` flag for events excluded from deadlock detection
+- **Scope `can_be_disposed` API**: Exposed `scope_can_be_disposed` as a virtual method on `zend_async_scope_t`, enabling scope completion checks from the Zend API via `ZEND_ASYNC_SCOPE_IS_COMPLETED`, `ZEND_ASYNC_SCOPE_IS_COMPLETELY_DONE`, and `ZEND_ASYNC_SCOPE_CAN_BE_DISPOSED` macros.
+- **TaskGroup completion semantics**: `ASYNC_TASK_GROUP_F_COMPLETED` flag is now set only when the group is both sealed and all tasks are settled. `finally()` handlers fire only in this terminal state. Calling `finally()` on an already-completed group invokes the callback synchronously.
+
+### Fixed
+- **exec() output not split into lines in async path**: The libuv read callback delivered raw byte chunks to the output array instead of splitting by newlines and stripping trailing whitespace like the POPEN path does. Implemented an on-the-fly line parser with zero-copy optimization and 8 KB reusable buffer (doubling strategy). Uses `memchr()` for SIMD-accelerated newline scanning. Fully matches POPEN path behavior including `isspace()` trailing whitespace stripping.
+- **exec() exit code race condition**: Pipe EOF notification (`exec_read_cb`) often arrived before `exec_on_exit`, waking the coroutine with `exit_code` still 0. Fixed by making `exec_on_exit` the sole notification point.
+- **exec() not routed through async path**: Changed routing condition from `ZEND_ASYNC_IS_ACTIVE` to `ZEND_ASYNC_ON` + `ZEND_ASYNC_SCHEDULER_INIT()` so exec functions use the async path when the scheduler is available.
+- **Deadlock in `proc_close()` when spawning many concurrent processes on Windows**: Windows Job Objects send `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` in addition to `JOB_OBJECT_MSG_EXIT_PROCESS` for every single-process job that exits. The IOCP watcher thread was treating both messages as process-exit events, pushing the same `process_event` to `pid_queue` twice and decrementing `countWaitingDescriptors` an extra time per process. With enough concurrent processes, the counter reached zero prematurely, triggering `libuv_stop_process_watcher()` too early and destroying `pid_queue` — leaving coroutines suspended in `proc_close()` with no event to wake them. Fixed by ignoring `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` in the switch statement since it always accompanies `EXIT_PROCESS` for single-process jobs.
+- **Use-after-free in `zend_exception_set_previous` calls**: When `exception == add_previous` (same object), `zend_exception_set_previous` calls `OBJ_RELEASE` which frees the object while other pointers (e.g. `EG(exception)`) still reference it. Added identity checks before all `zend_exception_set_previous` calls where the two arguments could alias the same object. Affected files: `scheduler.c`, `exceptions.c`, `zend_common.c`, `future.c`.
+- **Memory leak of `Async\DeadlockError` in scheduler fiber exit path**: In `fiber_entry`, when the scheduler fiber finalized, `exit_exception` from `ZEND_ASYNC_EXIT_EXCEPTION` was not propagated when `EG(exception) == NULL` — the exception was silently lost. Added `async_rethrow_exception(exit_exception)` for this case.
+- **stream_select() ignoring PHP-buffered data in async context**: When `fgets()`/`fread()` pulled more data into PHP's internal stream buffer than returned, a subsequent `stream_select()` would not detect the buffered data because the async path (libuv poll) only checks OS-level file descriptors. This caused hangs in `run-tests.php -j` parallel workers on macOS where TCP delivered multiple messages in a single segment. Fixed by checking `stream_array_emulate_read_fd_set()` before entering the async poll path.
+- **Waker events not cleaned when coroutine is resumed outside scheduler context**: When a coroutine was resumed directly (not from the scheduler), its waker events were not automatically cleaned up, which could lead to stale event references. Now `ZEND_ASYNC_WAKER_CLEAN_EVENTS` is called on resume outside the scheduler.
+- **False deadlock detection after coroutine execution**: The `has_handles` flag from `ZEND_ASYNC_REACTOR_EXECUTE` was evaluated before coroutines ran but checked after, causing false deadlock when coroutines created new I/O handles between those points. Added `ZEND_ASYNC_REACTOR_LOOP_ALIVE()` check to deadlock conditions for accurate state at decision time.
+- **TaskSet auto-cleanup race condition**: Completed task entries were removed unconditionally in `task_group_try_complete()`, even when no consumer had requested results. This caused `joinAll()`/`joinNext()`/`joinAny()` to return empty results when called after tasks had already completed. Fixed by deferring cleanup to the point of actual result delivery — per-entry removal in `race()`/`any()`/iterator callbacks, and bulk cleanup in `all()` after results are collected.
+
+## [0.5.0] - 2025-12-24
+
+### Added
+- **Fiber Support**: Full integration of PHP Fibers with TrueAsync coroutine system
+  - `Fiber::suspend()` and `Fiber::resume()` work in async scheduler context
+  - `Fiber::getCoroutine()` method to access fiber's coroutine
+  - Fiber status methods (isStarted, isSuspended, isRunning, isTerminated)
+  - Support for nested fibers and fiber-coroutine interactions
+  - Comprehensive test coverage for all fiber scenarios
+- **TrueAsync API**: Added `ZEND_ASYNC_SCHEDULER_LAUNCH()` macro for scheduler initialization
+- **TrueAsync API**: Updated to version 0.8.0 with fiber support
+- **TrueAsync API**: Added customizable scheduler heartbeat handler mechanism with `zend_async_set_heartbeat_handler()` API
+
+### Fixed
+- **Critical GC Bug**: Fixed garbage collection crash during coroutine cancellation when exception occurs in main coroutine while GC is running
+- Fixed double free in `zend_fiber_object_destroy()`
+- Fixed `stream_select()` for `timeout == NULL` case in async context
+- Fixed fiber memory leaks and improved GC logic
+
+### Changed
+- **Deadlock Detection**: Replaced warnings with structured exception handling
+  - Deadlock detection now throws `Async\DeadlockError` exception instead of multiple warnings
+  - **Breaking Change**: Applications relying on deadlock warnings
+  will need to be updated to catch `Async\DeadlockError` exceptions
+- **Breaking Change: PHP Coding Standards Compliance** - Function names updated to follow official PHP naming conventions:
+  - `spawnWith()` → `spawn_with()`
+  - `awaitAnyOrFail()` → `await_any_or_fail()`
+  - `awaitFirstSuccess()` → `await_first_success()`
+  - `awaitAllOrFail()` → `await_all_or_fail()`
+  - `awaitAll()` → `await_all()`
+  - `awaitAnyOfOrFail()` → `await_any_of_or_fail()`
+  - `awaitAnyOf()` → `await_any_of()`
+  - `currentContext()` → `current_context()`
+  - `coroutineContext()` → `coroutine_context()`
+  - `currentCoroutine()` → `current_coroutine()`
+  - `rootContext()` → `root_context()`
+  - `getCoroutines()` → `get_coroutines()`
+  - `gracefulShutdown()` → `graceful_shutdown()`
+  - **Rationale**: Compliance with [PHP Coding Standards](https://github.com/php/policies/blob/main/coding-standards-and-naming.rst) - functions must use lowercase with underscores
+
+## [0.4.0] - 2025-09-30
+
+### Added
+- **UDP socket stream support for TrueAsync**
+- **SSL support for socket stream**
+- **Poll Proxy**: New `zend_async_poll_proxy_t` structure for optimized file descriptor management
+    - Efficient caching of event handlers to reduce EventLoop creation overhead
+    - Poll proxy event aggregation and improved lifecycle management
+
+### Fixed
+- **Fixing `ref_count` logic for the `zend_async_event_callback_t` structure**:
+    - The add/dispose methods correctly increment the counter
+    - Memory leaks fixed
+- Fixed await iterator logic for `awaitXXX` functions
+- Fixed process waiting logic for UNIX-like systems
+
+### Changed
+- **Memory Optimization**: Enhanced memory allocation for async structures
+    - Optimized waker trigger structures with improved memory layout
+    - Enhanced memory management for poll proxy events
+    - Better resource cleanup and lifecycle management
+- **Event Loop Performance**: Major scheduler optimizations
+    - **Automatic Event Cleanup**: Added automatic waker event cleanup when coroutines resume (see `ZEND_ASYNC_WAKER_CLEAN_EVENTS`)
+    - Separate queue implementation for resumed coroutines to improve stability
+    - Reduced unnecessary LibUV calls in scheduler tick processing
+- **Socket Performance**:
+    - Event handler caching for sockets to avoid constant EventLoop recreation
+    - Optimized `network_async_accept_incoming` to try `accept()` before waiting
+    - Enhanced stream_select functionality with event-driven architecture
+    - Improved blocking operation handling with boolean return values
+- **TrueAsync API Performance**: Optimized execution paths by replacing expensive `EG(exception)` checks with direct `bool` return values across all async functions
+- Upgrade `LibUV` to version `1.45` due to a timer bug that causes the application to hang
+
+## [0.3.0] - 2025-07-16
+
+### Added
+- Docker support with multi-stage build (Ubuntu 24.04, libuv 1.49, curl 8.10)
+- PDO MySQL and MySQLi async support
+- **TrueAsync API Extensions**: Enhanced async API with new object creation and coroutine grouping capabilities
+    - Added `ZEND_ASYNC_NEW_GROUP()` API for creating CoroutineGroup objects for managing multiple coroutines
+    - Added `ZEND_ASYNC_NEW_FUTURE_OBJ()` and `ZEND_ASYNC_NEW_CHANNEL_OBJ()` APIs for creating Zend objects from async primitives
+    - Extended `zend_async_task_t` structure with `run` method for thread pool task execution
+    - Enhanced `zend_async_scheduler_register()` function with new API function pointers
+- **Multiple Callbacks Per Event Support**: Complete redesign of waker trigger system to support multiple callbacks on a single event
+    - Modified `zend_async_waker_trigger_s` structure to use flexible array member with dynamic capacity
+    - Added `waker_trigger_create()` and `waker_trigger_add_callback()` helper functions for efficient memory management
+    - Implemented single-block memory allocation for better performance (trigger + callback array in one allocation)
+    - Default capacity starts at 1 and doubles as needed (1 → 2 → 4 → 8...)
+    - Fixed `coroutine_event_callback_dispose()` to remove only specific callbacks instead of entire events
+    - **Breaking Change**: Events now persist until all associated callbacks are removed
+- **Bailout Tests**: Added 15 tests covering memory exhaustion and stack overflow scenarios in async operations
+- **Garbage Collection Support**: Implemented comprehensive GC handlers for async objects
+    - Added `async_coroutine_object_gc()` function to track all ZVALs in coroutine structures
+    - Added `async_scope_object_gc()` function to track ZVALs in scope structures  
+    - Proper GC tracking for context HashTables (values and keys)
+    - GC support for finally handlers, exception handlers, and function call parameters
+    - GC tracking for waker events, internal context, and nested async structures
+    - Prevents memory leaks in complex async applications with circular references
+- **Key Order Preservation**: Added `preserveKeyOrder` parameter to async await functions
+    - Added `preserve_key_order` parameter to `async_await_futures()` API function
+    - Added `preserve_key_order` field to `async_await_context_t` structure
+    - Enhanced `awaitAll()`, `awaitAllWithErrors()`, `awaitAnyOf()`, and `awaitAnyOfWithErrors()` functions with `preserveKeyOrder` parameter (defaults to `true`)
+    - Allows controlling whether the original key order is maintained in result arrays
+
+### Fixed
+- Memory management improvements for long-running async applications
+- Proper cleanup of coroutine and scope objects during garbage collection cycles
+- **Async Iterator API**:
+    - Fixed iterator state management to prevent memory leaks
+- Fixed the `spawnWith()` function for interaction with the `ScopeProvider` and `SpawnStrategy` interface
+- **Build System Fixes**:
+    - Fixed macOS compilation error with missing field initializer in `uv_stdio_container_t` structure (`libuv_reactor.c:1956`)
+    - Fixed Windows build script PowerShell syntax error (missing `shell: cmd` directive)
+    - Fixed race condition issues in 10 async test files for deterministic test execution on all platforms
+
+### Changed
+- **Breaking Change: Function Renaming** - Major API reorganization for better consistency:
+    - `awaitAllFailFirst()` → `awaitAllOrFail()`
+    - `awaitAllWithErrors()` → `awaitAll()` 
+    - `awaitAnyOfFailFirst()` → `awaitAnyOfOrFail()`
+    - `awaitAnyOfWithErrors()` → `awaitAnyOf()`
+- **Breaking Change: `awaitAll()` Return Format** - New `awaitAll()` (formerly `awaitAllWithErrors()`) now returns `[results, exceptions]` tuple:
+    - First element `[0]` contains array of successful results
+    - Second element `[1]` contains array of exceptions from failed coroutines
+    - **Migration**: Update from `$results = awaitAll($coroutines)` to `[$results, $exceptions] = awaitAll($coroutines)`
+- **LibUV requirement increased to ≥ 1.44.0** - Requires libuv version 1.44.0 or later to ensure proper UV_RUN_ONCE behavior and prevent busy loop issues that could cause high CPU usage
+- **Async Iterator API**:
+    - Proper handling of `REWIND`/`NEXT` states in a concurrent environment. 
+      The iterator code now stops iteration in 
+      coroutines if the iterator is in the process of changing its position.
+    - Added functionality for proper handling of exceptions from `Zend iterators` (`\Iterator` and `generators`).
+      An exception that occurs in the iterator can now be handled by the iterator's owner.
+
+
+## [0.2.0] - 2025-07-01
+
+### Added
+- **Async-aware destructor handling (PHP Core)**: Implemented `async_shutdown_destructors()` function to properly 
+  handle destructors that may suspend execution in async context
+- **CompositeException**: New exception class for handling multiple exceptions that occur in finally handlers
+    - Automatically collects multiple exceptions from `onFinally` handlers in both Scope and Coroutine
+    - Provides `addException()` method to add exceptions to the composite
+    - Provides `getExceptions()` method to retrieve all collected exceptions
+    - Ensures all finally handlers are executed even when exceptions occur
+- Complete implementation of `onFinally()` method for `Async\Scope` class
+- Cross-thread trigger event API
+- Priority support to async iterator system
+- Coroutine priority support to TrueAsync API
+- **Iterator API integration**: Added `zend_async_iterator_t` structure to TrueAsync API with `run()` and `run_in_coroutine()` methods
+- `disposeAfterTimeout()` method for Scope
+- `awaitAfterCancellation()` method for Scope
+- Complete Scope API implementation
+- `Async\protect()` function
+- Signal handlers support (UNIX)
+- Coroutine class with full lifecycle management
+- `onFinally()` logic for Coroutine class
+
+### Changed
+- Enhanced ZEND_ASYNC_NEW_SCOPE API to create Scope without Zend object for internal use
+- Refactored catch_or_cancel logic according to RFC scope behavior
+- Refactored async_scheduler_coroutine_suspend to support non-zero exception context
+- Optimized iterator module
+- **Iterator structure refactoring**: Made `async_iterator_t` compatible with `zend_async_iterator_t` API by adding function pointer methods
+- Improved exception handling and cancellation logic
+- Enhanced Context API behavior for Scope
+
+### Fixed
+- Multiple fixes for Scope dispose operations
+- Fixed scope_try_to_dispose logic
+- Spawn tests fixes
+- Build issues for Scope
+- Context logic with NULL scope
+- Iterator bugs and coroutine issues
+- Stream tests and DNS tests
+- ZEND_ASYNC_IS_OFF issues
+- Race condition in process waiting (libuv)
+- Memory cleanup for reactor shutdown
+
+## [0.1.0] - 2025-06-25
+
+### Added
+- Future logic for coroutine class - coroutines can now behave like real Future objects
+- Support for `ob_start` with coroutines
+- Global main coroutine switch handlers API for context isolation
+- Socket Listening API
+- Support for `proc_open` in async context
+- CURL async support and comprehensive tests
+- Sleep functions (`usleep`, `sleep`) with async support
+- Exec functions with async support
+- Async DNS resolution support including IPv6
+- Comprehensive DNS test suite (13 test files)
+- Nanosecond support for async timer events
+- Stream socket tests and functionality
+- PHP_POLL2 implementation and tests
+- `cancel_on_exit` option for `async_await_futures`
+- Context API with HashTable optimization
+- Coroutine Internal context support
+
+### Changed
+- Refactored sockets extension to use new TrueAsync API
+- Refactored timeout object implementation with proper memory separation
+- Refactored Internal Context API
+- Refactored Zend DNS API
+- Moved async extension memory initialization to RINIT
+- Changed allocator to erealloc2
+- Improved circular buffer behavior during relocation and resizing
+
+### Fixed
+- Multiple memory leaks
+- DNS API bugs and errors
+- Stream tests fixes
+- CURL function fixes
+- Socket extension test fixes
+- Exception propagation bugs
+- Poll2 logic fixes
+- Double free issues in awaitAll
+- Coroutine cancellation and completion logic
+- Scheduler graceful shutdown logic
+
+## [0.0.1] - Initial Release
+
+### Added
+- Initial TrueAsync extension architecture
+- Basic coroutine support
+- Event loop integration with libuv
+- Core async/await functionality
+- Basic suspend/resume operations
+- Initial test framework
+- Context switching mechanisms
+- Basic scheduler implementation

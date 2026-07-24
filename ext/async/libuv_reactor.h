@@ -1,0 +1,252 @@
+/*
++----------------------------------------------------------------------+
+  | Copyright (c) The PHP Group                                          |
+  +----------------------------------------------------------------------+
+  | This source file is subject to version 3.01 of the PHP license,      |
+  | that is bundled with this package in the file LICENSE, and is        |
+  | available through the world-wide-web at the following url:           |
+  | https://www.php.net/license/3_01.txt                                 |
+  | If you did not receive a copy of the PHP license and are unable to   |
+  | obtain it through the world-wide-web, please send a note to          |
+  | license@php.net so we can mail you a copy immediately.               |
+  +----------------------------------------------------------------------+
+  | Author: Edmond                                                       |
+  +----------------------------------------------------------------------+
+*/
+#ifndef LIBUV_REACTOR_H
+#define LIBUV_REACTOR_H
+
+#define LIBUV_REACTOR_VERSION "0.8.0"
+#define LIBUV_REACTOR_NAME "Libuv Reactor 0.8.0"
+#include <Zend/zend_async_API.h>
+#include "thread.h"
+
+#ifdef PHP_WIN32
+#include "libuv/uv.h"
+#define SIGCHLD 17
+#else
+#include <uv.h>
+#endif
+
+typedef struct _async_poll_event_t async_poll_event_t;
+typedef struct _async_socket_event_t async_socket_event_t;
+typedef struct _async_timer_event_t async_timer_event_t;
+typedef struct _async_signal_event_t async_signal_event_t;
+typedef struct _async_filesystem_event_t async_filesystem_event_t;
+typedef struct _async_fs_watch_dir async_fs_watch_dir_t;
+
+typedef struct _async_process_event_t async_process_event_t;
+typedef struct _async_thread_event_t async_thread_event_t;
+typedef struct _async_trigger_event_t async_trigger_event_t;
+
+typedef struct _async_dns_nameinfo_t async_dns_nameinfo_t;
+typedef struct _async_dns_addrinfo_t async_dns_addrinfo_t;
+
+typedef struct _async_exec_event_t async_exec_event_t;
+typedef struct _async_io_t async_io_t;
+typedef struct _async_io_req_t async_io_req_t;
+
+struct _async_poll_event_t
+{
+	zend_async_poll_event_t event;
+	uv_poll_t uv_handle;
+	/* Array of active proxies for correct event aggregation */
+	zend_async_poll_proxy_t **proxies;
+	uint32_t proxies_count;
+	uint32_t proxies_capacity;
+	/* Cached SOCK_DGRAM flag — UDP sockets do not need the recv(MSG_PEEK)
+	 * spurious-readable filter applied to stream sockets. */
+	bool is_dgram;
+};
+
+struct _async_timer_event_t
+{
+	zend_async_timer_event_t event;
+	uv_timer_t uv_handle;
+};
+
+struct _async_signal_event_t
+{
+	zend_async_signal_event_t event;
+	// uv_signal_t removed - now using global signal management
+};
+
+struct _async_filesystem_event_t
+{
+	zend_async_filesystem_event_t event;
+	uv_fs_event_t uv_handle;
+
+	/* Recursive-watch emulation for platforms whose libuv backend lacks a
+	 * native UV_FS_EVENT_RECURSIVE (Linux/inotify, most BSD): one watch node
+	 * per directory in the subtree, all feeding this one event. Zeroed and
+	 * unused when recursive_emulated is false. */
+	async_fs_watch_dir_t **watch_dirs;
+	uint32_t                watch_dir_count;
+	uint32_t                watch_dir_capacity;
+	uint32_t                pending_close;     /* live node handles during async teardown */
+	bool                    recursive_emulated;
+};
+
+/* kqueue (BSD) and event-ports (Solaris) name only the watched directory, not
+ * the child entry that changed, so the recursive emulation cannot report which
+ * nested file moved. There we keep a snapshot of each directory's children and
+ * diff it on every notification to recover the name. Linux/inotify reports the
+ * child name directly and needs no snapshot; macOS/Windows use the native
+ * recursive backend and no emulation node at all. */
+#if !defined(__linux__) && !defined(__APPLE__) && !defined(PHP_WIN32)
+# define ASYNC_FS_EMULATE_DIFF 1
+#else
+# define ASYNC_FS_EMULATE_DIFF 0
+#endif
+
+/* One watched directory in the recursive-emulation subtree. Its uv handle's
+ * data points back here; owner reaches the aggregating event. */
+struct _async_fs_watch_dir
+{
+	uv_fs_event_t             handle;
+	async_filesystem_event_t *owner;
+	zend_string              *abs_path;    /* absolute path this handle watches */
+	zend_string              *rel_prefix;  /* path relative to the watched root; empty for root */
+#if ASYNC_FS_EMULATE_DIFF
+	HashTable                 entries;     /* set of immediate child names; diffed per event */
+#endif
+};
+
+struct _async_dns_nameinfo_t
+{
+	zend_async_dns_nameinfo_t event;
+	uv_getnameinfo_t uv_handle;
+};
+
+struct _async_dns_addrinfo_t
+{
+	zend_async_dns_addrinfo_t event;
+	uv_getaddrinfo_t uv_handle;
+};
+
+struct _async_process_event_t
+{
+	zend_async_process_event_t event;
+#ifdef PHP_WIN32
+	HANDLE hJob;
+#endif
+};
+
+struct _async_thread_event_t
+{
+	zend_async_thread_event_t event;
+	uv_thread_t uv_handle;
+	uv_async_t uv_notify;     /* Cross-thread notification handle */
+};
+
+/* Thread event is launched (OS thread created). Shares event.base.flags;
+ * thread bits 13/14 are taken, so this uses 15. */
+#define ASYNC_THREAD_F_LAUNCHED (1u << 15)
+
+struct _async_exec_event_t
+{
+	zend_async_exec_event_t event;
+	uv_process_t *process;
+	uv_pipe_t *stdout_pipe;
+	uv_pipe_t *stderr_pipe;
+	uv_process_options_t options;
+	/* Coroutine that initiated the exec — needed for PHPWRITE_CORO
+	 * so that PASSTHRU/SYSTEM output goes through the correct OB stack. */
+	zend_coroutine_t *coroutine;
+	/* Line parser state: pending incomplete line between chunks. */
+	char *line_buf;
+	size_t line_buf_len;   /* bytes used */
+	size_t line_buf_cap;   /* allocated capacity */
+};
+
+struct _async_trigger_event_t
+{
+	zend_async_trigger_event_t event;
+	uv_async_t uv_handle;
+};
+
+typedef struct _libuv_work_wrapper_s
+{
+	uv_work_t uv_req;
+	zend_async_task_t *task;
+} libuv_work_wrapper_t;
+
+struct _async_io_t
+{
+	zend_async_io_t base;
+	int crt_fd;
+	int orig_fd;   /* original stdio fd (0/1/2) when dup'd, or -1 */
+	async_io_req_t *active_req;
+
+	/* File-write serialization: at most one uv_fs_write may be in flight
+	 * per handle. Concurrent thread-pool writes with offset=-1 race the
+	 * shared kernel file offset and silently lose data on platforms that
+	 * do not serialize them in-kernel (macOS, Windows). Extra writes wait
+	 * in this FIFO and are dispatched one at a time, on each completion. */
+	async_io_req_t *write_q_head;
+	async_io_req_t *write_q_tail;
+	bool file_write_in_flight;
+
+	union
+	{
+		uv_stream_t stream;
+		uv_pipe_t pipe;
+		uv_tty_t tty;
+		uv_tcp_t tcp;
+		uv_udp_t udp;
+
+		struct
+		{
+			zend_off_t offset;
+		} file;
+	} handle;
+};
+
+/* uv_flags on async_io_req_t — dispose()/callback rendezvous for ops that
+ * can't be cancelled synchronously (uv_write, uv_fs_*), mirroring
+ * ZEND_ASYNC_UDP_REQ_F_*: a dispose() arriving mid-flight defers the free to
+ * the completion callback. */
+#define ASYNC_IO_REQ_F_UV_IN_FLIGHT    (1u << 0) /* uv op submitted, callback pending */
+#define ASYNC_IO_REQ_F_DISPOSE_PENDING (1u << 1) /* dispose() arrived while in flight */
+
+struct _async_io_req_t
+{
+	zend_async_io_req_t base;
+	async_io_t *io;
+	size_t max_size;
+	bool buf_owned;
+	uint8_t uv_flags; /* ASYNC_IO_REQ_F_* — reactor-private */
+
+	/* Vectored write ownership: when non-zero, the request was submitted via
+	 * libuv_io_writev and owns `writev_nbufs` zend_string references stored
+	 * in a trailing flex array right after the req struct (single pecalloc).
+	 * Completion / dispose paths release each ref. Zero means non-writev. */
+	uint16_t writev_nbufs;
+
+	/* Link in async_io_t::write_q_* while this file write waits its turn. */
+	async_io_req_t *write_q_next;
+
+	union
+	{
+		uv_write_t write_req;
+		uv_fs_t fs_req;
+	};
+};
+
+typedef struct _async_udp_req_t async_udp_req_t;
+
+struct _async_udp_req_t
+{
+	zend_async_udp_req_t base;
+	async_io_t *io;
+	size_t max_size;
+	uv_udp_send_t send_req;
+};
+
+void async_libuv_reactor_register(void);
+
+/* Called by async_thread_run in the child thread after ts_free_thread, so
+ * the registry entry vanishes only once the child is past TSRM/Zend access. */
+void async_libuv_thread_registry_remove(zend_async_thread_handle_t handle);
+
+#endif // LIBUV_REACTOR_H

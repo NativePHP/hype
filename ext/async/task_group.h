@@ -1,0 +1,120 @@
+/*
++----------------------------------------------------------------------+
+  | Copyright (c) The PHP Group                                          |
+  +----------------------------------------------------------------------+
+  | This source file is subject to version 3.01 of the PHP license,      |
+  | that is bundled with this package in the file LICENSE, and is        |
+  | available through the world-wide-web at the following url:           |
+  | https://www.php.net/license/3_01.txt                                 |
+  | If you did not receive a copy of the PHP license and are unable to   |
+  | obtain it through the world-wide-web, please send a note to          |
+  | license@php.net so we can mail you a copy immediately.               |
+  +----------------------------------------------------------------------+
+  | Author: Edmond                                                       |
+  +----------------------------------------------------------------------+
+*/
+#ifndef ASYNC_TASK_GROUP_H
+#define ASYNC_TASK_GROUP_H
+
+#include "php_async_api.h"
+#include <Zend/zend_async_API.h>
+#include "scope.h"
+#include "coroutine.h"
+
+/* TaskGroup-specific event flags (bits 11+) */
+#define ASYNC_TASK_GROUP_F_COMPLETED (1u << 11)
+#define ASYNC_TASK_GROUP_F_SEALED (1u << 12)
+#define ASYNC_TASK_GROUP_F_TASK_SET (1u << 13)
+
+#define ASYNC_TASK_GROUP_IS_COMPLETED(group) (((group)->event.flags & ASYNC_TASK_GROUP_F_COMPLETED) != 0)
+#define ASYNC_TASK_GROUP_SET_COMPLETED(group) ((group)->event.flags |= ASYNC_TASK_GROUP_F_COMPLETED)
+
+#define ASYNC_TASK_GROUP_IS_SEALED(group) (((group)->event.flags & ASYNC_TASK_GROUP_F_SEALED) != 0)
+#define ASYNC_TASK_GROUP_SET_SEALED(group) ((group)->event.flags |= ASYNC_TASK_GROUP_F_SEALED)
+
+#define ASYNC_TASK_GROUP_IS_TASK_SET(group) (((group)->event.flags & ASYNC_TASK_GROUP_F_TASK_SET) != 0)
+#define ASYNC_TASK_GROUP_SET_TASK_SET(group) ((group)->event.flags |= ASYNC_TASK_GROUP_F_TASK_SET)
+
+typedef struct _async_task_group_s async_task_group_t;
+typedef struct _task_group_waiter_event_s task_group_waiter_event_t;
+
+struct _async_task_group_s
+{
+	/* Event (must be first) — TaskGroup IS an event (Awaitable).
+	 * group->event == all() semantics.
+	 * Flags used:
+	 *   ASYNC_TASK_GROUP_F_SEALED          — sealed for new tasks (spawn rejected)
+	 *   ZEND_ASYNC_EVENT_F_EXCEPTION_HANDLED — errors handled (toggle)
+	 *   ASYNC_TASK_GROUP_F_COMPLETED       — terminal: all tasks done, event CLOSED */
+	zend_async_event_t event;
+
+	/* Scope for the group's coroutines: an owned child scope, or an external
+	 * PHP-supplied one (then scope_object holds its zend object). */
+	async_scope_t *scope;
+
+	/* Held ref to an external scope's zend object; NULL for owned child scopes. */
+	zend_object *scope_object;
+
+	/* Concurrency settings */
+	uint32_t concurrency;      /* 0 = unlimited */
+	uint32_t queue_limit;      /* 0 = unbounded pending queue; >0 = spawn() suspends when pending_count >= queue_limit */
+	uint32_t pending_count;    /* number of PENDING entries in tasks HashTable */
+	int32_t active_coroutines; /* currently running coroutines */
+
+	/* FIFO queue of coroutines suspended in spawn() waiting for a queue slot.
+	 * Values are zend_async_trigger_event_t*, keyed by (zend_ulong)(uintptr_t)trigger.
+	 * Single-threaded: PHP HashTable preserves insertion order, giving FIFO semantics. */
+	HashTable slot_waiters;
+
+	/* Unified tasks array — preserves spawn() order.
+	 * Values:
+	 *   IS_PTR → task_entry_t* (pending/running/error)
+	 *   anything else → successful result
+	 * Internal pointer used for drain (next pending to spawn).
+	 * Keys: string|int as provided to spawn(). */
+	HashTable tasks;
+
+	/* Race/any/all/iterator waiter events — pointer vector with safe iteration */
+	task_group_waiter_event_t **waiter_events;
+	uint32_t waiter_events_length;
+	uint32_t waiter_events_capacity;
+	uint32_t waiter_notify_index;
+
+	/* Finally handlers (lazy-init) */
+	HashTable *finally_handlers;
+
+	/* Auto-increment key counter */
+	uint32_t next_key;
+
+	/* PHP object (must be last — offsetof) */
+	zend_object std;
+};
+
+/* Iterator for foreach support */
+typedef struct
+{
+	zend_object_iterator it;
+	async_task_group_t *group;
+	zval current;      /* [result, error] array */
+	zval current_key;  /* string|int key */
+	uint32_t position; /* current HashTable index for ordered iteration */
+	bool valid;
+	bool started;
+} task_group_iterator_t;
+
+/* Class entries */
+extern zend_class_entry *async_ce_task_group;
+extern zend_class_entry *async_ce_task_set;
+
+/* Convert zend_object → async_task_group_t */
+#define ASYNC_TASK_GROUP_FROM_OBJ(obj) ((async_task_group_t *) ((char *) (obj) - offsetof(async_task_group_t, std)))
+
+/* Convert zend_async_event_t → async_task_group_t (event is first field) */
+#define ASYNC_TASK_GROUP_FROM_EVENT(ev) ((async_task_group_t *) (ev))
+
+/* API */
+zend_async_group_t *async_new_group(uint32_t concurrency, uint32_t queue_limit, zend_object *scope);
+void async_register_task_group_ce(void);
+void async_register_task_set_ce(void);
+
+#endif /* ASYNC_TASK_GROUP_H */

@@ -1,0 +1,7144 @@
+/*
++----------------------------------------------------------------------+
+  | Copyright (c) The PHP Group                                          |
+  +----------------------------------------------------------------------+
+  | This source file is subject to version 3.01 of the PHP license,      |
+  | that is bundled with this package in the file LICENSE, and is        |
+  | available through the world-wide-web at the following url:           |
+  | https://www.php.net/license/3_01.txt                                 |
+  | If you did not receive a copy of the PHP license and are unable to   |
+  | obtain it through the world-wide-web, please send a note to          |
+  | license@php.net so we can mail you a copy immediately.               |
+  +----------------------------------------------------------------------+
+  | Author: Edmond                                                       |
+  +----------------------------------------------------------------------+
+*/
+#include "libuv_reactor.h"
+#include <Zend/zend_async_API.h>
+#include <Zend/zend_closures.h>
+#include <main/php.h>
+#include <main/SAPI.h>
+
+#include "exceptions.h"
+#include "php_async.h"
+#include "php_main.h"
+#include "thread.h"
+#include "thread_pool.h"
+#include "zend_common.h"
+
+#ifdef ZTS
+#include "TSRM.h"
+#endif
+
+#ifdef PHP_WIN32
+#include "win32/unistd.h"
+#include "win32/codepage.h"
+#include <mswsock.h> /* TransmitFile, WSAID_TRANSMITFILE — file→socket sendfile */
+#include <io.h>      /* _get_osfhandle — CRT fd → Win32 HANDLE for the source file */
+#else
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
+#endif
+
+#ifdef ZEND_SIGNALS
+#include "Zend/zend_signal.h"
+
+/* Storage for original sigaction handlers (typically zend_signal_handler_defer)
+ * that were installed before libuv took over signal handling. These are restored
+ * when libuv releases the signal, so zend_signal_deactivate() sees the expected
+ * handler and does not emit a warning. */
+static struct sigaction async_saved_sigactions[NSIG];
+static bool async_signal_active[NSIG] = { false };
+
+static void libuv_restore_signal_handler(int signum)
+{
+	if (signum > 0 && signum < NSIG && async_signal_active[signum]) {
+		sigaction(signum, &async_saved_sigactions[signum], NULL);
+		async_signal_active[signum] = false;
+	}
+}
+#endif
+
+static void libuv_reactor_stop_with_exception(void);
+
+/* DNS private flags (bits 13+, private range for event subtypes) */
+#define LIBUV_DNS_F_CALLBACK_DONE    (1u << 13) /* libuv callback has fired */
+#define LIBUV_DNS_F_DISPOSE_PENDING  (1u << 14) /* dispose requested, callback owns the memory */
+
+// Forward declarations for global signal management
+static void libuv_add_signal_event(int signum, zend_async_event_t *event);
+static void libuv_remove_signal_event(int signum, zend_async_event_t *event);
+static void libuv_add_process_event(zend_async_event_t *event);
+static void libuv_remove_process_event(zend_async_event_t *event);
+static void libuv_handle_process_events(void);
+static void libuv_handle_signal_events(const int signum);
+static void libuv_signal_close_cb(uv_handle_t *handle);
+
+// Forward declarations for cleanup functions
+static void libuv_cleanup_signal_handlers(void);
+static void libuv_cleanup_signal_events(void);
+static void libuv_cleanup_process_events(void);
+static void uv_stat_to_zend_stat(const uv_stat_t *uv_statbuf, zend_stat_t *zend_statbuf);
+
+///////////////////////////////////////////////////////////
+/// Child thread registry
+///
+/// Process-global registry that tracks every OS thread spawned by the
+/// reactor (both event-backed threads and lightweight pool workers).
+///
+/// Purpose: let the main thread block before php_module_shutdown until
+/// all child threads have released TSRM and are safe to outrun.
+///
+/// - Add: main thread under registry_mutex, after uv_thread_create
+///   returns successfully, keyed by the OS handle.
+/// - Remove: child thread itself, right after ts_free_thread() and
+///   before returning from the OS entry point, so that entries only
+///   disappear once the thread has stopped touching Zend/TSRM state.
+/// - Quiesce: main thread waits on registry_cond until the table is
+///   empty, then caller may proceed into php_module_shutdown.
+///////////////////////////////////////////////////////////
+
+static HashTable     child_thread_registry;
+static uv_mutex_t    child_thread_registry_mutex;
+static uv_cond_t     child_thread_registry_cond;
+static bool          child_thread_registry_inited = false;
+
+static void libuv_thread_registry_init(void)
+{
+	if (child_thread_registry_inited) {
+		return;
+	}
+
+	zend_hash_init(&child_thread_registry, 8, NULL, NULL, 1 /* persistent */);
+
+	if (uv_mutex_init(&child_thread_registry_mutex) != 0) {
+		zend_error_noreturn(E_CORE_ERROR,
+				"libuv: failed to init child_thread_registry_mutex");
+	}
+
+	if (uv_cond_init(&child_thread_registry_cond) != 0) {
+		uv_mutex_destroy(&child_thread_registry_mutex);
+		zend_error_noreturn(E_CORE_ERROR,
+				"libuv: failed to init child_thread_registry_cond");
+	}
+
+	child_thread_registry_inited = true;
+}
+
+static void libuv_thread_registry_add(zend_async_thread_handle_t handle)
+{
+	libuv_thread_registry_init();
+
+	uv_mutex_lock(&child_thread_registry_mutex);
+	/* value payload is unused — the key alone is what we track */
+	zval placeholder;
+	ZVAL_NULL(&placeholder);
+	zend_hash_index_add(&child_thread_registry, (zend_ulong) handle, &placeholder);
+	uv_mutex_unlock(&child_thread_registry_mutex);
+}
+
+static void libuv_thread_registry_remove(zend_async_thread_handle_t handle)
+{
+	if (!child_thread_registry_inited) {
+		return;
+	}
+
+	uv_mutex_lock(&child_thread_registry_mutex);
+	zend_hash_index_del(&child_thread_registry, (zend_ulong) handle);
+	if (zend_hash_num_elements(&child_thread_registry) == 0) {
+		uv_cond_broadcast(&child_thread_registry_cond);
+	}
+	uv_mutex_unlock(&child_thread_registry_mutex);
+}
+
+/* {{{ libuv_reactor_quiesce — block until every child thread has
+ * released TSRM. Called from main thread at the very top of
+ * php_module_shutdown, before any module gets destroyed. */
+static void libuv_reactor_quiesce(void)
+{
+#ifdef ZTS
+	ZEND_ASSERT(tsrm_is_main_thread());
+#endif
+
+	if (!child_thread_registry_inited) {
+		return;
+	}
+
+	uv_mutex_lock(&child_thread_registry_mutex);
+	while (zend_hash_num_elements(&child_thread_registry) > 0) {
+		uv_cond_wait(&child_thread_registry_cond, &child_thread_registry_mutex);
+	}
+	uv_mutex_unlock(&child_thread_registry_mutex);
+}
+/* }}} */
+
+/* Exposed to thread.c so child threads can self-remove after ts_free_thread. */
+void async_libuv_thread_registry_remove(zend_async_thread_handle_t handle)
+{
+	libuv_thread_registry_remove(handle);
+}
+
+///////////////////////////////////////////////////////////
+/// Event info methods for deadlock diagnostics
+///////////////////////////////////////////////////////////
+
+static const char *io_type_name(const zend_async_io_type type)
+{
+	switch (type) {
+		case ZEND_ASYNC_IO_TYPE_PIPE:
+			return "pipe";
+		case ZEND_ASYNC_IO_TYPE_FILE:
+			return "file";
+		case ZEND_ASYNC_IO_TYPE_TCP:
+			return "tcp";
+		case ZEND_ASYNC_IO_TYPE_UDP:
+			return "udp";
+		case ZEND_ASYNC_IO_TYPE_TTY:
+			return "tty";
+		default:
+			return "unknown";
+	}
+}
+
+static zend_string *libuv_poll_info(zend_async_event_t *event)
+{
+	const zend_async_poll_event_t *poll = (zend_async_poll_event_t *) event;
+
+	if (poll->is_socket) {
+		return zend_strpprintf(0,
+							   "Poll(socket=" ZEND_LONG_FMT ", events=%s%s)",
+							   (zend_long) poll->socket,
+							   (poll->events & ASYNC_READABLE) ? "r" : "",
+							   (poll->events & ASYNC_WRITABLE) ? "w" : "");
+	}
+
+	return zend_strpprintf(0,
+						   "Poll(fd=" ZEND_LONG_FMT ", events=%s%s)",
+						   (zend_long) poll->file,
+						   (poll->events & ASYNC_READABLE) ? "r" : "",
+						   (poll->events & ASYNC_WRITABLE) ? "w" : "");
+}
+
+static zend_string *libuv_poll_proxy_info(zend_async_event_t *event)
+{
+	const zend_async_poll_proxy_t *proxy = (zend_async_poll_proxy_t *) event;
+
+	return zend_strpprintf(0,
+						   "PollProxy(events=%s%s)",
+						   (proxy->events & ASYNC_READABLE) ? "r" : "",
+						   (proxy->events & ASYNC_WRITABLE) ? "w" : "");
+}
+
+static zend_string *libuv_timer_info(zend_async_event_t *event)
+{
+	const zend_async_timer_event_t *timer = (zend_async_timer_event_t *) event;
+
+	return zend_strpprintf(0, "Timer(timeout=%ums, %s)", timer->timeout, timer->is_periodic ? "periodic" : "once");
+}
+
+static zend_string *libuv_signal_info(zend_async_event_t *event)
+{
+	const zend_async_signal_event_t *signal = (zend_async_signal_event_t *) event;
+
+	return zend_strpprintf(0, "Signal(signum=%d)", signal->signal);
+}
+
+static zend_string *libuv_process_info(zend_async_event_t *event)
+{
+	const zend_async_process_event_t *proc = (zend_async_process_event_t *) event;
+
+	return zend_strpprintf(0, "Process(pid=" ZEND_LONG_FMT ")", (zend_long) proc->process);
+}
+
+static zend_string *libuv_filesystem_info(zend_async_event_t *event)
+{
+	const zend_async_filesystem_event_t *fs = (zend_async_filesystem_event_t *) event;
+
+	return zend_strpprintf(0, "FilesystemWatch(path=%s)", fs->path ? ZSTR_VAL(fs->path) : "<null>");
+}
+
+static zend_string *libuv_dns_nameinfo_info(zend_async_event_t *event)
+{
+	return zend_string_init(ZEND_STRL("DNSNameInfo"), 0);
+}
+
+static zend_string *libuv_dns_addrinfo_info(zend_async_event_t *event)
+{
+	const zend_async_dns_addrinfo_t *addr = (zend_async_dns_addrinfo_t *) event;
+
+	return zend_strpprintf(0,
+						   "DNSAddrInfo(node=%s, service=%s)",
+						   addr->node ? addr->node : "<null>",
+						   addr->service ? addr->service : "<null>");
+}
+
+static zend_string *libuv_exec_info(zend_async_event_t *event)
+{
+	const zend_async_exec_event_t *exec = (zend_async_exec_event_t *) event;
+
+	return zend_strpprintf(0, "Exec(cmd=%.80s)", exec->cmd ? exec->cmd : "<null>");
+}
+
+static zend_string *libuv_trigger_info(zend_async_event_t *event)
+{
+	return zend_string_init(ZEND_STRL("Trigger"), 0);
+}
+
+static zend_string *libuv_io_info(zend_async_event_t *event)
+{
+	const async_io_t *aio = (async_io_t *) event;
+	const zend_async_io_t *io = &aio->base;
+
+	if (io->type == ZEND_ASYNC_IO_TYPE_TCP || io->type == ZEND_ASYNC_IO_TYPE_UDP) {
+		return zend_strpprintf(
+				0, "IO(type=%s, socket=" ZEND_LONG_FMT ")", io_type_name(io->type), (zend_long) io->descriptor.socket);
+	}
+
+	return zend_strpprintf(
+			0, "IO(type=%s, fd=" ZEND_LONG_FMT ")", io_type_name(io->type), (zend_long) io->descriptor.fd);
+}
+
+static zend_string *libuv_listen_info(zend_async_event_t *event)
+{
+	const zend_async_listen_event_t *listen = (zend_async_listen_event_t *) event;
+
+	return zend_strpprintf(0, "Listen(host=%s, port=%d)", listen->host ? listen->host : "<null>", listen->port);
+}
+
+static zend_string *libuv_task_info(zend_async_event_t *event)
+{
+	return zend_string_init(ZEND_STRL("ThreadPoolTask"), 0);
+}
+
+#define UVLOOP (&ASYNC_G(uvloop))
+#define LIBUV_REACTOR ((zend_async_globals *) ASYNC_GLOBALS)
+#define LIBUV_REACTOR_VAR zend_async_globals *reactor = LIBUV_REACTOR;
+
+#define LIBUV_REACTOR_VAR_FROM(var) zend_async_globals *reactor = (zend_async_globals *) var;
+#define WATCHER ASYNC_G(watcherThread)
+#define IF_EXCEPTION_STOP_REACTOR \
+	if (UNEXPECTED(EG(exception) != NULL)) { \
+		libuv_reactor_stop_with_exception(); \
+	}
+
+#define ASYNC_OF_EXCEPTION_MESSAGE "Async mode is disabled. Reactor API cannot be used."
+
+#define START_REACTOR_OR_RETURN \
+	if (UNEXPECTED(ASYNC_G(reactor_started) == false)) { \
+		libuv_reactor_startup(); \
+		if (UNEXPECTED(EG(exception) != NULL)) { \
+			return NULL; \
+		} \
+	}
+
+#define START_REACTOR_OR_RETURN_NULL \
+	if (UNEXPECTED(ASYNC_G(reactor_started) == false)) { \
+		libuv_reactor_startup(); \
+		if (UNEXPECTED(EG(exception) != NULL)) { \
+			return NULL; \
+		} \
+	}
+
+#define EVENT_START_PROLOGUE(event) \
+	if (UNEXPECTED(ZEND_ASYNC_EVENT_IS_CLOSED(event))) { \
+		return true; \
+	} \
+	if (event->loop_ref_count > 0) { \
+		event->loop_ref_count++; \
+		return true; \
+	}
+
+#define EVENT_STOP_PROLOGUE(event) \
+	if (event->loop_ref_count == 0) { \
+		return true; \
+	} \
+	if (event->loop_ref_count > 1) { \
+		event->loop_ref_count--; \
+		if (UNEXPECTED(ZEND_ASYNC_EVENT_IS_CLOSED(event))) { \
+			event->loop_ref_count = 0; \
+		} else { \
+			return true; \
+		} \
+	} \
+	if (UNEXPECTED(ZEND_ASYNC_EVENT_IS_CLOSED(event))) { \
+		event->loop_ref_count = 0; \
+		return true; \
+	}
+
+static zend_always_inline void close_event(zend_async_event_t *event)
+{
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+		ZEND_ASYNC_EVENT_SET_CLOSED(event);
+	}
+}
+
+/* {{{ libuv_reactor_startup */
+bool libuv_reactor_startup(void)
+{
+	if (ASYNC_G(reactor_started)) {
+		return true;
+	}
+
+	if (ZEND_ASYNC_IS_OFF) {
+		async_throw_error(ASYNC_OF_EXCEPTION_MESSAGE);
+		return false;
+	}
+
+	const int result = uv_loop_init(UVLOOP);
+
+	if (result != 0) {
+		async_throw_error("Failed to initialize loop: %s", uv_strerror(result));
+		return false;
+	}
+
+	uv_loop_set_data(UVLOOP, ASYNC_GLOBALS);
+	zend_hash_init(&ASYNC_G(active_io_handles), 16, NULL, NULL, 0);
+	ASYNC_G(reactor_started) = true;
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_reactor_stop_with_exception */
+static void libuv_reactor_stop_with_exception(void)
+{
+	// TODO: implement libuv_reactor_stop_with_exception
+}
+
+/* }}} */
+
+/* }}} */
+
+#ifdef ZEND_DEBUG
+/* Dump a libuv handle that survived reactor shutdown — such a handle keeps the
+ * loop from closing (uv_loop_close => EBUSY) and leaks the loop's internals. */
+static void libuv_debug_dump_handle(uv_handle_t *handle, void *arg)
+{
+	(void) arg;
+	fprintf(stderr, "async: leftover libuv handle: type=%s active=%d closing=%d has_ref=%d\n",
+		uv_handle_type_name(uv_handle_get_type(handle)),
+		uv_is_active(handle), uv_is_closing(handle), uv_has_ref(handle));
+}
+#endif
+
+/* {{{ libuv_reactor_shutdown */
+bool libuv_reactor_shutdown(void)
+{
+	if (EXPECTED(ASYNC_G(reactor_started))) {
+		// Cleanup global signal management structures
+		libuv_cleanup_signal_handlers();
+		libuv_cleanup_signal_events();
+		libuv_cleanup_process_events();
+
+		/* Sync drain: pick up ready callbacks. */
+		for (int i = 0; i < 100 && uv_loop_alive(UVLOOP); i++) {
+			uv_run(UVLOOP, UV_RUN_NOWAIT);
+		}
+		/* Async drain: wait for threadpool cancel-completions (getaddrinfo,
+		 * fs). uv_cancel can't preempt an in-flight worker, we must wait. */
+		for (int i = 0; i < 500 && uv_loop_alive(UVLOOP); i++) {
+			uv_run(UVLOOP, UV_RUN_ONCE);
+		}
+		/* Worker still running past the budget — leave the loop open;
+		 * pefree would race with the worker (UAF > leak; OS reclaims). */
+		if (uv_loop_alive(UVLOOP)) {
+#ifdef ZEND_DEBUG
+			fprintf(stderr, "async: libuv shutdown timeout; loop left open\n");
+			uv_walk(UVLOOP, libuv_debug_dump_handle, NULL);
+#endif
+		} else {
+			/* uv_loop_close fails with EBUSY if any handle is still open (even an
+			 * unref'd one, which uv_loop_alive ignores) — that would silently
+			 * leak the loop's internals. Surface it in debug builds. */
+			const int close_result = uv_loop_close(UVLOOP);
+			if (UNEXPECTED(close_result != 0)) {
+#ifdef ZEND_DEBUG
+				fprintf(stderr, "async: uv_loop_close failed (%s); leftover handles:\n",
+					uv_err_name(close_result));
+				uv_walk(UVLOOP, libuv_debug_dump_handle, NULL);
+#endif
+			}
+		}
+
+		ASYNC_G(reactor_started) = false;
+		zend_hash_destroy(&ASYNC_G(active_io_handles));
+	}
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_reactor_execute */
+bool libuv_reactor_execute(bool no_wait)
+{
+	// OPTIMIZATION: Skip uv_run() if no libuv handles to avoid unnecessary clock_gettime() calls
+	if (!uv_loop_alive(UVLOOP)) {
+		return false;
+	}
+
+	const bool has_handles = uv_run(UVLOOP, no_wait ? UV_RUN_NOWAIT : UV_RUN_ONCE);
+
+	return has_handles && ZEND_ASYNC_ACTIVE_EVENT_COUNT > 0;
+}
+
+/* }}} */
+
+/* {{{ libuv_now
+ *
+ * Cheap monotonic-ish "now" in milliseconds. uv_now() returns the loop's
+ * cached wall time (refreshed once per uv_run iteration); reads are a
+ * single load with no syscall and no vDSO. Suitable for deadline
+ * arithmetic and low-precision timestamping. For sub-ms-precision
+ * sampling (CoDel sojourn / service times) callers must continue to use
+ * zend_hrtime(). */
+static uint64_t libuv_now(void)
+{
+	if (UNEXPECTED(!ASYNC_G(reactor_started))) {
+		return 0;
+	}
+	return uv_now(UVLOOP);
+}
+
+/* }}} */
+
+/* {{{ libuv_reactor_loop_alive */
+bool libuv_reactor_loop_alive(void)
+{
+	if (!ASYNC_G(reactor_started)) {
+		return false;
+	}
+
+	return ZEND_ASYNC_ACTIVE_EVENT_COUNT > 0 && uv_loop_alive(UVLOOP) != 0;
+}
+
+/* }}} */
+
+/* {{{ libuv_close_handle_cb */
+static void libuv_close_handle_cb(uv_handle_t *handle)
+{
+	pefree(handle->data, 0);
+}
+
+/* }}} */
+
+/* {{{ libuv_close_poll_handle_cb */
+static void libuv_close_poll_handle_cb(uv_handle_t *handle)
+{
+	async_poll_event_t *poll = (async_poll_event_t *) handle->data;
+
+	/* Check if PHP requested descriptor closure after event cleanup */
+	if (ZEND_ASYNC_EVENT_SHOULD_CLOSE_FD(&poll->event.base)) {
+		if (poll->event.is_socket && ZEND_VALID_SOCKET(poll->event.socket)) {
+			/* Socket cleanup - just close, no blocking operations in LibUV callback */
+#ifdef PHP_WIN32
+			closesocket(poll->event.socket);
+#else
+			close(poll->event.socket);
+#endif
+		} else if (!poll->event.is_socket && poll->event.file != ZEND_FD_NULL) {
+			/* File descriptor cleanup — zend_file_descriptor_t is CRT fd on all platforms */
+			close(poll->event.file);
+		}
+	}
+
+	pefree(poll, 0);
+}
+
+/* }}} */
+
+/* {{{ libuv_add_callback */
+static bool libuv_add_callback(zend_async_event_t *event, zend_async_event_callback_t *callback)
+{
+	return zend_async_callbacks_push(event, callback);
+}
+
+/* }}} */
+
+/* {{{ libuv_remove_callback */
+static bool libuv_remove_callback(zend_async_event_t *event, zend_async_event_callback_t *callback)
+{
+	return zend_async_callbacks_remove(event, callback);
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////
+/// Poll API
+//////////////////////////////////////////////////////////////////////////////
+
+/* Forward declaration */
+static zend_always_inline void
+async_poll_notify_proxies(async_poll_event_t *poll, async_poll_event triggered_events, zend_object *exception);
+
+/* {{{ on_poll_event */
+static void on_poll_event(uv_poll_t *handle, int status, int events)
+{
+	async_poll_event_t *poll = handle->data;
+	zend_object *exception = NULL;
+
+	if (status < 0 && status != UV_EBADF) {
+		exception = async_new_exception(async_ce_input_output_exception, "Input output error: %s", uv_strerror(status));
+	}
+
+	// !WARNING!
+	// LibUV may return the UV_EBADF code when the remote host closes
+	// the connection while the descriptor is still present in the EventLoop.
+	// For POLL events, we handle this by ignoring the situation
+	// so that the coroutine receives the ASYNC_DISCONNECT flag.
+	// This code can be considered "incorrect"; however, this solution is acceptable.
+	//
+	if (UNEXPECTED(status == UV_EBADF)) {
+		events = ASYNC_DISCONNECT;
+	}
+
+	/* Filter spurious READABLE events on stream sockets.
+	 * libuv uv_poll may signal readable when no data is actually available.
+	 * Use recv(MSG_PEEK) to verify; if WOULDBLOCK — remove the flag.
+	 *
+	 * Skipped for SOCK_DGRAM: UDP readiness reflects datagram-queue presence
+	 * accurately, and a 0-byte datagram would falsely look like an empty stream
+	 * read. Avoiding the syscall is also a measurable win on busy UDP sockets
+	 * (e.g. ~1k recv/sec saved per single-connection HTTP/3 session). */
+	if (status >= 0 && poll->event.is_socket && !poll->is_dgram && (events & ASYNC_READABLE)) {
+		char peek_buf;
+		const int peek_ret = recv(poll->event.socket, &peek_buf, 1, MSG_PEEK);
+
+		if (peek_ret < 0) {
+#ifdef PHP_WIN32
+			const int err = WSAGetLastError();
+			if (err == WSAEWOULDBLOCK) {
+				events &= ~ASYNC_READABLE;
+			}
+#else
+			if (errno == EAGAIN
+#if EAGAIN != EWOULDBLOCK
+				|| errno == EWOULDBLOCK
+#endif
+			) {
+				events &= ~ASYNC_READABLE;
+			}
+#endif
+			if (events == 0) {
+				return;
+			}
+		}
+	}
+
+	poll->event.triggered_events = events;
+
+	/* Check if there are active proxies */
+	if (poll->proxies_count > 0) {
+		/* Notify all matching proxies */
+		async_poll_notify_proxies(poll, events, exception);
+	} else {
+		/* Standard base event notification */
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&poll->event.base, NULL, exception);
+	}
+
+	if (exception != NULL) {
+		zend_object_release(exception);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_poll_start */
+static bool libuv_poll_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_poll_event_t *poll = (async_poll_event_t *) (event);
+
+	const int error = uv_poll_start(&poll->uv_handle, poll->event.events, on_poll_event);
+
+	if (error < 0) {
+		async_throw_error("Failed to start poll handle: %s", uv_strerror(error));
+		return false;
+	}
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_poll_stop */
+static bool libuv_poll_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_poll_event_t *poll = (async_poll_event_t *) (event);
+
+	const int error = uv_poll_stop(&poll->uv_handle);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+
+	if (error < 0) {
+		async_throw_error("Failed to stop poll handle: %s", uv_strerror(error));
+		return false;
+	}
+
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_poll_dispose */
+static bool libuv_poll_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_poll_event_t *poll = (async_poll_event_t *) (event);
+
+	/* Free proxies array if exists */
+	if (poll->proxies != NULL) {
+		pefree(poll->proxies, 0);
+		poll->proxies = NULL;
+	}
+
+	/* Use poll-specific callback for poll events that may need descriptor cleanup.
+	 * If the reactor is already shut down, uv_close cannot run — free directly. */
+	if (UNEXPECTED(!ASYNC_G(reactor_started))) {
+		pefree(poll, 0);
+	} else {
+		uv_close((uv_handle_t *) &poll->uv_handle, libuv_close_poll_handle_cb);
+	}
+	return true;
+}
+
+/* }}} */
+
+/* {{{ async_poll_notify_proxies */
+static zend_always_inline void
+async_poll_notify_proxies(async_poll_event_t *poll, async_poll_event triggered_events, zend_object *exception)
+{
+	/* A disconnect or error is terminal for the descriptor: every waiter on
+	 * it must be released, not only those whose mask requested DISCONNECT.
+	 * Otherwise a writer parked on ASYNC_WRITABLE hangs forever when the peer
+	 * resets the connection — libuv reports POLLERR as UV_EBADF, which
+	 * on_poll_event turns into a bare ASYNC_DISCONNECT that no write proxy
+	 * mask matches. */
+	const bool is_terminal = (triggered_events & ASYNC_DISCONNECT) != 0 || exception != NULL;
+
+	/* Process each proxy that matches triggered events */
+	for (uint32_t i = 0; i < poll->proxies_count; i++) {
+		zend_async_poll_proxy_t *proxy = poll->proxies[i];
+
+		if (is_terminal || (triggered_events & proxy->events) != 0) {
+			/* Increase ref count to prevent disposal during processing */
+			ZEND_ASYNC_EVENT_ADD_REF(&proxy->base);
+
+			/* Calculate events relevant to this proxy. On a terminal
+			 * condition the proxy observes the disconnect even if its mask
+			 * never asked for it. */
+			async_poll_event proxy_events = is_terminal
+				? (triggered_events | (triggered_events & proxy->events))
+				: (triggered_events & proxy->events);
+
+			/* Set triggered events and notify callbacks */
+			proxy->triggered_events = proxy_events;
+			ZEND_ASYNC_CALLBACKS_NOTIFY_FROM_HANDLER(&proxy->base, &proxy_events, exception);
+
+			/* Release reference after processing */
+			ZEND_ASYNC_EVENT_RELEASE(&proxy->base);
+		}
+	}
+}
+
+/* }}} */
+
+/* {{{ async_poll_add_proxy */
+static zend_always_inline void async_poll_add_proxy(async_poll_event_t *poll, zend_async_poll_proxy_t *proxy)
+{
+	if (poll->proxies == NULL) {
+		poll->proxies = (zend_async_poll_proxy_t **) pecalloc(4, sizeof(zend_async_poll_proxy_t *), 0);
+		poll->proxies_capacity = 2;
+	}
+
+	if (poll->proxies_count == poll->proxies_capacity) {
+		poll->proxies_capacity *= 2;
+		poll->proxies = (zend_async_poll_proxy_t **) perealloc(
+				poll->proxies, poll->proxies_capacity * sizeof(zend_async_poll_proxy_t *), 0);
+	}
+
+	poll->proxies[poll->proxies_count++] = proxy;
+}
+
+/* }}} */
+
+/* {{{ async_poll_remove_proxy */
+static zend_always_inline void async_poll_remove_proxy(async_poll_event_t *poll, zend_async_poll_proxy_t *proxy)
+{
+	for (uint32_t i = 0; i < poll->proxies_count; i++) {
+		if (poll->proxies[i] == proxy) {
+			/* Move last element to this position */
+			poll->proxies[i] = poll->proxies[--poll->proxies_count];
+			break;
+		}
+	}
+}
+
+/* }}} */
+
+/* {{{ async_poll_aggregate_events */
+static zend_always_inline async_poll_event async_poll_aggregate_events(async_poll_event_t *poll)
+{
+	async_poll_event aggregated = 0;
+
+	for (uint32_t i = 0; i < poll->proxies_count; i++) {
+		aggregated |= poll->proxies[i]->events;
+
+		/* Early exit if all possible events are set */
+		if (aggregated == (ASYNC_READABLE | ASYNC_WRITABLE | ASYNC_DISCONNECT | ASYNC_PRIORITIZED)) {
+			break;
+		}
+	}
+
+	return aggregated;
+}
+
+/* }}} */
+
+/* {{{ libuv_poll_proxy_start */
+static bool libuv_poll_proxy_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	zend_async_poll_proxy_t *proxy = (zend_async_poll_proxy_t *) event;
+	async_poll_event_t *poll = (async_poll_event_t *) proxy->poll_event;
+
+	/* Add proxy to the array */
+	async_poll_add_proxy(poll, proxy);
+
+	/* Check if all proxy events are already set in base event */
+	if ((poll->event.events & proxy->events) != proxy->events) {
+		/* Add missing proxy events to base event */
+		poll->event.events |= proxy->events;
+
+		const int error = uv_poll_start(&poll->uv_handle, poll->event.events, on_poll_event);
+
+		if (error < 0) {
+			async_throw_error("Failed to update poll handle events: %s", uv_strerror(error));
+			return false;
+		}
+	}
+
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	event->loop_ref_count = 1;
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_poll_proxy_stop */
+static bool libuv_poll_proxy_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	zend_async_poll_proxy_t *proxy = (zend_async_poll_proxy_t *) event;
+	async_poll_event_t *poll = (async_poll_event_t *) proxy->poll_event;
+
+	/* Remove proxy from the array */
+	async_poll_remove_proxy(poll, proxy);
+
+	/* Recalculate events from remaining proxies */
+	async_poll_event new_events = async_poll_aggregate_events(poll);
+
+	/* Update base event */
+	if (poll->event.events != new_events && poll->event.base.ref_count > 1) {
+		poll->event.events = new_events;
+
+		/* Restart with new events */
+		const int error = uv_poll_start(&poll->uv_handle, new_events, on_poll_event);
+
+		if (error < 0) {
+			async_throw_error("Failed to update poll handle events: %s", uv_strerror(error));
+		}
+	}
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_poll_proxy_dispose */
+static bool libuv_poll_proxy_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	zend_async_poll_proxy_t *proxy = (zend_async_poll_proxy_t *) event;
+	async_poll_event_t *poll = (async_poll_event_t *) proxy->poll_event;
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	/* Release reference to base poll event */
+	ZEND_ASYNC_EVENT_RELEASE(&poll->event.base);
+
+	pefree(proxy, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_poll_event */
+zend_async_poll_event_t *
+libuv_new_poll_event(zend_file_descriptor_t fh, zend_socket_t socket, async_poll_event events, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_poll_event_t *poll =
+			pecalloc(1, extra_size != 0 ? sizeof(async_poll_event_t) + extra_size : sizeof(async_poll_event_t), 0);
+
+	int error = 0;
+
+	if (socket != 0) {
+		error = uv_poll_init_socket(UVLOOP, &poll->uv_handle, socket);
+		poll->event.is_socket = true;
+		poll->event.socket = socket;
+
+		/* Detect SOCK_DGRAM once so on_poll_event can skip the recv(MSG_PEEK)
+		 * spurious-readable filter for UDP. UDP readiness reflects datagram-queue
+		 * presence accurately; the peek is pure overhead (and a 0-byte datagram
+		 * would even be misclassified as no-data on a stream socket path). */
+		int sock_type = 0;
+#ifdef PHP_WIN32
+		int optlen = (int) sizeof(sock_type);
+#else
+		socklen_t optlen = sizeof(sock_type);
+#endif
+		if (getsockopt(socket, SOL_SOCKET, SO_TYPE, (char *) &sock_type, &optlen) == 0
+			&& sock_type == SOCK_DGRAM) {
+			poll->is_dgram = true;
+		}
+	} else if (fh != ZEND_FD_NULL) {
+#ifdef PHP_WIN32
+		async_throw_error("Windows does not support file descriptor polling");
+		pefree(poll, 0);
+		return NULL;
+#else
+		error = uv_poll_init(UVLOOP, &poll->uv_handle, (int) fh);
+		poll->event.is_socket = false;
+		poll->event.file = fh;
+#endif
+	} else {
+	}
+
+	if (error < 0) {
+		async_throw_error("Failed to initialize poll handle: %s", uv_strerror(error));
+		pefree(poll, 0);
+		return NULL;
+	}
+
+	// Link the handle to the loop.
+	poll->uv_handle.data = poll;
+	poll->event.events = events;
+	poll->event.base.extra_offset = sizeof(async_poll_event_t);
+	poll->event.base.ref_count = 1;
+
+	// Initialize the event methods
+	poll->event.base.add_callback = libuv_add_callback;
+	poll->event.base.del_callback = libuv_remove_callback;
+	poll->event.base.start = libuv_poll_start;
+	poll->event.base.stop = libuv_poll_stop;
+	poll->event.base.dispose = libuv_poll_dispose;
+	poll->event.base.info = libuv_poll_info;
+
+	return &poll->event;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_socket_event */
+zend_async_poll_event_t *libuv_new_socket_event(zend_socket_t socket, async_poll_event events, size_t extra_size)
+{
+	return libuv_new_poll_event(ZEND_FD_NULL, socket, events, extra_size);
+}
+
+/* }}} */
+
+/* {{{ libuv_new_poll_proxy_event */
+zend_async_poll_proxy_t *
+libuv_new_poll_proxy_event(zend_async_poll_event_t *poll_event, async_poll_event events, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	zend_async_poll_proxy_t *proxy = pecalloc(
+			1, extra_size != 0 ? sizeof(zend_async_poll_proxy_t) + extra_size : sizeof(zend_async_poll_proxy_t), 0);
+
+	/* Set up proxy */
+	proxy->poll_event = poll_event;
+	proxy->events = events;
+
+	/* Add reference to base poll event */
+	ZEND_ASYNC_EVENT_ADD_REF(&poll_event->base);
+
+	/* Initialize base event structure */
+	proxy->base.extra_offset = sizeof(zend_async_poll_proxy_t);
+	proxy->base.ref_count = 1;
+
+	/* Initialize proxy methods */
+	proxy->base.add_callback = libuv_add_callback;
+	proxy->base.del_callback = libuv_remove_callback;
+	proxy->base.start = libuv_poll_proxy_start;
+	proxy->base.stop = libuv_poll_proxy_stop;
+	proxy->base.dispose = libuv_poll_proxy_dispose;
+	proxy->base.info = libuv_poll_proxy_info;
+
+	return proxy;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Timer API
+/////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ on_timer_event */
+static void on_timer_event(uv_timer_t *handle)
+{
+	async_timer_event_t *timer_event = handle->data;
+
+	/* One-shot timers self-close on fire so that callers do not have to
+	 * remember to dispose() in the common path. MULTISHOT opts out of
+	 * that — a callback that wants to rearm the same slot would race
+	 * against close_event otherwise. The owner of a multishot timer is
+	 * responsible for an explicit dispose() at teardown. */
+	if (false == timer_event->event.is_periodic
+		&& false == ZEND_ASYNC_TIMER_IS_MULTISHOT(&timer_event->event)) {
+		close_event(&timer_event->event.base);
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&timer_event->event.base, NULL, NULL);
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_timer_start */
+static bool libuv_timer_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_timer_event_t *timer = (async_timer_event_t *) (event);
+
+	const int error = uv_timer_start(&timer->uv_handle,
+									 on_timer_event,
+									 timer->event.timeout,
+									 timer->event.is_periodic ? timer->event.timeout : 0);
+
+	if (error < 0) {
+		async_throw_error("Failed to start timer handle: %s", uv_strerror(error));
+		return false;
+	}
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_timer_stop */
+static bool libuv_timer_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_timer_event_t *timer = (async_timer_event_t *) (event);
+
+	const int error = uv_timer_stop(&timer->uv_handle);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+
+	if (error < 0) {
+		async_throw_error("Failed to stop timer handle: %s", uv_strerror(error));
+		return false;
+	}
+
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_timer_dispose */
+static bool libuv_timer_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_timer_event_t *timer = (async_timer_event_t *) (event);
+
+	uv_close((uv_handle_t *) &timer->uv_handle, libuv_close_handle_cb);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ compute_timer_timeout
+ *
+ * Resolve (timeout_ms, nanoseconds) → final ms with overflow saturation.
+ * Shared by libuv_new_timer_event and libuv_timer_rearm so both paths
+ * round and cap identically. */
+static zend_ulong compute_timer_timeout(const zend_ulong timeout, const zend_ulong nanoseconds)
+{
+	zend_ulong final_timeout = timeout;
+	if (nanoseconds > 0 && timeout == 0) {
+		/* Saturate on overflow: (nanoseconds + 999999) would wrap near UINT64_MAX.
+		 * Also cap at UINT_MAX since event->event.timeout is `unsigned int`. */
+		if (nanoseconds > ZEND_ULONG_MAX - 999999) {
+			final_timeout = UINT_MAX;
+		} else {
+			/* Convert to milliseconds with ceiling, then cap. */
+			final_timeout = (nanoseconds + 999999) / 1000000;
+			if (final_timeout > UINT_MAX) {
+				final_timeout = UINT_MAX;
+			}
+		}
+	}
+	return final_timeout;
+}
+/* }}} */
+
+/* {{{ libuv_timer_rearm
+ *
+ * Reschedule an already-running (or stopped) MULTISHOT timer with a new
+ * timeout. libuv accepts a second uv_timer_start on the same handle as a
+ * native rearm — no realloc, no uv_close. The original callbacks and
+ * refcount survive untouched. */
+static bool libuv_timer_rearm(zend_async_timer_event_t *event,
+                              const zend_ulong timeout, const zend_ulong nanoseconds)
+{
+	if (event == NULL) {
+		return false;
+	}
+	if (ZEND_ASYNC_EVENT_IS_CLOSED(&event->base)) {
+		return false;
+	}
+	if (false == ZEND_ASYNC_TIMER_IS_MULTISHOT(event)) {
+		/* Non-multishot timers self-close on fire; rearm would race the
+		 * close path. Misuse, fail loudly in debug builds. */
+		ZEND_ASSERT(0 && "rearm requires ZEND_ASYNC_TIMER_F_MULTISHOT");
+		return false;
+	}
+
+	async_timer_event_t *t = (async_timer_event_t *) event;
+	const zend_ulong final_timeout = compute_timer_timeout(timeout, nanoseconds);
+
+	const int error = uv_timer_start(&t->uv_handle,
+	                                 on_timer_event,
+	                                 final_timeout,
+	                                 event->is_periodic ? final_timeout : 0);
+	if (error < 0) {
+		async_throw_error("Failed to rearm timer handle: %s", uv_strerror(error));
+		return false;
+	}
+
+	event->timeout = (unsigned int) final_timeout;
+
+	/* loop_ref_count: rearm does not add a ref. The first start() already
+	 * bumped it; if the timer fired and we are rearming from inside the
+	 * callback, on_timer_event left ref_count alone (only close_event
+	 * touches it, and MULTISHOT bypasses close_event). If the user
+	 * stop()'d the timer before rearm, loop_ref_count was decremented to
+	 * 0 there — re-bump to mirror start(). */
+	if (event->base.loop_ref_count == 0) {
+		event->base.loop_ref_count = 1;
+		ZEND_ASYNC_INCREASE_EVENT_COUNT(&event->base);
+	}
+
+	return true;
+}
+/* }}} */
+
+/* {{{ libuv_new_timer_event */
+zend_async_timer_event_t *
+libuv_new_timer_event(const zend_ulong timeout, const zend_ulong nanoseconds, const bool is_periodic, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_timer_event_t *event =
+			pecalloc(1, extra_size != 0 ? sizeof(async_timer_event_t) + extra_size : sizeof(async_timer_event_t), 0);
+
+	const int error = uv_timer_init(UVLOOP, &event->uv_handle);
+
+	if (error < 0) {
+		async_throw_error("Failed to initialize timer handle: %s", uv_strerror(error));
+		pefree(event, 0);
+		return NULL;
+	}
+
+	event->uv_handle.data = event;
+
+	const zend_ulong final_timeout = compute_timer_timeout(timeout, nanoseconds);
+
+	event->event.timeout = final_timeout;
+	event->event.is_periodic = is_periodic;
+	event->event.base.extra_offset = sizeof(async_timer_event_t);
+	event->event.base.ref_count = 1;
+
+	event->event.base.add_callback = libuv_add_callback;
+	event->event.base.del_callback = libuv_remove_callback;
+	event->event.base.start = libuv_timer_start;
+	event->event.base.stop = libuv_timer_stop;
+	event->event.base.dispose = libuv_timer_dispose;
+	event->event.base.info = libuv_timer_info;
+
+	return &event->event;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+///// Signal API
+////////////////////////////////////////////////////////////////////////////////
+
+/* NOTE: on_signal_event removed - now using global signal management */
+
+/* {{{ libuv_signal_start */
+static bool libuv_signal_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_signal_event_t *signal = (async_signal_event_t *) (event);
+
+	libuv_add_signal_event(signal->event.signal, event);
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_signal_stop */
+static bool libuv_signal_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_signal_event_t *signal = (async_signal_event_t *) (event);
+
+	libuv_remove_signal_event(signal->event.signal, event);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_signal_dispose */
+static bool libuv_signal_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	// Signal cleanup handled by global signal management
+	pefree(event, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_signal_event */
+zend_async_signal_event_t *libuv_new_signal_event(int signum, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_signal_event_t *signal =
+			pecalloc(1, extra_size != 0 ? sizeof(async_signal_event_t) + extra_size : sizeof(async_signal_event_t), 0);
+	signal->event.signal = signum;
+	signal->event.base.extra_offset = sizeof(async_signal_event_t);
+	signal->event.base.ref_count = 1;
+
+	signal->event.base.add_callback = libuv_add_callback;
+	signal->event.base.del_callback = libuv_remove_callback;
+	signal->event.base.start = libuv_signal_start;
+	signal->event.base.stop = libuv_signal_stop;
+	signal->event.base.dispose = libuv_signal_dispose;
+	signal->event.base.info = libuv_signal_info;
+
+	return &signal->event;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Global Signal Management API
+/////////////////////////////////////////////////////////////////////////////////
+/**
+ * **UNIX Signal Handling**
+ *
+ * The Unix signal handling code allows creating multiple wait events for the same signal, but in reality,
+ * there will be only one actual handler for the EventLoop.
+ *
+ * > Note that the `SIGCHLD` handler is also used to detect the process-event.
+ *
+ * **Implementation details of process handling.**
+ *
+ * Because the process exit code can only be retrieved once,
+ * while multiple coroutines may want to wait for the same process,
+ * we use a single EventLoop event for each unique process ID.
+ *
+ * Thus, ASYNC_G(process_events) is a hash table with the key as ProcessId
+ * and the value as an Event for process handling.
+ **/
+
+/* {{{ libuv_signal_close_cb */
+static void libuv_signal_close_cb(uv_handle_t *handle)
+{
+	pefree(handle, 0);
+}
+
+/* }}} */
+
+/* {{{ libuv_global_signal_callback */
+static void libuv_global_signal_callback(uv_signal_t *handle, int signum)
+{
+#ifdef ZEND_SIGNALS
+	/* Forward signal to the Zend handler chain (pcntl, timeout handler, etc.).
+	 * libuv replaced zend_signal_handler_defer with its own sigaction, so Zend
+	 * handlers stored in SIGG(handlers) would never be called otherwise.
+	 * We call them first because they only set flags / enqueue — no PHP
+	 * execution happens here. */
+	zend_signal_entry_t p_sig = SIGG(handlers)[signum - 1];
+
+	if (p_sig.handler != SIG_DFL && p_sig.handler != SIG_IGN) {
+		if (p_sig.flags & SA_SIGINFO) {
+			/* SA_SIGINFO handlers dereference siginfo (pcntl copies it) —
+			 * NULL is not an option here. */
+			siginfo_t siginfo;
+			memset(&siginfo, 0, sizeof(siginfo));
+			siginfo.si_signo = signum;
+			((void (*)(int, siginfo_t *, void *)) p_sig.handler)(signum, &siginfo, NULL);
+		} else {
+			((void (*)(int)) p_sig.handler)(signum);
+		}
+	}
+#endif
+
+	// Handle regular signal events for ALL signals (including SIGCHLD)
+	libuv_handle_signal_events(signum);
+
+	// Additionally handle process events if this is SIGCHLD
+	if (signum == SIGCHLD) {
+		libuv_handle_process_events();
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_get_or_create_signal_handler */
+static uv_signal_t *libuv_get_or_create_signal_handler(int signum)
+{
+	if (ASYNC_G(signal_handlers) == NULL) {
+		ASYNC_G(signal_handlers) = zend_new_array(0);
+	}
+
+	uv_signal_t *handler = zend_hash_index_find_ptr(ASYNC_G(signal_handlers), signum);
+	if (handler != NULL) {
+		return handler;
+	}
+
+	// Create new signal handler
+	handler = pecalloc(1, sizeof(uv_signal_t), 0);
+
+	int error = uv_signal_init(UVLOOP, handler);
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to initialize signal handle: %s", uv_strerror(error));
+		pefree(handler, 0);
+		return NULL;
+	}
+
+#ifdef ZEND_SIGNALS
+	/* Save the current sigaction (zend_signal_handler_defer) before libuv
+	 * overwrites it via uv_signal_start() → sigaction(). */
+	if (signum > 0 && signum < NSIG && !async_signal_active[signum]) {
+		sigaction(signum, NULL, &async_saved_sigactions[signum]);
+		async_signal_active[signum] = true;
+	}
+#endif
+
+	error = uv_signal_start(handler, libuv_global_signal_callback, signum);
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to start signal handle: %s", uv_strerror(error));
+		uv_close((uv_handle_t *) handler, libuv_signal_close_cb);
+		return NULL;
+	}
+
+	if (UNEXPECTED(zend_hash_index_add_ptr(ASYNC_G(signal_handlers), signum, handler) == NULL)) {
+		async_throw_error("Failed to store signal handler");
+		uv_signal_stop(handler);
+		uv_close((uv_handle_t *) handler, libuv_signal_close_cb);
+		return NULL;
+	}
+
+	return handler;
+}
+
+/* }}} */
+
+/* {{{ libuv_add_signal_event */
+static void libuv_add_signal_event(int signum, zend_async_event_t *event)
+{
+	// Ensure signal handler exists
+	uv_signal_t *handler = libuv_get_or_create_signal_handler(signum);
+	if (handler == NULL) {
+		return;
+	}
+
+	// Initialize signal_events if needed
+	if (ASYNC_G(signal_events) == NULL) {
+		ASYNC_G(signal_events) = zend_new_array(0);
+	}
+
+	// Get or create events list for this signal
+	HashTable *events_list = zend_hash_index_find_ptr(ASYNC_G(signal_events), signum);
+	if (events_list == NULL) {
+		events_list = zend_new_array(0);
+
+		if (UNEXPECTED(zend_hash_index_add_ptr(ASYNC_G(signal_events), signum, events_list) == NULL)) {
+			async_throw_error("Failed to store signal event: %d", signum);
+			zend_array_destroy(events_list);
+			return;
+		}
+	}
+
+	// Add event to the list (use pointer address as key)
+	if (UNEXPECTED(zend_hash_index_add_ptr(events_list, async_ptr_to_index(event), event) == NULL)) {
+		async_throw_error("Failed to store signal event");
+		return;
+	}
+
+	/* Waiters must keep the loop alive (idempotent; undoes a chain-only unref). */
+	uv_ref((uv_handle_t *) handler);
+}
+
+/* }}} */
+
+/* {{{ libuv_remove_signal_event */
+static void libuv_remove_signal_event(int signum, zend_async_event_t *event)
+{
+	if (ASYNC_G(signal_events) == NULL) {
+		return;
+	}
+
+	HashTable *events_list = zend_hash_index_find_ptr(ASYNC_G(signal_events), signum);
+	if (events_list == NULL) {
+		return;
+	}
+
+	zend_hash_index_del(events_list, async_ptr_to_index(event));
+
+	// If no more events for this signal, remove the handler (but check for process events if SIGCHLD)
+	if (zend_hash_num_elements(events_list) == 0) {
+		bool can_remove_handler = true;
+
+		// For SIGCHLD, check if there are process events still active
+		if (signum == SIGCHLD && ASYNC_G(process_events) != NULL) {
+			if (zend_hash_num_elements(ASYNC_G(process_events)) > 0) {
+				can_remove_handler = false;
+			}
+		}
+
+		if (can_remove_handler && ASYNC_G(signal_handlers) != NULL) {
+			uv_signal_t *handler = zend_hash_index_find_ptr(ASYNC_G(signal_handlers), signum);
+			if (handler != NULL) {
+				if ((bool) (uintptr_t) handler->data) {
+					/* A Zend-chain subscriber (pcntl etc.) still needs delivery —
+					 * keep the handler armed but stop pinning the loop. */
+					uv_unref((uv_handle_t *) handler);
+				} else {
+					uv_signal_stop(handler);
+#ifdef ZEND_SIGNALS
+					libuv_restore_signal_handler(signum);
+#endif
+					uv_close((uv_handle_t *) handler, libuv_signal_close_cb);
+					zend_hash_index_del(ASYNC_G(signal_handlers), signum);
+				}
+			}
+		}
+
+		zend_hash_destroy(events_list);
+		pefree(events_list, 0);
+		zend_hash_index_del(ASYNC_G(signal_events), signum);
+	}
+}
+
+/* }}} */
+
+#ifdef ZEND_SIGNALS
+/* {{{ libuv_zend_sigaction
+ * zend_sigaction() delegate: instead of the OS sigaction() install, the
+ * reactor takes delivery ownership of the signal. SIGG(handlers) is already
+ * updated by core, and libuv_global_signal_callback forwards every delivery
+ * into that chain — the subscriber keeps firing, through the reactor.
+ * handler->data holds the "Zend-chain subscribed" flag. */
+static bool libuv_zend_sigaction(const int signo)
+{
+	if (!ASYNC_G(reactor_started) || signo <= 0 || signo >= NSIG) {
+		return false;
+	}
+
+	const zend_signal_entry_t entry = SIGG(handlers)[signo - 1];
+	const bool has_handler = entry.handler != (void *) SIG_DFL && entry.handler != (void *) SIG_IGN;
+
+	HashTable *events_list =
+			ASYNC_G(signal_events) != NULL ? zend_hash_index_find_ptr(ASYNC_G(signal_events), signo) : NULL;
+	const bool has_waiters = events_list != NULL && zend_hash_num_elements(events_list) > 0;
+
+	uv_signal_t *owned = ASYNC_G(signal_handlers) != NULL
+			? zend_hash_index_find_ptr(ASYNC_G(signal_handlers), signo)
+			: NULL;
+
+	if (has_handler) {
+		/* Intercept only when the reactor already owns this signal's OS
+		 * handler; a pcntl-only subscription keeps the regular
+		 * zend_signal_handler_defer path (synchronous dispatch semantics). */
+		if (owned == NULL) {
+			return false;
+		}
+
+		owned->data = (void *) (uintptr_t) true;
+		return true;
+	}
+
+	/* SIG_DFL / SIG_IGN: the Zend-chain subscription is gone. */
+	if (owned == NULL) {
+		return false;
+	}
+
+	owned->data = NULL;
+
+	if (has_waiters ||
+		(signo == SIGCHLD && ASYNC_G(process_events) != NULL &&
+		 zend_hash_num_elements(ASYNC_G(process_events)) > 0)) {
+		return true;
+	}
+
+	/* Nobody left — release the signal, core installs its own disposition. */
+	uv_signal_stop(owned);
+	libuv_restore_signal_handler(signo);
+	uv_close((uv_handle_t *) owned, libuv_signal_close_cb);
+	zend_hash_index_del(ASYNC_G(signal_handlers), signo);
+	return false;
+}
+
+/* }}} */
+#endif
+
+/* {{{ libuv_handle_process_events */
+static void libuv_handle_process_events(void)
+{
+	if (ASYNC_G(process_events) == NULL) {
+		return;
+	}
+
+	// Create a copy of events to iterate safely (callbacks may modify the original HashTable)
+	uint32_t num_events = zend_hash_num_elements(ASYNC_G(process_events));
+	if (num_events == 0) {
+		return;
+	}
+
+	zend_async_event_t **events_copy = pecalloc(num_events, sizeof(zend_async_event_t *), 0);
+	if (events_copy == NULL) {
+		return;
+	}
+
+	uint32_t i = 0;
+	zend_async_event_t *event;
+	ZEND_HASH_FOREACH_PTR(ASYNC_G(process_events), event)
+	{
+		events_copy[i++] = event;
+	}
+	ZEND_HASH_FOREACH_END();
+
+	// Process events from the copy
+	for (i = 0; i < num_events; i++) {
+		event = events_copy[i];
+
+		// Get PID to use as key for verification
+		async_process_event_t *process = (async_process_event_t *) event;
+		uintptr_t pid_key = (uintptr_t) process->event.process;
+
+		// Verify event is still in the HashTable (might have been removed)
+		if (ASYNC_G(process_events) == NULL || zend_hash_index_find_ptr(ASYNC_G(process_events), pid_key) == NULL) {
+			continue;
+		}
+
+#ifndef PHP_WIN32
+		pid_t pid = (pid_t) process->event.process;
+		int status;
+		pid_t result = waitpid(pid, &status, WNOHANG);
+
+		if (result == pid) {
+			// Process has exited
+			if (WIFEXITED(status)) {
+				process->event.exit_code = WEXITSTATUS(status);
+			} else if (WIFSIGNALED(status)) {
+				process->event.exit_code = -WTERMSIG(status);
+			} else {
+				process->event.exit_code = -1;
+			}
+
+			ZEND_ASYNC_CALLBACKS_NOTIFY(event, NULL, NULL);
+			// Process event will be removed when stopped
+		}
+#endif
+	}
+
+	pefree(events_copy, 0);
+}
+
+/* }}} */
+
+/* {{{ libuv_handle_signal_events */
+static void libuv_handle_signal_events(const int signum)
+{
+	if (ASYNC_G(signal_events) == NULL) {
+		return;
+	}
+
+	HashTable *events_list = zend_hash_index_find_ptr(ASYNC_G(signal_events), signum);
+	if (events_list == NULL) {
+		return;
+	}
+
+	zend_async_event_t *event;
+	ZEND_HASH_FOREACH_PTR(events_list, event)
+	{
+		ZEND_ASYNC_CALLBACKS_NOTIFY(event, NULL, NULL);
+	}
+	ZEND_HASH_FOREACH_END();
+}
+
+/* }}} */
+
+/* {{{ libuv_add_process_event */
+static void libuv_add_process_event(zend_async_event_t *event)
+{
+	// Ensure SIGCHLD handler exists
+	libuv_get_or_create_signal_handler(SIGCHLD);
+}
+
+/* }}} */
+
+/* {{{ libuv_remove_process_event */
+static void libuv_remove_process_event(zend_async_event_t *event)
+{
+	if (ASYNC_G(process_events) == NULL) {
+		return;
+	}
+
+	// Get process handle from event to use as key
+	async_process_event_t *process_event = (async_process_event_t *) event;
+
+	zend_hash_index_del(ASYNC_G(process_events), (uintptr_t) process_event->event.process);
+
+	// Only remove SIGCHLD handler if no more process events AND no regular signal events for SIGCHLD
+	if (zend_hash_num_elements(ASYNC_G(process_events)) == 0) {
+		bool has_sigchld_signal_events = false;
+
+		// Check if there are regular signal events for SIGCHLD
+		if (ASYNC_G(signal_events) != NULL) {
+			HashTable *sigchld_events = zend_hash_index_find_ptr(ASYNC_G(signal_events), SIGCHLD);
+			if (sigchld_events != NULL && zend_hash_num_elements(sigchld_events) > 0) {
+				has_sigchld_signal_events = true;
+			}
+		}
+
+		// Only remove handler if no signal events exist for SIGCHLD
+		if (!has_sigchld_signal_events && ASYNC_G(signal_handlers) != NULL) {
+			uv_signal_t *handler = zend_hash_index_find_ptr(ASYNC_G(signal_handlers), SIGCHLD);
+			if (handler != NULL) {
+				uv_signal_stop(handler);
+				uv_close((uv_handle_t *) handler, libuv_signal_close_cb);
+				zend_hash_index_del(ASYNC_G(signal_handlers), SIGCHLD);
+			}
+		}
+
+		zend_hash_destroy(ASYNC_G(process_events));
+		pefree(ASYNC_G(process_events), 0);
+		ASYNC_G(process_events) = NULL;
+	}
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Global Signal Management Cleanup Functions
+/////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ libuv_cleanup_signal_handlers */
+static void libuv_cleanup_signal_handlers(void)
+{
+	if (ASYNC_G(signal_handlers) != NULL) {
+		uv_signal_t *handler;
+		ZEND_HASH_FOREACH_PTR(ASYNC_G(signal_handlers), handler)
+		{
+			if (handler != NULL) {
+				uv_signal_stop(handler);
+#ifdef ZEND_SIGNALS
+				libuv_restore_signal_handler(handler->signum);
+#endif
+				uv_close((uv_handle_t *) handler, libuv_signal_close_cb);
+			}
+		}
+		ZEND_HASH_FOREACH_END();
+
+		zend_array_destroy(ASYNC_G(signal_handlers));
+		ASYNC_G(signal_handlers) = NULL;
+	}
+}
+
+/* }}} */
+
+/* {{{ libuv_cleanup_signal_events */
+static void libuv_cleanup_signal_events(void)
+{
+	if (ASYNC_G(signal_events) != NULL) {
+		HashTable *events_list;
+		ZEND_HASH_FOREACH_PTR(ASYNC_G(signal_events), events_list)
+		{
+			if (events_list != NULL) {
+				zend_hash_destroy(events_list);
+				pefree(events_list, 0);
+			}
+		}
+		ZEND_HASH_FOREACH_END();
+
+		zend_array_destroy(ASYNC_G(signal_events));
+		ASYNC_G(signal_events) = NULL;
+	}
+}
+
+/* }}} */
+
+/* {{{ libuv_cleanup_process_events */
+static void libuv_cleanup_process_events(void)
+{
+	if (ASYNC_G(process_events) != NULL) {
+		zend_array_destroy(ASYNC_G(process_events));
+		ASYNC_G(process_events) = NULL;
+	}
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Process API
+/////////////////////////////////////////////////////////////////////////////////
+
+#ifdef PHP_WIN32
+static void process_watcher_thread(void *args)
+{
+	LIBUV_REACTOR_VAR_FROM(args);
+
+	ULONG_PTR completionKey;
+
+	while (reactor->isRunning && reactor->ioCompletionPort != NULL) {
+
+		DWORD lpNumberOfBytesTransferred;
+		// OVERLAPPED overlapped = {0};
+		LPOVERLAPPED lpOverlapped = NULL;
+
+		if (false ==
+			GetQueuedCompletionStatus(
+					reactor->ioCompletionPort, &lpNumberOfBytesTransferred, &completionKey, &lpOverlapped, INFINITE)) {
+			break;
+		}
+
+		if (completionKey == 0) {
+			continue;
+		}
+
+		if (reactor->isRunning == false) {
+			break;
+		}
+
+		switch (lpNumberOfBytesTransferred) {
+			case JOB_OBJECT_MSG_EXIT_PROCESS:
+			case JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS:
+				goto handleExitCode;
+			// JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO always accompanies EXIT_PROCESS for
+			// single-process jobs — ignore it to avoid double-processing the same event.
+			default:
+				continue;
+		}
+
+	handleExitCode:
+
+		async_process_event_t *process_event = (async_process_event_t *) completionKey;
+
+		if (UNEXPECTED(circular_buffer_is_full(reactor->pid_queue))) {
+
+			uv_async_send(reactor->uvloop_wakeup);
+
+			unsigned int delay = 1;
+
+			while (reactor->isRunning && circular_buffer_is_full(reactor->pid_queue)) {
+				usleep(delay);
+				delay = MIN(delay << 1, 1000);
+			}
+
+			if (false == reactor->isRunning) {
+				break;
+			}
+		}
+
+		circular_buffer_push(reactor->pid_queue, &process_event, false);
+		uv_async_send(reactor->uvloop_wakeup);
+	}
+}
+
+static void libuv_start_process_watcher(void);
+static void libuv_stop_process_watcher(void);
+
+static void on_process_event(uv_async_t *handle)
+{
+	LIBUV_REACTOR_VAR;
+
+	if (reactor->pid_queue == NULL || circular_buffer_is_empty(reactor->pid_queue)) {
+		return;
+	}
+
+	async_process_event_t *process_event;
+
+	while (reactor->pid_queue && circular_buffer_is_not_empty(reactor->pid_queue)) {
+		circular_buffer_pop(reactor->pid_queue, &process_event);
+
+		DWORD exit_code;
+		GetExitCodeProcess(process_event->event.process, &exit_code);
+
+		process_event->event.exit_code = exit_code;
+
+		if (reactor->countWaitingDescriptors > 0) {
+			reactor->countWaitingDescriptors--;
+
+			if (reactor->countWaitingDescriptors == 0) {
+				libuv_stop_process_watcher();
+			}
+		}
+
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&process_event->event.base, NULL, NULL);
+		process_event->event.base.stop(&process_event->event.base);
+		IF_EXCEPTION_STOP_REACTOR;
+	}
+}
+
+static void libuv_start_process_watcher(void)
+{
+	if (WATCHER != NULL) {
+		return;
+	}
+
+	uv_thread_t *thread = pecalloc(1, sizeof(uv_thread_t), 0);
+
+	if (thread == NULL) {
+		return;
+	}
+
+	LIBUV_REACTOR_VAR;
+
+	// Create IoCompletionPort
+	reactor->ioCompletionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+
+	if (reactor->ioCompletionPort == NULL) {
+		char *error_msg = php_win32_error_to_msg((HRESULT) GetLastError());
+		php_error_docref(NULL, E_CORE_ERROR, "Failed to create IO completion port: %s", error_msg);
+		php_win32_error_msg_free(error_msg);
+		return;
+	}
+
+	reactor->isRunning = true;
+	reactor->countWaitingDescriptors = 0;
+
+	int error = uv_thread_create(thread, process_watcher_thread, reactor);
+
+	if (error < 0) {
+		uv_thread_detach(thread);
+		pefree(thread, 0);
+		reactor->isRunning = false;
+		php_error_docref(NULL, E_CORE_ERROR, "Failed to create process watcher thread: %s", uv_strerror(error));
+		return;
+	}
+
+	WATCHER = thread;
+	reactor->uvloop_wakeup = pecalloc(1, sizeof(uv_async_t), 0);
+
+	error = uv_async_init(UVLOOP, reactor->uvloop_wakeup, on_process_event);
+	reactor->pid_queue = pecalloc(1, sizeof(circular_buffer_t), 0);
+	circular_buffer_ctor(reactor->pid_queue, 64, sizeof(async_process_event_t *), NULL);
+
+	if (error < 0) {
+		uv_thread_detach(thread);
+		reactor->isRunning = false;
+		pefree(thread, 0);
+		WATCHER = NULL;
+		php_error_docref(NULL, E_CORE_ERROR, "Failed to initialize async handle: %s", uv_strerror(error));
+	}
+}
+
+static void libuv_wakeup_close_cb(uv_handle_t *handle)
+{
+	pefree(handle, 0);
+}
+
+/* {{{ libuv_stop_process_watcher */
+static void libuv_stop_process_watcher(void)
+{
+	if (WATCHER == NULL) {
+		return;
+	}
+
+	LIBUV_REACTOR_VAR;
+
+	reactor->isRunning = false;
+
+	uv_close((uv_handle_t *) reactor->uvloop_wakeup, libuv_wakeup_close_cb);
+	reactor->uvloop_wakeup = NULL;
+
+	// send wake up event to stop the thread
+	PostQueuedCompletionStatus(reactor->ioCompletionPort, 0, (ULONG_PTR) 0, NULL);
+	uv_thread_detach(WATCHER);
+	pefree(WATCHER, 0);
+	WATCHER = NULL;
+
+	// Stop IO completion port
+	CloseHandle(reactor->ioCompletionPort);
+	reactor->ioCompletionPort = NULL;
+
+	// Stop circular buffer (circular_buffer_destroy frees the struct itself)
+	circular_buffer_destroy(reactor->pid_queue);
+	reactor->pid_queue = NULL;
+}
+
+/* }}} */
+
+/* {{{ libuv_process_event_start */
+static bool libuv_process_event_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_process_event_t *process = (async_process_event_t *) (event);
+
+	if (process->hJob != NULL) {
+		return true;
+	}
+
+	DWORD exitCode = 0;
+	if (GetExitCodeProcess(process->event.process, &exitCode) && exitCode != STILL_ACTIVE) {
+		async_throw_error("Process has already terminated: %d", exitCode);
+		return false;
+	}
+
+	process->hJob = CreateJobObject(NULL, NULL);
+
+	DWORD error;
+
+	if (AssignProcessToJobObject(process->hJob, process->event.process) == 0) {
+
+		CloseHandle(process->hJob);
+		process->hJob = NULL;
+
+		error = GetLastError();
+		if (error == ERROR_SUCCESS) {
+			exitCode = 0;
+			GetExitCodeProcess(process->event.process, &exitCode);
+			process->event.exit_code = (zend_long) exitCode;
+			ZEND_ASYNC_EVENT_SET_CLOSED(event);
+			ZEND_ASYNC_CALLBACKS_NOTIFY(&process->event.base, NULL, NULL);
+			return true;
+		}
+
+		char *error_msg = php_win32_error_to_msg((HRESULT) error);
+		async_throw_error("Failed to assign process to job object: %s", error_msg);
+		php_win32_error_msg_free(error_msg);
+		return false;
+	}
+
+	if (WATCHER == NULL) {
+		libuv_start_process_watcher();
+	}
+
+	JOBOBJECT_ASSOCIATE_COMPLETION_PORT info = { 0 };
+	info.CompletionKey = (PVOID) process;
+	info.CompletionPort = LIBUV_REACTOR->ioCompletionPort;
+
+	if (!SetInformationJobObject(process->hJob, JobObjectAssociateCompletionPortInformation, &info, sizeof(info))) {
+		CloseHandle(process->hJob);
+		process->hJob = NULL;
+
+		error = GetLastError();
+		if (error == ERROR_SUCCESS) {
+			exitCode = 0;
+			GetExitCodeProcess(process->event.process, &exitCode);
+			process->event.exit_code = (zend_long) exitCode;
+			ZEND_ASYNC_EVENT_SET_CLOSED(event);
+			ZEND_ASYNC_CALLBACKS_NOTIFY(&process->event.base, NULL, NULL);
+			return true;
+		}
+
+		char *error_msg = php_win32_error_to_msg((HRESULT) error);
+		async_throw_error("Failed to associate IO completion port with Job for process: %s", error_msg);
+		php_win32_error_msg_free(error_msg);
+		return false;
+	}
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	LIBUV_REACTOR->countWaitingDescriptors++;
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_process_event_stop */
+static bool libuv_process_event_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	ZEND_ASYNC_EVENT_SET_CLOSED(event);
+	async_process_event_t *process = (async_process_event_t *) event;
+	event->loop_ref_count = 0;
+
+	if (process->hJob != NULL) {
+		CloseHandle(process->hJob);
+		process->hJob = NULL;
+	}
+
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+#else
+// Unix process handle
+static bool libuv_process_event_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_process_event_t *process = (async_process_event_t *) (event);
+	pid_t pid = (pid_t) process->event.process;
+
+	// Add handler first to guarantee we catch SIGCHLD
+	libuv_add_process_event(event);
+
+	// Check if process already terminated (zombie state)
+	int exit_status;
+	pid_t result = waitpid(pid, &exit_status, WNOHANG);
+
+	if (result == pid) {
+		// Process already terminated, got exit code
+		if (WIFEXITED(exit_status)) {
+			process->event.exit_code = WEXITSTATUS(exit_status);
+		} else if (WIFSIGNALED(exit_status)) {
+			process->event.exit_code = -WTERMSIG(exit_status);
+		} else {
+			process->event.exit_code = -1;
+		}
+
+		event->stop(event);
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&process->event.base, NULL, NULL);
+		return true;
+	} else if (result == 0) {
+		// Process still running, wait for SIGCHLD
+		event->loop_ref_count = 1;
+		ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+		return true;
+	} else {
+		if (errno == ECHILD) {
+			/* Child was already reaped externally. Treat as exited with unknown status. */
+			process->event.exit_code = -1;
+			event->stop(event);
+			ZEND_ASYNC_CALLBACKS_NOTIFY(&process->event.base, NULL, NULL);
+			return true;
+		}
+
+		// Error: process doesn't exist or other waitpid error
+		libuv_remove_process_event(event);
+		zend_object *exception = async_new_exception(
+				async_ce_async_exception, "Failed to monitor process %d: %s", (int) pid, strerror(errno));
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&process->event.base, NULL, exception);
+		OBJ_RELEASE(exception);
+		return EG(exception) == NULL;
+	}
+}
+
+static bool libuv_process_event_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+	ZEND_ASYNC_EVENT_SET_CLOSED(event);
+
+	// Remove from process monitoring
+	libuv_remove_process_event(event);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+#endif
+
+/* {{{ libuv_process_event_dispose */
+static bool libuv_process_event_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	// Remove from process_events hash before freeing to prevent UAF via stale hash pointer
+	const zend_process_t proc_handle = ((zend_async_process_event_t *) event)->process;
+	if ((uintptr_t) proc_handle != 0 && ASYNC_G(process_events) != NULL) {
+		zend_hash_index_del(ASYNC_G(process_events), (zend_ulong) (uintptr_t) proc_handle);
+	}
+
+#ifdef PHP_WIN32
+
+	async_process_event_t *process = (async_process_event_t *) (event);
+
+	if (process->hJob != NULL) {
+		CloseHandle(process->hJob);
+		process->hJob = NULL;
+	}
+#endif
+
+	pefree(event, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_process_event */
+zend_async_process_event_t *libuv_new_process_event(zend_process_t process_handle, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	// Use process handle as key for hash lookup
+	uintptr_t pid_key = (uintptr_t) process_handle;
+
+	// Initialize process_events if needed
+	if (ASYNC_G(process_events) == NULL) {
+		ASYNC_G(process_events) = zend_new_array(0);
+	}
+
+	// Check if we already have an event for this process
+	zend_async_process_event_t *existing_event = zend_hash_index_find_ptr(ASYNC_G(process_events), pid_key);
+	if (existing_event != NULL) {
+		// Found existing event - increment ref count and return it
+		ZEND_ASYNC_EVENT_ADD_REF(&existing_event->base);
+		return existing_event;
+	}
+
+	// Create new event only if one doesn't exist
+	async_process_event_t *process_event = pecalloc(
+			1, extra_size != 0 ? sizeof(async_process_event_t) + extra_size : sizeof(async_process_event_t), 0);
+
+	process_event->event.process = process_handle;
+	process_event->event.base.extra_offset = sizeof(async_process_event_t);
+	process_event->event.base.ref_count = 1;
+
+	process_event->event.base.add_callback = libuv_add_callback;
+	process_event->event.base.del_callback = libuv_remove_callback;
+	process_event->event.base.start = libuv_process_event_start;
+	process_event->event.base.stop = libuv_process_event_stop;
+	process_event->event.base.dispose = libuv_process_event_dispose;
+	process_event->event.base.info = libuv_process_info;
+
+	if (UNEXPECTED(zend_hash_index_add_ptr(ASYNC_G(process_events), pid_key, &process_event->event) == NULL)) {
+		async_throw_error("Failed to store process event");
+		return NULL;
+	}
+
+	return &process_event->event;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Thread API
+/////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ libuv_thread_notify_cb - called on parent loop when child thread finishes */
+static void libuv_thread_notify_cb(uv_async_t *handle)
+{
+	async_thread_event_t *thread = handle->data;
+
+	/* Load persistent result/exception into parent thread's emalloc */
+	ZEND_ASYNC_THREAD_LOAD_RESULT(&thread->event);
+
+	if (UNEXPECTED(EG(exception) != NULL)) {
+		zend_object *exception = EG(exception);
+		GC_ADDREF(exception);
+		zend_clear_exception();
+
+		if (thread->event.exception != NULL) {
+			zend_exception_set_previous(thread->event.exception, exception);
+		} else {
+			thread->event.exception = exception;
+		}
+	}
+
+	/* Set CLOSED AFTER stop(): the stop prologue short-circuits on a closed
+	 * event and would skip the disarm (unref + uncount). */
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&thread->event.base, &thread->event.result, thread->event.exception);
+	thread->event.base.stop(&thread->event.base);
+	ZEND_ASYNC_EVENT_SET_CLOSED(&thread->event.base);
+
+	if (ZEND_ASYNC_EVENT_IS_EXCEPTION_HANDLED(&thread->event.base)) {
+		ZEND_THREAD_SET_EXCEPTION_CONSUMED(&thread->event);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_thread_notify — callback for notify_parent */
+static void libuv_thread_notify(zend_async_thread_event_t *event)
+{
+	async_thread_event_t *thread = (async_thread_event_t *) event;
+	uv_async_send(&thread->uv_notify);
+}
+
+/* }}} */
+
+/* {{{ libuv_thread_event_start */
+static bool libuv_thread_event_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_thread_event_t *thread = (async_thread_event_t *) event;
+
+	/* First start() is the spawn call: create the OS thread and stay transparent
+	 * (no ref/count). loop_ref_count stays 0 so the first awaiter's start() arms. */
+	if ((event->flags & ASYNC_THREAD_F_LAUNCHED) == 0) {
+
+		if (thread->event.context) {
+			zend_atomic_ptr_store(&thread->event.context->event, &thread->event);
+			ZEND_ASYNC_THREAD_CONTEXT_ADDREF(thread->event.context);
+		}
+
+		/* Assign+register the key BEFORE uv_thread_create: a fast-exiting runner
+		 * that reads key == 0 skips self-removal and the registry entry leaks. */
+		libuv_thread_registry_init();
+
+		if (thread->event.context) {
+			thread->event.context->key =
+				(zend_async_thread_handle_t) async_ptr_to_index(thread->event.context);
+			libuv_thread_registry_add(thread->event.context->key);
+		}
+
+		const int ret = uv_thread_create(&thread->uv_handle, zend_async_thread_run_fn, thread->event.context);
+
+		if (UNEXPECTED(ret != 0)) {
+			if (thread->event.context) {
+				libuv_thread_registry_remove(thread->event.context->key);
+				thread->event.context->key = 0;
+				zend_atomic_int_dec(&thread->event.context->ref_count);
+			}
+
+			async_throw_error("Failed to create thread: %s", uv_strerror(ret));
+			return false;
+		}
+
+		event->flags |= ASYNC_THREAD_F_LAUNCHED;
+		return true;
+	}
+
+	/* Subsequent start() is an awaiter: arm the wait so the parent loop blocks
+	 * for completion (ref the notify handle and count the event). */
+	uv_ref((uv_handle_t *) &thread->uv_notify);
+	ZEND_ASYNC_EVENT_CLR_HIDDEN(event);
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_thread_event_stop */
+static bool libuv_thread_event_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_thread_event_t *thread = (async_thread_event_t *) event;
+
+	/* Last awaiter left: disarm back to transparent. Decrement before hiding
+	 * (the count macro is a no-op on hidden events). CLOSED is set on actual
+	 * completion in libuv_thread_notify_cb, not here. */
+	uv_unref((uv_handle_t *) &thread->uv_notify);
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	ZEND_ASYNC_EVENT_SET_HIDDEN(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_thread_event_dispose */
+static bool libuv_thread_event_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_thread_event_t *thread = (async_thread_event_t *) event;
+
+	/* Release event's ref on context */
+	if (thread->event.context) {
+		zend_async_thread_context_t *ctx = thread->event.context;
+
+		/* Detach the event from the context before freeing it: store NULL so
+		 * a child that has not yet reached its handoff bails out, then take
+		 * event_mutex as an empty barrier to drain a handoff already in
+		 * progress. After this, the child can no longer touch this event. */
+		zend_atomic_ptr_store(&ctx->event, NULL);
+		ZEND_ASYNC_THREAD_CONTEXT_EVENT_MUTEX_LOCK(ctx);
+		ZEND_ASYNC_THREAD_CONTEXT_EVENT_MUTEX_UNLOCK(ctx);
+
+		thread->event.context = NULL;
+		ZEND_ASYNC_THREAD_CONTEXT_RELEASE(ctx);
+	}
+
+	if (thread->event.filename) {
+		zend_string_release(thread->event.filename);
+		thread->event.filename = NULL;
+	}
+
+	/* Result/exception cleanup depends on whether notify_cb has
+	 * converted them from pemalloc to emalloc */
+	if (ZEND_THREAD_IS_RESULT_LOADED(&thread->event)) {
+		zval_ptr_dtor(&thread->event.result);
+		if (thread->event.exception) {
+			if (ZEND_THREAD_IS_EXCEPTION_CONSUMED(&thread->event)) {
+				OBJ_RELEASE(thread->event.exception);
+			} else {
+				EG(exception) = thread->event.exception;
+			}
+		}
+	} else {
+		if (!Z_ISUNDEF(thread->event.result)) {
+			async_thread_release_transferred_zval(&thread->event.result);
+		}
+		if (thread->event.exception) {
+			zval exc_pz;
+			ZVAL_OBJ(&exc_pz, thread->event.exception);
+			async_thread_release_transferred_zval(&exc_pz);
+		}
+	}
+	ZVAL_UNDEF(&thread->event.result);
+	thread->event.exception = NULL;
+
+	uv_close((uv_handle_t *) &thread->uv_notify, libuv_close_handle_cb);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_thread_replay — replay result/exception for already-completed thread */
+static bool libuv_thread_replay(zend_async_event_t *event,
+	zend_async_event_callback_t *callback, zval *result, zend_object **exception)
+{
+	zend_async_thread_event_t *thread_event = (zend_async_thread_event_t *) event;
+
+	if (!ZEND_ASYNC_EVENT_IS_CLOSED(event)) {
+		return false;
+	}
+
+	if (callback != NULL) {
+		callback->callback(event, callback, &thread_event->result, thread_event->exception);
+
+		if (ZEND_ASYNC_EVENT_IS_EXCEPTION_HANDLED(&thread_event->base)) {
+			ZEND_THREAD_SET_EXCEPTION_CONSUMED(thread_event);
+		}
+
+		return true;
+	}
+
+	if (result != NULL && !Z_ISUNDEF(thread_event->result)) {
+		ZVAL_COPY(result, &thread_event->result);
+	}
+
+	if (exception == NULL && thread_event->exception != NULL) {
+		zval exc_zv;
+		ZVAL_OBJ_COPY(&exc_zv, thread_event->exception);
+		zend_throw_exception_object(&exc_zv);
+		ZEND_THREAD_SET_EXCEPTION_CONSUMED(thread_event);
+	} else if (exception != NULL && thread_event->exception != NULL) {
+		*exception = thread_event->exception;
+		GC_ADDREF(*exception);
+		ZEND_THREAD_SET_EXCEPTION_CONSUMED(thread_event);
+	}
+
+	return thread_event->exception != NULL || !Z_ISUNDEF(thread_event->result);
+}
+
+/* }}} */
+
+/* {{{ libuv_thread_info */
+static zend_string *libuv_thread_info(zend_async_event_t *event)
+{
+	async_thread_event_t *thread = (async_thread_event_t *) event;
+
+	int64_t tid = thread->event.context ? zend_atomic_int64_load(&thread->event.context->thread_id) : 0;
+
+	return zend_strpprintf(0, "thread #%" PRId64 " spawned at %s:%u",
+		tid,
+		thread->event.filename ? ZSTR_VAL(thread->event.filename) : "unknown",
+		thread->event.lineno);
+}
+
+/* }}} */
+
+/* {{{ libuv_new_thread_event */
+zend_async_thread_event_t *libuv_new_thread_event(
+	const zend_fcall_t *entry, const zend_fcall_t *bootloader, const uint32_t thread_flags, const size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	const size_t alloc_size = extra_size != 0
+		? sizeof(async_thread_event_t) + extra_size
+		: sizeof(async_thread_event_t);
+
+	/* ecalloc (persistent=0): lives in parent's emalloc heap.
+	 * Safe because parent outlives child thread (uv_thread_join in stop). */
+	async_thread_event_t *thread_event = pecalloc(1, alloc_size, 0);
+
+	thread_event->event.thread_flags = thread_flags;
+	thread_event->event.base.extra_offset = sizeof(async_thread_event_t);
+	thread_event->event.base.ref_count = 1;
+
+	thread_event->event.base.add_callback = libuv_add_callback;
+	thread_event->event.base.del_callback = libuv_remove_callback;
+	thread_event->event.base.start = libuv_thread_event_start;
+	thread_event->event.base.stop = libuv_thread_event_stop;
+	thread_event->event.base.dispose = libuv_thread_event_dispose;
+	thread_event->event.base.replay = libuv_thread_replay;
+	thread_event->event.base.info = libuv_thread_info;
+
+	ZVAL_UNDEF(&thread_event->event.result);
+	thread_event->event.exception = NULL;
+	thread_event->event.filename = NULL;
+	thread_event->event.lineno = 0;
+
+	/* Set notify callback for child → parent notification */
+	thread_event->event.notify_parent = libuv_thread_notify;
+
+	/* Create thread context (persistent, ref-counted) */
+	zend_async_thread_context_t *ctx = pecalloc(1, sizeof(zend_async_thread_context_t), 1);
+	ZEND_ATOMIC_INT_INIT(&ctx->ref_count, 1); /* event holds one ref */
+	ZEND_ATOMIC_INT64_INIT(&ctx->thread_id, 0);
+	ctx->snapshot = NULL;
+	ctx->bailout_error_message = NULL;
+	zend_atomic_ptr_init(&ctx->event, NULL); /* set in start when thread is launched */
+	ctx->event_mutex = NULL; /* allocated below, after all early-failure paths */
+	ctx->internal_entry = NULL;
+
+	/* Create snapshot: deep-copy entry closure + optional bootloader + parent context.
+	 * Snapshot creation may fail (return NULL) if a captured variable's
+	 * transfer_obj handler refuses — e.g. FutureState already transferred
+	 * to another thread. The exception is already set by the handler. */
+	if (entry != NULL) {
+		ctx->snapshot = ZEND_ASYNC_THREAD_SNAPSHOT_CREATE(entry, bootloader);
+		if (UNEXPECTED(ctx->snapshot == NULL)) {
+			pefree(ctx, 1);
+			pefree(thread_event, 0);
+			return NULL;
+		}
+	}
+
+	thread_event->event.context = ctx;
+
+	/* Initialize cross-thread notification handle */
+	const int ret = uv_async_init(UVLOOP, &thread_event->uv_notify, libuv_thread_notify_cb);
+
+	if (UNEXPECTED(ret != 0)) {
+		if (ctx->snapshot) {
+			ZEND_ASYNC_THREAD_SNAPSHOT_DESTROY(ctx->snapshot);
+		}
+		pefree(ctx, 1);
+		pefree(thread_event, 0);
+		async_throw_error("Failed to init thread notification: %s", uv_strerror(ret));
+		return NULL;
+	}
+
+	thread_event->uv_notify.data = thread_event;
+
+	/* Transparent by default: notify stays armed but unref'd (does not keep the
+	 * parent loop alive) and the event is hidden (not counted). start() arms the
+	 * wait (ref + count) only when someone awaits. */
+	uv_unref((uv_handle_t *) &thread_event->uv_notify);
+	ZEND_ASYNC_EVENT_SET_HIDDEN(&thread_event->event.base);
+
+	/* Allocate last: every early-failure path above pefree's ctx directly,
+	 * so keeping the mutex out of those paths avoids a leak. No-op under NTS. */
+	ZEND_ASYNC_THREAD_CONTEXT_EVENT_MUTEX_ALLOC(ctx);
+
+	return &thread_event->event;
+}
+
+/* }}} */
+
+/* {{{ libuv_start_thread — start lightweight thread via async_thread_run */
+static zend_async_thread_handle_t libuv_start_thread(
+	zend_async_thread_internal_entry_t *entry, zend_async_thread_context_t *context)
+{
+	/* entry ownership moves to context */
+	context->internal_entry = entry;
+
+	/* Add ref on context for the runner */
+	ZEND_ASYNC_THREAD_CONTEXT_ADDREF(context);
+
+	/* Initialise registry and assign+register the key BEFORE uv_thread_create.
+	 * See start_thread comment above for why post-create assignment races. */
+	libuv_thread_registry_init();
+	context->key = (zend_async_thread_handle_t) async_ptr_to_index(context);
+	const zend_async_thread_handle_t key = context->key;
+	libuv_thread_registry_add(key);
+
+	uv_thread_t uv_handle;
+	const int ret = uv_thread_create(&uv_handle, zend_async_thread_run_fn, context);
+
+	if (UNEXPECTED(ret != 0)) {
+		libuv_thread_registry_remove(key);
+		context->key = 0;
+		zend_atomic_int_dec(&context->ref_count);
+		context->internal_entry = NULL;
+		async_throw_error("Failed to create thread: %s", uv_strerror(ret));
+		return 0;
+	}
+
+	/* The handle is discarded and nothing ever joins these threads — detach, or
+	 * every exited worker leaks its 8MB stack (per rotation under reload,
+	 * true-async/server#93). pthread_detach directly: the uv_thread_detach
+	 * wrapper only exists since libuv 1.50, our minimum is 1.45. */
+#ifdef PHP_WIN32
+	uv_thread_detach(&uv_handle);
+#else
+	pthread_detach(uv_handle);
+#endif
+
+	/* Do NOT touch `context` after a successful create: the runner holds the
+	 * only ref (pool workers have no owning Thread object), so a fast-exiting
+	 * worker — e.g. a bootloader that throws immediately — can RELEASE and free
+	 * context before this returns. Return the key captured before the spawn. */
+	return key;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Thread Pool API
+/////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ libuv_task_work_cb - runs in thread pool worker thread */
+static void libuv_task_work_cb(uv_work_t *req)
+{
+	libuv_work_wrapper_t *wrapper = (libuv_work_wrapper_t *) req;
+
+	/* Execute the task's run function in the worker thread.
+	 * No PHP/Zend API access is allowed here. */
+	wrapper->task->run(wrapper->task);
+}
+
+/* }}} */
+
+/* {{{ libuv_task_after_work_cb - runs on event loop thread */
+static void libuv_task_after_work_cb(uv_work_t *req, int status)
+{
+	libuv_work_wrapper_t *wrapper = (libuv_work_wrapper_t *) req;
+	zend_async_task_t *task = wrapper->task;
+	zend_object *exception = NULL;
+
+	close_event(&task->base);
+
+	if (status == UV_ECANCELED) {
+		exception = async_new_exception(async_ce_cancellation_exception, "Thread pool task was cancelled");
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&task->base, NULL, exception);
+
+	if (exception != NULL) {
+		OBJ_RELEASE(exception);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+
+	/* Free only the wrapper, not the task */
+	pefree(wrapper, 0);
+
+	/* Drop the in-flight ref from libuv_queue_task; worker has returned. */
+	ZEND_ASYNC_EVENT_RELEASE(&task->base);
+}
+
+/* }}} */
+
+/* {{{ libuv_task_start */
+static bool libuv_task_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_task_stop */
+static bool libuv_task_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_task_dispose */
+static bool libuv_task_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+	pefree(event, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_task */
+static zend_async_task_t *libuv_new_task(zend_async_task_run_t run, void *data, size_t extra_size)
+{
+	if (UNEXPECTED(run == NULL)) {
+		async_throw_error("Cannot create a task without a run function");
+		return NULL;
+	}
+
+	const size_t total_size = sizeof(zend_async_task_t) + extra_size;
+	zend_async_task_t *task = pecalloc(1, total_size, 0);
+
+	zend_async_event_t *event = &task->base;
+	event->ref_count = 1;
+	event->extra_offset = extra_size > 0 ? sizeof(zend_async_task_t) : 0;
+	event->add_callback = libuv_add_callback;
+	event->del_callback = libuv_remove_callback;
+	event->start = libuv_task_start;
+	event->stop = libuv_task_stop;
+	event->dispose = libuv_task_dispose;
+	event->info = libuv_task_info;
+
+	task->run = run;
+	task->data = data;
+
+	return task;
+}
+
+/* }}} */
+
+/* {{{ libuv_queue_task */
+static bool libuv_queue_task(zend_async_task_t *task)
+{
+	if (UNEXPECTED(task == NULL)) {
+		async_throw_error("Cannot queue a NULL task");
+		return false;
+	}
+
+	if (UNEXPECTED(task->run == NULL)) {
+		async_throw_error("Cannot queue a task without a run function");
+		return false;
+	}
+
+	if (UNEXPECTED(ASYNC_G(reactor_started) == false)) {
+		libuv_reactor_startup();
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			return false;
+		}
+	}
+
+	/* Allocate the libuv work wrapper */
+	libuv_work_wrapper_t *wrapper = pecalloc(1, sizeof(libuv_work_wrapper_t), 0);
+	wrapper->task = task;
+
+	/* Queue the work to libuv's thread pool */
+	int error = uv_queue_work(UVLOOP, &wrapper->uv_req, libuv_task_work_cb, libuv_task_after_work_cb);
+
+	if (error < 0) {
+		pefree(wrapper, 0);
+		async_throw_error("Failed to queue thread pool task: %s", uv_strerror(error));
+		return false;
+	}
+
+	/* In-flight work owns a ref so the task outlives the worker even if the
+	 * awaiting coroutine is cancelled mid-run. Released in after_work_cb. */
+	ZEND_ASYNC_EVENT_ADD_REF(&task->base);
+
+	return true;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// File System API
+/////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ on_filesystem_event */
+static void on_filesystem_event(uv_fs_event_t *handle, const char *filename, int events, int status)
+{
+	async_filesystem_event_t *fs_event = handle->data;
+
+	// Reset previous triggered filename
+	if (fs_event->event.triggered_filename) {
+		zend_string_release(fs_event->event.triggered_filename);
+		fs_event->event.triggered_filename = NULL;
+	}
+
+	fs_event->event.triggered_events = 0;
+
+	if (status < 0) {
+		zend_object *exception = async_new_exception(
+				async_ce_input_output_exception, "Filesystem monitoring error: %s", uv_strerror(status));
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&fs_event->event.base, NULL, exception);
+		zend_object_release(exception);
+		return;
+	}
+
+	if (events & UV_RENAME) {
+		fs_event->event.triggered_events |= ZEND_ASYNC_FS_EVENT_RENAME;
+	}
+	if (events & UV_CHANGE) {
+		fs_event->event.triggered_events |= ZEND_ASYNC_FS_EVENT_CHANGE;
+	}
+
+	fs_event->event.triggered_filename = filename ? zend_string_init(filename, strlen(filename), 0) : NULL;
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&fs_event->event.base, NULL, NULL);
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* Native UV_FS_EVENT_RECURSIVE exists only on macOS (FSEvents) and Windows
+ * (ReadDirectoryChangesW); elsewhere (Linux/inotify, BSD) we emulate it. */
+#if defined(__APPLE__) || defined(PHP_WIN32)
+# define ASYNC_FS_HAS_NATIVE_RECURSIVE 1
+#else
+# define ASYNC_FS_HAS_NATIVE_RECURSIVE 0
+#endif
+
+#if !ASYNC_FS_HAS_NATIVE_RECURSIVE
+/* One inotify watch per directory, so an unbounded tree would otherwise exhaust
+ * fs.inotify.max_user_watches. Bounds both watch count and walk breadth. */
+#define ASYNC_FS_MAX_WATCH_DIRS 8192
+
+static void async_fs_watch_walk(async_filesystem_event_t *fs_event, const char *abs_path, const char *rel_prefix);
+static bool async_fs_watch_add_dir(async_filesystem_event_t *fs_event, zend_string *abs_path, zend_string *rel_prefix);
+
+#if ASYNC_FS_EMULATE_DIFF
+/* Record the immediate children (files and directories) of abs_path into set,
+ * used as a whole-directory listing (no '.'/'..') for diffing against later. */
+static void async_fs_snapshot_dir(const char *abs_path, HashTable *set)
+{
+	DIR *dir = opendir(abs_path);
+
+	if (dir == NULL) {
+		return;
+	}
+
+	struct dirent *ent;
+
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.'
+			&& (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+			continue;
+		}
+
+		zend_hash_str_add_empty_element(set, ent->d_name, strlen(ent->d_name));
+	}
+
+	closedir(dir);
+}
+#endif
+
+/* Close cb for a node that failed to start: free the node only, never touch the
+ * owner (it may already be tearing down on its own pending_close accounting). */
+static void async_fs_watch_dir_orphan_close_cb(uv_handle_t *handle)
+{
+	async_fs_watch_dir_t *node = handle->data;
+
+	if (node->abs_path != NULL) {
+		zend_string_release(node->abs_path);
+	}
+
+	if (node->rel_prefix != NULL) {
+		zend_string_release(node->rel_prefix);
+	}
+
+#if ASYNC_FS_EMULATE_DIFF
+	zend_hash_destroy(&node->entries);
+#endif
+
+	pefree(node, 0);
+}
+
+/* Close cb for a node torn down as part of the owner's dispose. Frees the node,
+ * then frees the owning event once its last node handle has closed — so a node
+ * never outlives the event it points back at. */
+static void async_fs_watch_dir_close_cb(uv_handle_t *handle)
+{
+	async_fs_watch_dir_t     *node     = handle->data;
+	async_filesystem_event_t *fs_event = node->owner;
+
+	if (node->abs_path != NULL) {
+		zend_string_release(node->abs_path);
+	}
+
+	if (node->rel_prefix != NULL) {
+		zend_string_release(node->rel_prefix);
+	}
+
+#if ASYNC_FS_EMULATE_DIFF
+	zend_hash_destroy(&node->entries);
+#endif
+
+	pefree(node, 0);
+
+	if (--fs_event->pending_close == 0) {
+		if (fs_event->watch_dirs != NULL) {
+			pefree(fs_event->watch_dirs, 0);
+		}
+
+		pefree(fs_event, 0);
+	}
+}
+
+/* Drop the watch on a directory and everything beneath it — a subdirectory was
+ * deleted or moved out of the tree. Removes stale nodes so a path reused later
+ * is watched afresh instead of being skipped by the dedup check. */
+static void async_fs_watch_remove_subtree(async_filesystem_event_t *fs_event, const char *abs_path)
+{
+	const size_t len = strlen(abs_path);
+	uint32_t     i   = 0;
+
+	while (i < fs_event->watch_dir_count) {
+		async_fs_watch_dir_t *node = fs_event->watch_dirs[i];
+		const char           *p    = ZSTR_VAL(node->abs_path);
+		const size_t          plen = ZSTR_LEN(node->abs_path);
+
+		/* Match the directory itself or anything under it (prefix + '/'). */
+		if (plen < len || memcmp(p, abs_path, len) != 0 || (plen != len && p[len] != '/')) {
+			i++;
+			continue;
+		}
+
+		/* Unlink from the array first (swap the last node in) so dedup and
+		 * dispose no longer see it, then close — the orphan cb frees the node. */
+		fs_event->watch_dirs[i] = fs_event->watch_dirs[--fs_event->watch_dir_count];
+		uv_close((uv_handle_t *) &node->handle, async_fs_watch_dir_orphan_close_cb);
+	}
+}
+
+#if ASYNC_FS_EMULATE_DIFF
+/* Fold one changed child (named relative to the watched root) onto the owning
+ * event and wake its consumers. One notification carries exactly one name, so a
+ * burst diff calls this once per added or removed entry. */
+static void async_fs_watch_dir_emit_one(async_fs_watch_dir_t *node, zend_string *name, uint32_t events)
+{
+	async_filesystem_event_t *fs_event = node->owner;
+
+	if (fs_event->event.triggered_filename != NULL) {
+		zend_string_release(fs_event->event.triggered_filename);
+		fs_event->event.triggered_filename = NULL;
+	}
+
+	fs_event->event.triggered_events   = events;
+	fs_event->event.triggered_filename = (ZSTR_LEN(node->rel_prefix) != 0)
+			? zend_strpprintf(0, "%s/%s", ZSTR_VAL(node->rel_prefix), ZSTR_VAL(name))
+			: zend_string_copy(name);
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&fs_event->event.base, NULL, NULL);
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* kqueue/event-ports report only that this directory changed, never which
+ * child. Re-list the directory, diff it against the stored snapshot, and emit
+ * one event per added or removed entry — recovering the name inotify would have
+ * given directly. New subdirectories gain their own watch, vanished ones lose
+ * theirs, so recursion stays in sync exactly as the inotify path does. */
+static void async_fs_watch_dir_emit_diff(async_fs_watch_dir_t *node, int events)
+{
+	async_filesystem_event_t *fs_event = node->owner;
+
+	HashTable current;
+	zend_hash_init(&current, 8, NULL, NULL, 0);
+	async_fs_snapshot_dir(ZSTR_VAL(node->abs_path), &current);
+
+	uint32_t evt = ZEND_ASYNC_FS_EVENT_RENAME;
+	if (events & UV_CHANGE) {
+		evt |= ZEND_ASYNC_FS_EVENT_CHANGE;
+	}
+
+	zend_string *name;
+
+	/* Added: present now, absent before. A new subdirectory gains a watch. */
+	ZEND_HASH_FOREACH_STR_KEY(&current, name) {
+		if (name == NULL || zend_hash_exists(&node->entries, name)) {
+			continue;
+		}
+
+		async_fs_watch_dir_emit_one(node, name, evt);
+
+		if (fs_event->watch_dir_count >= ASYNC_FS_MAX_WATCH_DIRS) {
+			continue;
+		}
+
+		char child_abs[PATH_MAX];
+
+		if (EXPECTED((size_t) snprintf(child_abs, sizeof(child_abs), "%s/%s",
+				ZSTR_VAL(node->abs_path), ZSTR_VAL(name)) < sizeof(child_abs))) {
+			struct stat st;
+
+			if (lstat(child_abs, &st) == 0 && S_ISDIR(st.st_mode)) {
+				zend_string *child_abs_zs = zend_string_init(child_abs, strlen(child_abs), 0);
+				zend_string *child_rel    = (ZSTR_LEN(node->rel_prefix) != 0)
+						? zend_strpprintf(0, "%s/%s", ZSTR_VAL(node->rel_prefix), ZSTR_VAL(name))
+						: zend_string_copy(name);
+
+				async_fs_watch_add_dir(fs_event, child_abs_zs, child_rel);
+
+				zend_string_release(child_rel);
+				zend_string_release(child_abs_zs);
+			}
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	/* Removed: present before, absent now. A vanished subdirectory (and all it
+	 * held) loses its watch so a later reuse of the path is watched afresh. */
+	ZEND_HASH_FOREACH_STR_KEY(&node->entries, name) {
+		if (name == NULL || zend_hash_exists(&current, name)) {
+			continue;
+		}
+
+		char child_abs[PATH_MAX];
+
+		if (EXPECTED((size_t) snprintf(child_abs, sizeof(child_abs), "%s/%s",
+				ZSTR_VAL(node->abs_path), ZSTR_VAL(name)) < sizeof(child_abs))) {
+			async_fs_watch_remove_subtree(fs_event, child_abs);
+		}
+
+		async_fs_watch_dir_emit_one(node, name, evt);
+	} ZEND_HASH_FOREACH_END();
+
+	/* Adopt the fresh listing as the baseline for the next notification. */
+	zend_hash_destroy(&node->entries);
+	node->entries = current;
+}
+#endif /* ASYNC_FS_EMULATE_DIFF */
+
+/* Per-directory event callback: folds every node's events onto the one owning
+ * event and keeps the watch set in sync as subdirectories appear or vanish. */
+static void async_fs_watch_dir_cb(uv_fs_event_t *handle, const char *filename, int events, int status)
+{
+	async_fs_watch_dir_t     *node     = handle->data;
+	async_filesystem_event_t *fs_event = node->owner;
+
+	if (fs_event->event.triggered_filename != NULL) {
+		zend_string_release(fs_event->event.triggered_filename);
+		fs_event->event.triggered_filename = NULL;
+	}
+
+	fs_event->event.triggered_events = 0;
+
+	if (UNEXPECTED(status < 0)) {
+		zend_object *exception = async_new_exception(
+				async_ce_input_output_exception, "Filesystem monitoring error: %s", uv_strerror(status));
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&fs_event->event.base, NULL, exception);
+		zend_object_release(exception);
+		return;
+	}
+
+#if ASYNC_FS_EMULATE_DIFF
+	async_fs_watch_dir_emit_diff(node, events);
+#else
+	if (events & UV_RENAME) {
+		fs_event->event.triggered_events |= ZEND_ASYNC_FS_EVENT_RENAME;
+	}
+
+	if (events & UV_CHANGE) {
+		fs_event->event.triggered_events |= ZEND_ASYNC_FS_EVENT_CHANGE;
+	}
+
+	if (filename != NULL) {
+		fs_event->event.triggered_filename = (ZSTR_LEN(node->rel_prefix) != 0)
+				? zend_strpprintf(0, "%s/%s", ZSTR_VAL(node->rel_prefix), filename)
+				: zend_string_init(filename, strlen(filename), 0);
+	}
+
+	/* Keep the subtree in sync: a rename that created a directory gains a watch
+	 * (inotify is not recursive); a deleted / moved-out one loses it. */
+	if ((events & UV_RENAME) && filename != NULL) {
+		char child_abs[PATH_MAX];
+
+		if (EXPECTED((size_t) snprintf(child_abs, sizeof(child_abs), "%s/%s", ZSTR_VAL(node->abs_path), filename)
+				< sizeof(child_abs))) {
+			struct stat st;
+
+			if (lstat(child_abs, &st) == 0 && S_ISDIR(st.st_mode)) {
+				if (fs_event->watch_dir_count < ASYNC_FS_MAX_WATCH_DIRS) {
+					zend_string *child_abs_zs = zend_string_init(child_abs, strlen(child_abs), 0);
+					zend_string *child_rel    = (ZSTR_LEN(node->rel_prefix) != 0)
+							? zend_strpprintf(0, "%s/%s", ZSTR_VAL(node->rel_prefix), filename)
+							: zend_string_init(filename, strlen(filename), 0);
+
+					async_fs_watch_add_dir(fs_event, child_abs_zs, child_rel);
+
+					zend_string_release(child_rel);
+					zend_string_release(child_abs_zs);
+				}
+			} else {
+				async_fs_watch_remove_subtree(fs_event, child_abs);
+			}
+		}
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&fs_event->event.base, NULL, NULL);
+
+	IF_EXCEPTION_STOP_REACTOR;
+#endif /* ASYNC_FS_EMULATE_DIFF */
+}
+
+/* Watch every existing subdirectory of an already-watched directory. lstat (not
+ * stat) skips symlinked directories so the walk cannot follow a cycle. */
+static void async_fs_watch_walk(async_filesystem_event_t *fs_event, const char *abs_path, const char *rel_prefix)
+{
+	DIR *dir = opendir(abs_path);
+
+	if (dir == NULL) {
+		return;
+	}
+
+	struct dirent *ent;
+
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.'
+			&& (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) {
+			continue;
+		}
+
+		char child_abs[PATH_MAX];
+
+		if (UNEXPECTED((size_t) snprintf(child_abs, sizeof(child_abs), "%s/%s", abs_path, ent->d_name)
+				>= sizeof(child_abs))) {
+			continue;
+		}
+
+		struct stat st;
+
+		if (lstat(child_abs, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			continue;
+		}
+
+		zend_string *child_rel    = (rel_prefix[0] != '\0')
+				? zend_strpprintf(0, "%s/%s", rel_prefix, ent->d_name)
+				: zend_string_init(ent->d_name, strlen(ent->d_name), 0);
+		zend_string *child_abs_zs = zend_string_init(child_abs, strlen(child_abs), 0);
+
+		async_fs_watch_add_dir(fs_event, child_abs_zs, child_rel);
+
+		zend_string_release(child_abs_zs);
+		zend_string_release(child_rel);
+
+		if (fs_event->watch_dir_count >= ASYNC_FS_MAX_WATCH_DIRS) {
+			break;
+		}
+	}
+
+	closedir(dir);
+}
+
+/* Add one directory as a watch node and descend into its existing subtree.
+ * Idempotent: a directory already watched is skipped. */
+static bool async_fs_watch_add_dir(async_filesystem_event_t *fs_event, zend_string *abs_path, zend_string *rel_prefix)
+{
+	if (UNEXPECTED(fs_event->watch_dir_count >= ASYNC_FS_MAX_WATCH_DIRS)) {
+		return false;
+	}
+
+	for (uint32_t i = 0; i < fs_event->watch_dir_count; i++) {
+		if (zend_string_equals(fs_event->watch_dirs[i]->abs_path, abs_path)) {
+			return true;
+		}
+	}
+
+	async_fs_watch_dir_t *node = pecalloc(1, sizeof(*node), 0);
+
+	if (UNEXPECTED(uv_fs_event_init(UVLOOP, &node->handle) < 0)) {
+		pefree(node, 0);
+		return false;
+	}
+
+	node->handle.data = node;
+	node->owner       = fs_event;
+	node->abs_path    = zend_string_copy(abs_path);
+	node->rel_prefix  = zend_string_copy(rel_prefix);
+
+#if ASYNC_FS_EMULATE_DIFF
+	/* Baseline listing for the diff on the first notification. Initialised
+	 * before start() so the close cb can always destroy it on the error path. */
+	zend_hash_init(&node->entries, 8, NULL, NULL, 0);
+	async_fs_snapshot_dir(ZSTR_VAL(abs_path), &node->entries);
+#endif
+
+	if (UNEXPECTED(uv_fs_event_start(&node->handle, async_fs_watch_dir_cb, ZSTR_VAL(abs_path), 0) < 0)) {
+		uv_close((uv_handle_t *) &node->handle, async_fs_watch_dir_orphan_close_cb);
+		return false;
+	}
+
+	if (fs_event->watch_dir_count == fs_event->watch_dir_capacity) {
+		fs_event->watch_dir_capacity = fs_event->watch_dir_capacity != 0 ? fs_event->watch_dir_capacity * 2 : 8;
+		fs_event->watch_dirs =
+				perealloc(fs_event->watch_dirs, fs_event->watch_dir_capacity * sizeof(async_fs_watch_dir_t *), 0);
+	}
+
+	fs_event->watch_dirs[fs_event->watch_dir_count++] = node;
+
+	async_fs_watch_walk(fs_event, ZSTR_VAL(abs_path), ZSTR_VAL(rel_prefix));
+
+	return true;
+}
+#endif /* !ASYNC_FS_HAS_NATIVE_RECURSIVE */
+
+/* {{{ libuv_filesystem_start */
+static bool libuv_filesystem_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_filesystem_event_t *fs_event = (async_filesystem_event_t *) (event);
+
+#if !ASYNC_FS_HAS_NATIVE_RECURSIVE
+	if (fs_event->recursive_emulated) {
+		if (fs_event->watch_dir_count > 0) {
+			/* Restart after stop(): re-arm every surviving node; a directory
+			 * gone meanwhile is dropped the same way remove_subtree drops it. */
+			uint32_t i = 0;
+
+			while (i < fs_event->watch_dir_count) {
+				async_fs_watch_dir_t *node = fs_event->watch_dirs[i];
+
+				if (UNEXPECTED(uv_fs_event_start(&node->handle, async_fs_watch_dir_cb,
+						ZSTR_VAL(node->abs_path), 0) < 0)) {
+					fs_event->watch_dirs[i] = fs_event->watch_dirs[--fs_event->watch_dir_count];
+					uv_close((uv_handle_t *) &node->handle, async_fs_watch_dir_orphan_close_cb);
+					continue;
+				}
+
+				i++;
+			}
+		} else if (UNEXPECTED(false ==
+				async_fs_watch_add_dir(fs_event, fs_event->event.path, ZSTR_EMPTY_ALLOC()))) {
+			async_throw_error("Failed to start recursive filesystem watch on %s", ZSTR_VAL(fs_event->event.path));
+			return false;
+		}
+
+		event->loop_ref_count++;
+		ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+		return true;
+	}
+#endif
+
+	unsigned int uv_flags = 0;
+	if (fs_event->event.flags & ZEND_ASYNC_FS_EVENT_RECURSIVE) {
+		uv_flags |= UV_FS_EVENT_RECURSIVE;
+	}
+
+	const int error =
+			uv_fs_event_start(&fs_event->uv_handle, on_filesystem_event, ZSTR_VAL(fs_event->event.path), uv_flags);
+
+	if (error < 0) {
+		async_throw_error("Failed to start filesystem handle: %s", uv_strerror(error));
+		return false;
+	}
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_filesystem_stop */
+static bool libuv_filesystem_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_filesystem_event_t *fs_event = (async_filesystem_event_t *) (event);
+
+#if !ASYNC_FS_HAS_NATIVE_RECURSIVE
+	if (fs_event->recursive_emulated) {
+		for (uint32_t i = 0; i < fs_event->watch_dir_count; i++) {
+			uv_fs_event_stop(&fs_event->watch_dirs[i]->handle);
+		}
+
+		event->loop_ref_count = 0;
+		ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+		return true;
+	}
+#endif
+
+	const int error = uv_fs_event_stop(&fs_event->uv_handle);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+
+	if (error < 0) {
+		async_throw_error("Failed to stop filesystem handle: %s", uv_strerror(error));
+		return false;
+	}
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_filesystem_dispose */
+static bool libuv_filesystem_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_filesystem_event_t *fs_event = (async_filesystem_event_t *) (event);
+
+	if (fs_event->event.path) {
+		zend_string_release(fs_event->event.path);
+		fs_event->event.path = NULL;
+	}
+
+	if (fs_event->event.triggered_filename) {
+		zend_string_release(fs_event->event.triggered_filename);
+		fs_event->event.triggered_filename = NULL;
+	}
+
+#if !ASYNC_FS_HAS_NATIVE_RECURSIVE
+	if (fs_event->recursive_emulated) {
+		if (fs_event->watch_dir_count == 0) {
+			if (fs_event->watch_dirs != NULL) {
+				pefree(fs_event->watch_dirs, 0);
+			}
+
+			pefree(fs_event, 0);
+			return true;
+		}
+
+		fs_event->pending_close = fs_event->watch_dir_count;
+
+		for (uint32_t i = 0; i < fs_event->watch_dir_count; i++) {
+			uv_close((uv_handle_t *) &fs_event->watch_dirs[i]->handle, async_fs_watch_dir_close_cb);
+		}
+
+		return true;
+	}
+#endif
+
+	uv_close((uv_handle_t *) &fs_event->uv_handle, libuv_close_handle_cb);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_filesystem_event */
+zend_async_filesystem_event_t *
+libuv_new_filesystem_event(zend_string *path, const unsigned int flags, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_filesystem_event_t *fs_event = pecalloc(
+			1, extra_size != 0 ? sizeof(async_filesystem_event_t) + extra_size : sizeof(async_filesystem_event_t), 0);
+
+#if !ASYNC_FS_HAS_NATIVE_RECURSIVE
+	fs_event->recursive_emulated = (flags & ZEND_ASYNC_FS_EVENT_RECURSIVE) != 0;
+#endif
+
+	/* Emulated recursion watches one uv handle per subdirectory (created in
+	 * start), so the embedded handle stays unused — don't init or dispose it. */
+	if (false == fs_event->recursive_emulated) {
+		const int error = uv_fs_event_init(UVLOOP, &fs_event->uv_handle);
+
+		if (error < 0) {
+			async_throw_error("Failed to initialize filesystem handle: %s", uv_strerror(error));
+			pefree(fs_event, 0);
+			return NULL;
+		}
+
+		fs_event->uv_handle.data = fs_event;
+	}
+
+	fs_event->event.path = zend_string_copy(path);
+	fs_event->event.flags = flags;
+	fs_event->event.base.extra_offset = sizeof(async_filesystem_event_t);
+	fs_event->event.base.ref_count = 1;
+
+	fs_event->event.base.add_callback = libuv_add_callback;
+	fs_event->event.base.del_callback = libuv_remove_callback;
+	fs_event->event.base.start = libuv_filesystem_start;
+	fs_event->event.base.stop = libuv_filesystem_stop;
+	fs_event->event.base.dispose = libuv_filesystem_dispose;
+	fs_event->event.base.info = libuv_filesystem_info;
+
+	return &fs_event->event;
+}
+
+/* }}} */
+
+///////////////////////////////////////////////////////////////////////////////////
+/// DNS API
+///////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ on_nameinfo_event */
+static void on_nameinfo_event(uv_getnameinfo_t *req, int status, const char *hostname, const char *service)
+{
+	async_dns_nameinfo_t *name_info = req->data;
+
+	name_info->event.base.flags |= LIBUV_DNS_F_CALLBACK_DONE;
+
+	/* dispose was called while callback was pending — finish disposal */
+	if (name_info->event.base.flags & LIBUV_DNS_F_DISPOSE_PENDING) {
+		name_info->event.base.dispose(&name_info->event.base);
+		return;
+	}
+
+	zend_object *exception = NULL;
+
+	name_info->event.hostname = NULL;
+	name_info->event.service = NULL;
+
+	// Events of type nameinfo are triggered only once.
+	// After that, the event is automatically closed.
+	close_event(&name_info->event.base);
+
+	if (UNEXPECTED(status < 0)) {
+		exception = async_new_exception(async_ce_dns_exception, "DNS error: %s", uv_strerror(status));
+
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&name_info->event.base, NULL, exception);
+
+		if (exception != NULL) {
+			zend_object_release(exception);
+		}
+
+		return;
+	}
+
+	// We must copy these strings as zend_string into Zend memory space because they do not belong to us.
+	if (hostname != NULL) {
+		name_info->event.hostname = zend_string_init(hostname, strlen(hostname), 0);
+	}
+
+	if (service != NULL) {
+		name_info->event.service = zend_string_init(service, strlen(service), 0);
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&name_info->event.base, NULL, NULL);
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_dns_nameinfo_start */
+static bool libuv_dns_nameinfo_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_dns_nameinfo_stop */
+static bool libuv_dns_nameinfo_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_dns_nameinfo_dispose */
+static bool libuv_dns_nameinfo_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	/* libuv callback not yet fired — cannot free, callback owns the memory now */
+	if (!(event->flags & LIBUV_DNS_F_CALLBACK_DONE)) {
+		event->flags |= LIBUV_DNS_F_DISPOSE_PENDING;
+		uv_cancel((uv_req_t *) &((async_dns_nameinfo_t *) event)->uv_handle);
+		return true;
+	}
+
+	zend_async_dns_nameinfo_t *name_info = (zend_async_dns_nameinfo_t *) (event);
+
+	if (name_info->hostname != NULL) {
+		zend_string_release(name_info->hostname);
+		name_info->hostname = NULL;
+	}
+
+	if (name_info->service != NULL) {
+		zend_string_release(name_info->service);
+		name_info->service = NULL;
+	}
+
+	pefree(event, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_getnameinfo */
+static zend_async_dns_nameinfo_t *libuv_getnameinfo(const struct sockaddr *addr, int flags, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_dns_nameinfo_t *name_info =
+			pecalloc(1, extra_size != 0 ? sizeof(async_dns_nameinfo_t) + extra_size : sizeof(async_dns_nameinfo_t), 0);
+
+	const int error = uv_getnameinfo(UVLOOP, &name_info->uv_handle, on_nameinfo_event, addr, flags);
+
+	if (error < 0) {
+		async_rethrow_exception(async_new_exception(
+				async_ce_dns_exception, "Failed to initialize getnameinfo handle: %s", uv_strerror(error)));
+		pefree(name_info, 0);
+		return NULL;
+	}
+
+	name_info->uv_handle.data = name_info;
+	name_info->event.base.extra_offset = sizeof(async_dns_nameinfo_t);
+	name_info->event.base.ref_count = 1;
+
+	name_info->event.base.add_callback = libuv_add_callback;
+	name_info->event.base.del_callback = libuv_remove_callback;
+	name_info->event.base.start = libuv_dns_nameinfo_start;
+	name_info->event.base.stop = libuv_dns_nameinfo_stop;
+	name_info->event.base.dispose = libuv_dns_nameinfo_dispose;
+	name_info->event.base.info = libuv_dns_nameinfo_info;
+
+	return &name_info->event;
+}
+
+/* }}} */
+
+/* {{{ on_addrinfo_event */
+static void on_addrinfo_event(uv_getaddrinfo_t *req, int status, struct addrinfo *res)
+{
+	async_dns_addrinfo_t *addr_info = req->data;
+
+	addr_info->event.base.flags |= LIBUV_DNS_F_CALLBACK_DONE;
+
+	/* dispose was called while callback was pending — finish disposal */
+	if (addr_info->event.base.flags & LIBUV_DNS_F_DISPOSE_PENDING) {
+		if (res != NULL) {
+			uv_freeaddrinfo(res);
+		}
+		addr_info->event.base.dispose(&addr_info->event.base);
+		return;
+	}
+
+	zend_object *exception = NULL;
+
+	// Events of type addrinfo are triggered only once.
+	// After that, the event is automatically closed.
+	close_event(&addr_info->event.base);
+
+	if (status < 0) {
+		exception = async_new_exception(async_ce_dns_exception, "DNS error: %s", uv_strerror(status));
+	}
+
+	addr_info->event.result = res;
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&addr_info->event.base, NULL, exception);
+
+	if (exception != NULL) {
+		OBJ_RELEASE(exception);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_dns_getaddrinfo_start */
+static bool libuv_dns_getaddrinfo_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_dns_getaddrinfo_stop */
+static bool libuv_dns_getaddrinfo_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_dns_getaddrinfo_dispose */
+static bool libuv_dns_getaddrinfo_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	/* libuv callback not yet fired — cannot free, callback owns the memory now */
+	if (!(event->flags & LIBUV_DNS_F_CALLBACK_DONE)) {
+		event->flags |= LIBUV_DNS_F_DISPOSE_PENDING;
+		uv_cancel((uv_req_t *) &((async_dns_addrinfo_t *) event)->uv_handle);
+		return true;
+	}
+
+	async_dns_addrinfo_t *addr_info = (async_dns_addrinfo_t *) event;
+
+	/* If consumer never picked up the result (e.g. coroutine cancelled between
+	 * on_addrinfo_event and dns_callback_resolve), event->result is still non-NULL
+	 * and owned by the event. Free it here to avoid leaking the libuv addrinfo. */
+	if (addr_info->event.result != NULL) {
+		uv_freeaddrinfo((struct addrinfo *) addr_info->event.result);
+		addr_info->event.result = NULL;
+	}
+
+	pefree(addr_info, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_getaddrinfo */
+static zend_async_dns_addrinfo_t *
+libuv_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_dns_addrinfo_t *addr_info =
+			pecalloc(1, extra_size != 0 ? sizeof(async_dns_addrinfo_t) + extra_size : sizeof(async_dns_addrinfo_t), 0);
+
+	const int error = uv_getaddrinfo(UVLOOP, &addr_info->uv_handle, on_addrinfo_event, node, service, hints);
+
+	if (error < 0) {
+		async_rethrow_exception(async_new_exception(
+				async_ce_dns_exception, "Failed to initialize getaddrinfo handle: %s", uv_strerror(error)));
+
+		pefree(addr_info, 0);
+		return NULL;
+	}
+
+	addr_info->uv_handle.data = addr_info;
+	addr_info->event.base.extra_offset = sizeof(async_dns_addrinfo_t);
+	addr_info->event.base.ref_count = 1;
+
+	addr_info->event.base.add_callback = libuv_add_callback;
+	addr_info->event.base.del_callback = libuv_remove_callback;
+	addr_info->event.base.start = libuv_dns_getaddrinfo_start;
+	addr_info->event.base.stop = libuv_dns_getaddrinfo_stop;
+	addr_info->event.base.dispose = libuv_dns_getaddrinfo_dispose;
+	addr_info->event.base.info = libuv_dns_addrinfo_info;
+
+	return &addr_info->event;
+}
+
+/* }}} */
+
+/* {{{ libuv_freeaddrinfo */
+static bool libuv_freeaddrinfo(struct addrinfo *ai)
+{
+	if (ai != NULL) {
+		uv_freeaddrinfo(ai);
+	}
+
+	return true;
+}
+
+/* }}} */
+
+////////////////////////////////////////////////////////////////////////////////////
+/// Exec API
+///////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ exec_on_exit */
+static void exec_on_exit(uv_process_t *process, const int64_t exit_status, int term_signal)
+{
+	async_exec_event_t *exec = process->data;
+	exec->event.exit_code = exit_status;
+	exec->event.term_signal = term_signal;
+
+	process->data = exec->process;
+	exec->process = NULL;
+
+	uv_close((uv_handle_t *) process, libuv_close_handle_cb);
+
+	if (exec->event.terminated != true) {
+		exec->event.terminated = true;
+		ZEND_ASYNC_DECREASE_EVENT_COUNT(&exec->event.base);
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&exec->event.base, NULL, NULL);
+	}
+}
+
+//* }}} */
+
+static void exec_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
+{
+	async_exec_event_t *event = handle->data;
+	zend_async_exec_event_t *exec = &event->event;
+
+	if (exec->output_len == 0) {
+		exec->output_len = suggested_size;
+		exec->output_buffer = emalloc(suggested_size);
+	} else if (exec->output_len < suggested_size) {
+		exec->output_len = suggested_size;
+		exec->output_buffer = erealloc(exec->output_buffer, suggested_size);
+	}
+
+	buf->base = exec->output_buffer;
+	buf->len = exec->output_len;
+}
+
+/**
+ * @brief Append raw data to a zval string without line splitting.
+ *
+ * If @p target is not IS_STRING, it is replaced with a new string;
+ * otherwise the existing string is extended in place.
+ *
+ * Used by SHELL_EXEC mode (stdout) and exec_std_err_read_cb (stderr).
+ *
+ * @param target Destination zval.
+ * @param data   Pointer to the data to append.
+ * @param len    Number of bytes to append.
+ */
+static zend_always_inline void exec_accumulate_zval(zval *target, const char *data, size_t len)
+{
+	if (Z_TYPE_P(target) != IS_STRING) {
+		zval_ptr_dtor(target);
+		ZVAL_NEW_STR(target, zend_string_init(data, len, 0));
+	} else {
+		zend_string *string = Z_STR_P(target);
+		string = zend_string_extend(string, ZSTR_LEN(string) + len, 0);
+		memcpy(ZSTR_VAL(string) + ZSTR_LEN(string) - len, data, len);
+		ZSTR_VAL(string)[ZSTR_LEN(string)] = '\0';
+		ZVAL_STR(target, string);
+	}
+}
+
+/* ---- On-the-fly line parser for exec/system output ----
+ *
+ * A simple two-state finite automaton that processes an arbitrary byte stream
+ * delivered in chunks by libuv:
+ *
+ *   PENDING  --[\n]--> EMIT --> PENDING --> ...
+ *            --[EOF]--> FLUSH PENDING (finalized in libuv_exec)
+ *
+ * Memory strategy:
+ *   - line_buf is allocated on first use at EXEC_LINE_BUF_INIT_CAP (8 KB)
+ *     and doubled when necessary.  It is reused across lines (only
+ *     line_buf_len is reset) and freed in libuv_exec_dispose.
+ *   - When a complete line fits within a single chunk and there is no
+ *     pending data, it is emitted directly from the read buffer (zero-copy).
+ */
+
+#define EXEC_LINE_BUF_INIT_CAP 8192
+
+/**
+ * @brief Strip trailing whitespace from a line.
+ *
+ * Uses isspace() for full compatibility with the POPEN path's
+ * strip_trailing_whitespace() in ext/standard/exec.c.
+ * The '\\n' delimiter is already excluded by the caller.
+ *
+ * @param line Pointer to the line data.
+ * @param len  Length of the line in bytes.
+ * @return     New length after stripping.
+ */
+static zend_always_inline size_t exec_strip_trailing_ws(const char *line, size_t len)
+{
+	while (len > 0 && isspace((unsigned char) line[len - 1])) {
+		len--;
+	}
+	return len;
+}
+
+/**
+ * @brief Append data to the pending-line buffer.
+ *
+ * Allocates EXEC_LINE_BUF_INIT_CAP (8 KB) on first use and doubles the
+ * capacity when needed.  The buffer is reused across lines — only
+ * line_buf_len is reset after each emit; the allocation persists until
+ * libuv_exec_dispose frees it.
+ *
+ * @param event The exec event whose line_buf to append to.
+ * @param data  Pointer to the data to append.
+ * @param len   Number of bytes to append.
+ */
+static zend_always_inline void exec_line_buf_append(async_exec_event_t *event, const char *data, size_t len)
+{
+	if (len == 0) {
+		return;
+	}
+
+	const size_t needed = event->line_buf_len + len;
+
+	if (event->line_buf == NULL) {
+		event->line_buf_cap = (EXEC_LINE_BUF_INIT_CAP > needed)
+							  ? EXEC_LINE_BUF_INIT_CAP : needed;
+		event->line_buf = emalloc(event->line_buf_cap);
+	} else if (needed > event->line_buf_cap) {
+		while (event->line_buf_cap < needed) {
+			event->line_buf_cap *= 2;
+		}
+		event->line_buf = erealloc(event->line_buf, event->line_buf_cap);
+	}
+
+	memcpy(event->line_buf + event->line_buf_len, data, len);
+	event->line_buf_len = needed;
+}
+
+/**
+ * @brief Emit one completed line to the appropriate target.
+ *
+ * Strips trailing whitespace and then, depending on exec_mode:
+ *   - EXEC/SYSTEM:  stores the stripped line in result_buffer, overwriting
+ *                    the previous value (only the last completed line is kept).
+ *   - EXEC_ARRAY:   appends the stripped line to the result_buffer array and
+ *                    updates return_value to track the last emitted line.
+ *
+ * @param exec The exec event containing mode and output targets.
+ * @param line Pointer to the line data (newline delimiter already excluded).
+ * @param len  Length of the line in bytes.
+ */
+static zend_always_inline void exec_emit_completed_line(
+	const zend_async_exec_event_t *exec, const char *line, size_t len)
+{
+	len = exec_strip_trailing_ws(line, len);
+
+	switch (exec->exec_mode) {
+		case ZEND_ASYNC_EXEC_MODE_EXEC:
+		case ZEND_ASYNC_EXEC_MODE_SYSTEM:
+			zval_ptr_dtor(exec->result_buffer);
+			ZVAL_STRINGL(exec->result_buffer, line, len);
+			break;
+
+		case ZEND_ASYNC_EXEC_MODE_EXEC_ARRAY:
+			add_next_index_stringl(exec->result_buffer, line, len);
+			break;
+
+		default:
+			break;
+	}
+}
+
+/**
+ * @brief Process a raw chunk from the child process stdout.
+ *
+ * Scans the chunk left-to-right for '\\n' delimiters.  For each complete line
+ * found, calls exec_emit_completed_line().  Any trailing data after the last
+ * '\\n' (or the entire chunk if no '\\n' is present) is appended to the
+ * pending-line buffer (line_buf) for the next invocation.
+ *
+ * When a complete line fits within the chunk and no pending data exists,
+ * it is emitted directly from the read buffer without copying (zero-copy).
+ *
+ * @param event The exec event with line parser state (line_buf).
+ * @param data  Pointer to the raw chunk data delivered by libuv.
+ * @param len   Number of bytes in the chunk.
+ */
+static void exec_process_chunk(async_exec_event_t *event, const char *data, size_t len)
+{
+	const zend_async_exec_event_t *exec = &event->event;
+	const char *seg_start = data;
+	const char *end = data + len;
+	const char *nl;
+
+	/* Use memchr() for newline scanning — glibc implements it with SIMD,
+	 * which is 10-30x faster than a byte-by-byte loop on large buffers. */
+	while ((nl = memchr(seg_start, '\n', end - seg_start)) != NULL) {
+		const size_t seg_len = nl - seg_start;
+
+		if (event->line_buf_len > 0) {
+			/* Pending data exists — combine and emit. */
+			exec_line_buf_append(event, seg_start, seg_len);
+			exec_emit_completed_line(exec, event->line_buf, event->line_buf_len);
+			event->line_buf_len = 0;
+		} else {
+			/* Zero-copy: emit directly from the read buffer. */
+			exec_emit_completed_line(exec, seg_start, seg_len);
+		}
+
+		seg_start = nl + 1;
+	}
+
+	/* Remaining data after the last '\n' — append to pending. */
+	if (seg_start < end) {
+		exec_line_buf_append(event, seg_start, end - seg_start);
+	}
+}
+
+static void exec_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
+{
+	async_exec_event_t *event = stream->data;
+	zend_async_exec_event_t *exec = &event->event;
+
+	if (nread > 0) {
+#ifdef PHP_WIN32
+		/* shell_exec uses VCWD_POPEN("rt") — text mode — so CRT strips \r\n → \n.
+		 * Replicate that for the async path.
+		 * passthru is raw binary — never modify data.
+		 * exec/system/exec_array use VCWD_POPEN("rb") and strip \r via
+		 * exec_strip_trailing_ws per line, so no pre-conversion needed. */
+		if (exec->exec_mode == ZEND_ASYNC_EXEC_MODE_SHELL_EXEC) {
+			ssize_t j = 0;
+			for (ssize_t i = 0; i < nread; i++) {
+				if (buf->base[i] == '\r' && i + 1 < nread && buf->base[i + 1] == '\n') {
+					continue;
+				}
+				buf->base[j++] = buf->base[i];
+			}
+			nread = j;
+		}
+#endif
+		switch (exec->exec_mode) {
+			case ZEND_ASYNC_EXEC_MODE_EXEC:
+			case ZEND_ASYNC_EXEC_MODE_EXEC_ARRAY:
+				exec_process_chunk(event, buf->base, nread);
+				break;
+
+			case ZEND_ASYNC_EXEC_MODE_SYSTEM:
+				PHPWRITE_CORO(buf->base, nread, event->coroutine);
+				exec_process_chunk(event, buf->base, nread);
+				break;
+
+			case ZEND_ASYNC_EXEC_MODE_PASSTHRU:
+				PHPWRITE_CORO(buf->base, nread, event->coroutine);
+				break;
+
+			case ZEND_ASYNC_EXEC_MODE_SHELL_EXEC:
+				exec_accumulate_zval(exec->result_buffer, buf->base, nread);
+				break;
+
+			default:
+				php_error_docref(NULL, E_WARNING, "Unknown exec type: %d", exec->exec_mode);
+		}
+	} else if (nread < 0) {
+		if (nread != UV_EOF) {
+			php_error_docref(NULL, E_WARNING, "Process pipe read error: %s", uv_strerror((int) nread));
+		}
+
+		event->stdout_pipe->data = NULL;
+		event->stdout_pipe = NULL;
+
+		if (exec->output_len > 0) {
+			efree(exec->output_buffer);
+			exec->output_len = 0;
+			exec->output_buffer = NULL;
+		}
+
+		uv_read_stop(stream);
+		// For libuv_close_handle_cb to work correctly.
+		stream->data = stream;
+		uv_close((uv_handle_t *) stream, libuv_close_handle_cb);
+
+		// Do NOT notify here. Pipe EOF often arrives before exec_on_exit,
+		// so notifying here would wake the coroutine with exit_code still 0.
+		// Let exec_on_exit be the sole notification point.
+	}
+}
+
+static void exec_std_err_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
+{
+	buf->base = emalloc(suggested_size);
+	buf->len = suggested_size;
+}
+
+static void exec_std_err_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
+{
+	async_exec_event_t *event = stream->data;
+	zend_async_exec_event_t *exec = &event->event;
+
+	if (nread > 0) {
+		if (exec->std_error != NULL) {
+			exec_accumulate_zval(exec->std_error, buf->base, nread);
+		}
+	} else if (nread < 0) {
+		event->stderr_pipe->data = NULL;
+		event->stderr_pipe = NULL;
+
+		uv_read_stop(stream);
+		stream->data = stream;
+		uv_close((uv_handle_t *) stream, libuv_close_handle_cb);
+	}
+
+	efree(buf->base);
+}
+
+/* }}} */
+
+/* {{{ libuv_exec_start */
+static bool libuv_exec_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_exec_event_t *exec = (async_exec_event_t *) (event);
+
+	if (exec->process == NULL) {
+		return true;
+	}
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_exec_stop */
+static bool libuv_exec_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_exec_event_t *exec = (async_exec_event_t *) (event);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+
+	if (exec->process != NULL) {
+		uv_process_kill(exec->process, ZEND_ASYNC_SIGTERM);
+	}
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_exec_dispose */
+static bool libuv_exec_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_exec_event_t *exec = (async_exec_event_t *) (event);
+
+	if (exec->event.output_buffer != NULL) {
+		efree(exec->event.output_buffer);
+		exec->event.output_buffer = NULL;
+		exec->event.output_len = 0;
+	}
+
+	if (exec->line_buf != NULL) {
+		efree(exec->line_buf);
+		exec->line_buf = NULL;
+		exec->line_buf_len = 0;
+		exec->line_buf_cap = 0;
+	}
+
+	if (exec->process != NULL && !uv_is_closing((uv_handle_t *) exec->process)) {
+		uv_process_kill(exec->process, ZEND_ASYNC_SIGTERM);
+		uv_handle_t *handle = (uv_handle_t *) exec->process;
+		exec->process = NULL;
+		// For libuv_close_handle_cb to work correctly.
+		handle->data = handle;
+		uv_close(handle, libuv_close_handle_cb);
+	}
+
+	if (exec->stdout_pipe != NULL && !uv_is_closing((uv_handle_t *) exec->stdout_pipe)) {
+		uv_read_stop((uv_stream_t *) exec->stdout_pipe);
+		uv_handle_t *handle = (uv_handle_t *) exec->stdout_pipe;
+		exec->stdout_pipe->data = NULL;
+		handle->data = handle;
+		uv_close(handle, libuv_close_handle_cb);
+	}
+
+	if (exec->stderr_pipe != NULL && !uv_is_closing((uv_handle_t *) exec->stderr_pipe)) {
+		uv_read_stop((uv_stream_t *) exec->stderr_pipe);
+		uv_handle_t *handle = (uv_handle_t *) exec->stderr_pipe;
+		exec->stderr_pipe->data = NULL;
+		handle->data = handle;
+		uv_close(handle, libuv_close_handle_cb);
+	}
+
+	// Free the event itself
+	pefree(event, 0);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_exec_event */
+static zend_async_exec_event_t *libuv_new_exec_event(zend_async_exec_mode exec_mode,
+													 const char *cmd,
+													 zval *return_buffer,
+													 zval *return_value,
+													 zval *std_error,
+													 const char *cwd,
+													 const char *env,
+													 size_t size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_exec_event_t *exec = pecalloc(1, size != 0 ? size : sizeof(async_exec_event_t), 0);
+	zend_async_exec_event_t *base = &exec->event;
+	uv_process_options_t *options = &exec->options;
+
+	if (exec == NULL || EG(exception)) {
+		return NULL;
+	}
+
+	base->exec_mode = exec_mode;
+	base->cmd = (char *) cmd;
+	base->return_value = return_value;
+	base->result_buffer = return_buffer;
+	base->std_error = std_error;
+
+	exec->process = pecalloc(sizeof(uv_process_t), 1, 0);
+	exec->stdout_pipe = pecalloc(sizeof(uv_pipe_t), 1, 0);
+
+	exec->process->data = exec;
+	exec->stdout_pipe->data = exec;
+
+	uv_pipe_init(UVLOOP, exec->stdout_pipe, 0);
+
+	if (std_error != NULL) {
+		exec->stderr_pipe = pecalloc(sizeof(uv_pipe_t), 1, 0);
+		exec->stderr_pipe->data = exec;
+		uv_pipe_init(UVLOOP, exec->stderr_pipe, 0);
+	}
+
+	options->exit_cb = exec_on_exit;
+#ifdef PHP_WIN32
+	options->flags = UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS;
+	options->file = "cmd.exe";
+
+	/* uv_spawn expects UTF-8 strings. Convert cmd from the current code page
+	 * (which may be e.g. CP1251) to UTF-8 via UTF-16 intermediate. */
+	wchar_t *cmd_w = php_win32_cp_any_to_w(cmd);
+	char *utf8_cmd = cmd_w ? php_win32_cp_w_to_utf8(cmd_w) : NULL;
+	free(cmd_w);
+
+	const char *spawn_cmd = utf8_cmd ? utf8_cmd : cmd;
+	const size_t cmd_buffer_size = strlen(spawn_cmd) + 3;
+	char *quoted_cmd = emalloc(cmd_buffer_size);
+	snprintf(quoted_cmd, cmd_buffer_size, "\"%s\"", spawn_cmd);
+	options->args = (char *[]){ "cmd.exe", "/s", "/c", quoted_cmd, NULL };
+
+	/* Convert cwd to UTF-8 as well. */
+	char *utf8_cwd = NULL;
+	if (cwd != NULL && cwd[0] != '\0') {
+		wchar_t *cwd_w = php_win32_cp_any_to_w(cwd);
+		utf8_cwd = cwd_w ? php_win32_cp_w_to_utf8(cwd_w) : NULL;
+		free(cwd_w);
+		options->cwd = utf8_cwd ? utf8_cwd : cwd;
+	}
+#else
+	options->file = "/bin/sh";
+	options->args = (char *[]){ "sh", "-c", (char *) cmd, NULL };
+
+	if (cwd != NULL && cwd[0] != '\0') {
+		options->cwd = cwd;
+	}
+#endif
+
+	uv_stdio_container_t stdio[3];
+	stdio[0] = (uv_stdio_container_t){ .flags = UV_IGNORE, .data = { .stream = NULL } };
+	stdio[1] = (uv_stdio_container_t){ .data.stream = (uv_stream_t *) exec->stdout_pipe, .flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE };
+	if (exec->stderr_pipe != NULL) {
+		stdio[2] = (uv_stdio_container_t){ .data.stream = (uv_stream_t *) exec->stderr_pipe, .flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE };
+	} else {
+		stdio[2] = (uv_stdio_container_t){ .flags = UV_INHERIT_FD, .data = { .fd = 2 } };
+	}
+	options->stdio = stdio;
+
+	options->stdio_count = 3;
+
+	if (env != NULL) {
+		options->env = (char **) env;
+	}
+
+	const int result = uv_spawn(UVLOOP, exec->process, options);
+
+#ifdef PHP_WIN32
+	efree(quoted_cmd);
+	free(utf8_cmd);
+	free(utf8_cwd);
+#endif
+
+	if (result) {
+		php_error_docref(NULL, E_WARNING, "Failed to spawn process: %s", uv_strerror(result));
+		uv_close((uv_handle_t *) exec->stdout_pipe, libuv_close_handle_cb);
+		uv_close((uv_handle_t *) exec->process, libuv_close_handle_cb);
+		exec->process = NULL;
+		exec->stdout_pipe = NULL;
+		return NULL;
+	}
+
+	uv_read_start((uv_stream_t *) exec->stdout_pipe, exec_alloc_cb, exec_read_cb);
+	if (exec->stderr_pipe != NULL) {
+		uv_read_start((uv_stream_t *) exec->stderr_pipe, exec_std_err_alloc_cb, exec_std_err_read_cb);
+	}
+
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&exec->event.base);
+
+	exec->event.base.ref_count = 1;
+
+	exec->event.base.add_callback = libuv_add_callback;
+	exec->event.base.del_callback = libuv_remove_callback;
+	exec->event.base.start = libuv_exec_start;
+	exec->event.base.stop = libuv_exec_stop;
+	exec->event.base.dispose = libuv_exec_dispose;
+	exec->event.base.info = libuv_exec_info;
+
+	return &exec->event;
+}
+
+/* {{{ libuv_exec */
+static int libuv_exec(zend_async_exec_mode exec_mode,
+					  const char *cmd,
+					  zval *return_buffer,
+					  zval *return_value,
+					  zval *std_error,
+					  const char *cwd,
+					  const char *env,
+					  const zend_ulong timeout)
+{
+	zval tmp_return_value, tmp_return_buffer;
+
+	ZVAL_UNDEF(&tmp_return_value);
+	ZVAL_UNDEF(&tmp_return_buffer);
+
+	if (return_value != NULL) {
+		ZVAL_BOOL(return_value, false);
+	}
+
+	zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+
+	if (UNEXPECTED(coroutine == NULL)) {
+		zend_throw_error(NULL, "Cannot call async_exec() outside of an async context");
+		return -1;
+	}
+
+	zend_async_exec_event_t *exec_event =
+			ZEND_ASYNC_NEW_EXEC_EVENT(exec_mode,
+									  cmd,
+									  return_buffer != NULL ? return_buffer : &tmp_return_buffer,
+									  return_value != NULL ? return_value : &tmp_return_value,
+									  std_error,
+									  cwd,
+									  env);
+
+	if (UNEXPECTED(exec_event == NULL)) {
+		return -1;
+	}
+
+	/* Store coroutine for PHPWRITE_CORO in exec_read_cb */
+	((async_exec_event_t *) exec_event)->coroutine = coroutine;
+
+	ZEND_ASYNC_WAKER_NEW(coroutine);
+	if (UNEXPECTED(EG(exception))) {
+		return -1;
+	}
+
+	zend_async_resume_when(coroutine, &exec_event->base, false, zend_async_waker_callback_resolve, NULL);
+	if (UNEXPECTED(EG(exception))) {
+		return -1;
+	}
+
+	ZEND_ASYNC_SUSPEND();
+	zend_async_waker_clean(coroutine);
+
+	if (UNEXPECTED(EG(exception))) {
+		return -1;
+	}
+
+	/* Finalize the on-the-fly line parser: flush pending (incomplete) line.
+	 *
+	 * State after the callback:
+	 * - line_buf / line_buf_len: pending data (no '\n' seen yet)
+	 * - EXEC/SYSTEM: result_buffer (tmp_return_buffer) = last completed line
+	 * - EXEC_ARRAY:  result_buffer = array with all completed lines
+	 */
+	const async_exec_event_t *exec_wrapper = (const async_exec_event_t *) exec_event;
+
+	if (exec_mode == ZEND_ASYNC_EXEC_MODE_EXEC || exec_mode == ZEND_ASYNC_EXEC_MODE_SYSTEM) {
+		if (return_value != NULL) {
+			if (exec_wrapper->line_buf_len > 0) {
+				/* Pending is the final line. */
+				const size_t len = exec_strip_trailing_ws(
+					exec_wrapper->line_buf, exec_wrapper->line_buf_len);
+				zval_ptr_dtor(return_value);
+				ZVAL_STRINGL(return_value, exec_wrapper->line_buf, len);
+			} else if (Z_TYPE(tmp_return_buffer) == IS_STRING) {
+				/* No pending — last completed line is the answer. */
+				zval_ptr_dtor(return_value);
+				ZVAL_COPY_VALUE(return_value, &tmp_return_buffer);
+				ZVAL_UNDEF(&tmp_return_buffer);
+			} else {
+				zval_ptr_dtor(return_value);
+				ZVAL_EMPTY_STRING(return_value);
+			}
+		}
+	} else if (exec_mode == ZEND_ASYNC_EXEC_MODE_EXEC_ARRAY) {
+		if (exec_wrapper->line_buf_len > 0) {
+			/* Pending is the final line — add to array and set return_value. */
+			const size_t len = exec_strip_trailing_ws(
+				exec_wrapper->line_buf, exec_wrapper->line_buf_len);
+			if (return_buffer != NULL) {
+				add_next_index_stringl(return_buffer, exec_wrapper->line_buf, len);
+			}
+			if (return_value != NULL) {
+				zval_ptr_dtor(return_value);
+				ZVAL_STRINGL(return_value, exec_wrapper->line_buf, len);
+			}
+		} else if (return_value != NULL) {
+			/* No pending — return_value = last element of the array, or "". */
+			zval_ptr_dtor(return_value);
+			if (return_buffer != NULL && Z_TYPE_P(return_buffer) == IS_ARRAY) {
+				const uint32_t count = zend_hash_num_elements(Z_ARRVAL_P(return_buffer));
+				if (count > 0) {
+					const zval *last = zend_hash_index_find(Z_ARRVAL_P(return_buffer), count - 1);
+					if (last != NULL) {
+						ZVAL_COPY(return_value, last);
+					} else {
+						ZVAL_EMPTY_STRING(return_value);
+					}
+				} else {
+					ZVAL_EMPTY_STRING(return_value);
+				}
+			} else {
+				ZVAL_EMPTY_STRING(return_value);
+			}
+		}
+	}
+
+	zval_ptr_dtor(&tmp_return_value);
+	zval_ptr_dtor(&tmp_return_buffer);
+
+	const int exit_code = (int) exec_event->exit_code;
+	exec_event->base.dispose(&exec_event->base);
+
+	return exit_code;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Trigger Event API
+/////////////////////////////////////////////////////////////////////////////////
+
+/* {{{ on_trigger_event */
+static void on_trigger_event(uv_async_t *handle)
+{
+	async_trigger_event_t *trigger = handle->data;
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&trigger->event.base, NULL, NULL);
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_trigger_event_trigger */
+static void libuv_trigger_event_trigger(zend_async_trigger_event_t *event)
+{
+	async_trigger_event_t *trigger = (async_trigger_event_t *) event;
+
+	if (!ZEND_ASYNC_EVENT_IS_CLOSED(&trigger->event.base)) {
+		uv_async_send(&trigger->uv_handle);
+	}
+}
+
+/* }}} */
+
+/* {{{ libuv_trigger_event_start */
+static bool libuv_trigger_event_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_trigger_event_t *trigger = (async_trigger_event_t *) event;
+	uv_ref((uv_handle_t *) &trigger->uv_handle);
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_trigger_event_stop */
+static bool libuv_trigger_event_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_trigger_event_t *trigger = (async_trigger_event_t *) event;
+	uv_unref((uv_handle_t *) &trigger->uv_handle);
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_trigger_event_dispose */
+static bool libuv_trigger_event_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_trigger_event_t *trigger = (async_trigger_event_t *) (event);
+
+	uv_close((uv_handle_t *) &trigger->uv_handle, libuv_close_handle_cb);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_new_trigger_event */
+zend_async_trigger_event_t *libuv_new_trigger_event(size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_trigger_event_t *trigger = pecalloc(
+			1, extra_size != 0 ? sizeof(async_trigger_event_t) + extra_size : sizeof(async_trigger_event_t), 0);
+
+	int error = uv_async_init(UVLOOP, &trigger->uv_handle, on_trigger_event);
+
+	if (error < 0) {
+		async_throw_error("Failed to initialize trigger handle: %s", uv_strerror(error));
+		pefree(trigger, 0);
+		return NULL;
+	}
+
+	/* Handle is initialized but should not keep the event loop alive
+	 * until start() is explicitly called (e.g. when a coroutine suspends). */
+	uv_unref((uv_handle_t *) &trigger->uv_handle);
+
+	// Link the handle to the trigger event
+	trigger->uv_handle.data = trigger;
+	trigger->event.base.extra_offset = sizeof(async_trigger_event_t);
+	trigger->event.base.ref_count = 1;
+
+	// Initialize the event methods
+	trigger->event.base.add_callback = libuv_add_callback;
+	trigger->event.base.del_callback = libuv_remove_callback;
+	trigger->event.base.start = libuv_trigger_event_start;
+	trigger->event.base.stop = libuv_trigger_event_stop;
+	trigger->event.base.dispose = libuv_trigger_event_dispose;
+	trigger->event.base.info = libuv_trigger_info;
+
+	// Set the trigger method
+	trigger->event.trigger = libuv_trigger_event_trigger;
+
+	return &trigger->event;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Async IO API
+/////////////////////////////////////////////////////////////////////////////////
+
+static bool libuv_io_close(zend_async_io_t *io_base);
+static void io_close_cb(uv_handle_t *pipe_handle);
+static bool io_file_write_dispatch(async_io_t *io, async_io_req_t *req);
+
+/* {{{ IO event methods */
+static bool libuv_io_event_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+static bool libuv_io_event_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	async_io_t *io = (async_io_t *) event;
+
+	/* Cancel pending stream read if any. Callers may use event.stop() to
+	 * stop a multishot read without having previously called event.start()
+	 * (reactor-internal reads submitted via IO_READ bypass start/stop), so
+	 * we still need to run uv_read_stop even when loop_ref_count is 0. */
+	if (io->active_req != NULL && ZEND_ASYNC_IO_IS_STREAM(io->base.type)) {
+		uv_read_stop(&io->handle.stream);
+		io->active_req = NULL;
+	}
+
+	/* No loop ref to drop → do not touch the global active_event_count.
+	 * Otherwise we steal a count from some other event and the scheduler
+	 * later mis-detects deadlock. */
+	if (event->loop_ref_count == 0) {
+		return true;
+	}
+
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+static bool libuv_io_event_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	async_io_t *io = (async_io_t *) event;
+
+	/* Notify the owner (e.g. plain_wrapper) so it can clear its pointer. */
+	if (io->base.on_detach != NULL) {
+		io->base.on_detach(&io->base, io->base.on_detach_arg);
+		io->base.on_detach = NULL;
+	}
+
+	/* Remove from the active IO tracking table. */
+	zend_hash_index_del(&ASYNC_G(active_io_handles), async_ptr_to_index(io));
+
+	/* Close the IO handle if not already closed. */
+	if (!(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		libuv_io_close(&io->base);
+		/* For stream/UDP handles under a live reactor, libuv_io_close has
+		 * just scheduled uv_close holding a fresh reference — the final
+		 * teardown belongs to io_close_cb. Freeing the io now would leave
+		 * the pending close callback with a dangling handle. */
+		if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+			ZEND_ASYNC_EVENT_DEL_REF(event);
+			return true;
+		}
+	}
+
+	/* Dispose any in-flight request still attached to the io (a one-shot
+	 * read/recv whose awaiter never ran, or a leftover). The multishot recv
+	 * req is normally freed by its consumer (libuv_io_close detaches it for
+	 * the await/consumer path), so this is a backstop.
+	 *
+	 * IMPORTANT: dispose() lives at a DIFFERENT struct offset in
+	 * zend_async_io_req_t (after an 8-byte free_cb) vs zend_async_udp_req_t
+	 * (after a 4-byte flags), so the two layouts are NOT interchangeable.
+	 * Reading dispose through the wrong layout calls the UDP req's sockaddr
+	 * bytes as a function pointer (access violation). Branch on io type. */
+	if (io->active_req != NULL) {
+		if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+			async_udp_req_t *ureq = (async_udp_req_t *) io->active_req;
+			io->active_req = NULL;
+			if (ureq->base.dispose != NULL) {
+				ureq->base.dispose(&ureq->base);
+			}
+		} else {
+			async_io_req_t *req = io->active_req;
+			io->active_req = NULL;
+			if (req->base.dispose != NULL) {
+				req->base.dispose(&req->base);
+			}
+		}
+	}
+
+	/* Dispose any file-write requests still queued behind the writer. */
+	if (io->write_q_head != NULL) {
+		async_io_req_t *qreq = io->write_q_head;
+		io->write_q_head = NULL;
+		io->write_q_tail = NULL;
+		while (qreq != NULL) {
+			async_io_req_t *qnext = qreq->write_q_next;
+			qreq->write_q_next = NULL;
+			if (qreq->base.dispose != NULL) {
+				qreq->base.dispose(&qreq->base);
+			}
+			qreq = qnext;
+		}
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	pefree(io, 0);
+
+	return true;
+}
+
+/* }}} */
+
+/* {{{ IO request dispose */
+static void libuv_io_req_dispose(zend_async_io_req_t *base_req)
+{
+	async_io_req_t *req = (async_io_req_t *) base_req;
+
+	/* Op in flight: it cannot be cancelled synchronously, so defer the free —
+	 * the completion callback re-enters dispose after clearing UV_IN_FLIGHT.
+	 * uv_cancel reaps a threadpool fs op still queued (no-op for uv_write). */
+	if (UNEXPECTED(req->uv_flags & ASYNC_IO_REQ_F_UV_IN_FLIGHT)) {
+		req->uv_flags |= ASYNC_IO_REQ_F_DISPOSE_PENDING;
+		if (EXPECTED(ASYNC_G(reactor_started))) {
+			(void) uv_cancel((uv_req_t *) &req->fs_req);
+		}
+		return;
+	}
+
+	/* Awaiter gone while the read was still armed (plain_wrapper timeout):
+	 * stop the reader and detach, else io_pipe_read_cb / the active_req
+	 * backstop would touch this request after it is freed (#173). */
+	if (req->io != NULL && req->io->active_req == req) {
+		async_io_t *io = req->io;
+		if (ZEND_ASYNC_IO_IS_STREAM(io->base.type)
+				&& !(io->base.state & ZEND_ASYNC_IO_CLOSED)
+				&& EXPECTED(ASYNC_G(reactor_started))) {
+			uv_read_stop(&io->handle.stream);
+		}
+		io->active_req = NULL;
+	}
+
+	/* A file-write request still waiting its turn in the handle's pending
+	 * queue (its coroutine was cancelled before the write was dispatched)
+	 * — unlink it so the queue never dereferences this freed request. */
+	if (req->io != NULL && req->io->write_q_head != NULL) {
+		async_io_t *io = req->io;
+		if (io->write_q_head == req) {
+			io->write_q_head = req->write_q_next;
+			if (io->write_q_head == NULL) {
+				io->write_q_tail = NULL;
+			}
+		} else {
+			async_io_req_t *p = io->write_q_head;
+			while (p != NULL && p->write_q_next != req) {
+				p = p->write_q_next;
+			}
+			if (p != NULL) {
+				p->write_q_next = req->write_q_next;
+				if (io->write_q_tail == req) {
+					io->write_q_tail = p;
+				}
+			}
+		}
+		req->write_q_next = NULL;
+	}
+
+	/* Vectored fire-and-forget early-teardown path: writev request that never
+	 * reached io_pipe_writev_cb (submit-time error). Release every owned
+	 * zend_string ref stored in the trailing slot array. The completion cb
+	 * zeroes writev_nbufs after its own release loop, so no double-release. */
+	if (req->writev_nbufs > 0) {
+		zend_string **slots = (zend_string **)((char *) req + sizeof(*req));
+		for (unsigned i = 0; i < req->writev_nbufs; i++) {
+			zend_string_release(slots[i]);
+		}
+		req->writev_nbufs = 0;
+	}
+
+	/* Fire-and-forget ownership transfer: hand the buffer back via free_cb
+	 * if the request was submitted with one but never made it to the
+	 * completion callback (e.g. submit-time error in libuv_io_write).
+	 * io_pipe_write_cb clears free_cb after its own invocation, so we
+	 * never double-free here. */
+	if (req->base.free_cb != NULL) {
+		zend_async_io_write_free_cb_t free_cb = req->base.free_cb;
+		void *buf = req->base.buf;
+		req->base.free_cb = NULL;
+		req->base.buf     = NULL;
+		free_cb(buf, req->io != NULL ? &req->io->base : NULL);
+	} else if (req->buf_owned && req->base.buf != NULL) {
+		pefree(req->base.buf, 0);
+	}
+
+	if (req->base.exception != NULL) {
+		zend_object_release(req->base.exception);
+	}
+
+	pefree(req, 0);
+}
+
+/* }}} */
+
+/* {{{ IO pipe callbacks */
+static void libuv_io_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *output)
+{
+	async_io_t *io = (async_io_t *) handle->data;
+
+	/* User-controlled allocator: lets the owner pick a sliding offset into
+	 * its own buffer so multishot stays armed across consecutive reads. */
+	if (io->base.alloc_cb != NULL) {
+#ifdef _WIN32
+		/* uv_buf_t = { ULONG len; char *base; } — copy. */
+		zend_async_buf_t b = { NULL, 0 };
+		io->base.alloc_cb(&io->base, suggested_size, &b);
+		output->base = b.base;
+		output->len  = (ULONG) b.len;
+#else
+		_Static_assert(sizeof(zend_async_buf_t) == sizeof(uv_buf_t)
+				&& offsetof(zend_async_buf_t, base) == offsetof(uv_buf_t, base)
+				&& offsetof(zend_async_buf_t, len)  == offsetof(uv_buf_t, len),
+				"zend_async_buf_t must match uv_buf_t");
+		io->base.alloc_cb(&io->base, suggested_size, (zend_async_buf_t *) output);
+#endif
+		return;
+	}
+
+	/* Legacy: static (buf, max_size) frozen at submit time on the req. */
+	async_io_req_t *req = io->active_req;
+	if (UNEXPECTED(req == NULL || req->base.buf == NULL)) {
+		output->base = NULL;
+		output->len = 0;
+		return;
+	}
+	output->base = req->base.buf;
+	output->len = (unsigned int) req->max_size;
+}
+
+static void io_pipe_read_cb(uv_stream_t *pipe_stream, ssize_t bytes_read, const uv_buf_t *buffer)
+{
+	async_io_t *io = (async_io_t *) pipe_stream->data;
+	async_io_req_t *req = io->active_req;
+
+	if (bytes_read == 0) {
+		return;
+	}
+
+	const bool multishot = ZEND_ASYNC_IO_IS_MULTISHOT(&io->base);
+	const bool terminal = (bytes_read < 0);
+
+	/* One-shot semantics: stop the reader after the first completion.
+	 * Multishot: stay armed until the caller closes the IO, except on EOF/error
+	 * which are always terminal. */
+	if (!multishot || terminal) {
+		uv_read_stop(pipe_stream);
+		io->active_req = NULL;
+	}
+
+	if (UNEXPECTED(req == NULL)) {
+		return;
+	}
+
+	if (bytes_read > 0) {
+		req->base.transferred = bytes_read;
+	} else if (bytes_read == UV_EOF) {
+		req->base.transferred = 0;
+		io->base.state |= ZEND_ASYNC_IO_EOF;
+	} else {
+		req->base.transferred = -1;
+		req->base.exception = async_new_exception(
+				async_ce_input_output_exception, "Pipe read error: %s", uv_strerror((int) bytes_read));
+	}
+
+	/* In multishot mode on a successful read, leave the request uncompleted so
+	 * it can be reused for the next chunk delivered by libuv. */
+	req->base.completed = !multishot || terminal;
+
+	/* Own the broadcast exception for the duration of the notify. It belongs
+	 * to this req and dies with it, but a consumer (e.g. the connection's
+	 * persistent read listener) may dispose the req mid-notify while a sibling
+	 * callback on the same io->event still forwards the same object to a parked
+	 * writer. Hold a ref across the broadcast; the local survives even if the
+	 * req is freed by a consumer. */
+	zend_object *exc = req->base.exception;
+	if (exc != NULL) {
+		GC_ADDREF(exc);
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, exc);
+
+	if (exc != NULL) {
+		OBJ_RELEASE(exc);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+static void io_pipe_write_cb(uv_write_t *write_request, int status)
+{
+	async_io_req_t *req = (async_io_req_t *) write_request->data;
+	async_io_t *io = req->io;
+
+	req->uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	if (status == 0) {
+		req->base.transferred = (ssize_t) req->max_size;
+	} else {
+		req->base.transferred = -1;
+		req->base.exception =
+				async_new_exception(async_ce_input_output_exception, "Pipe write error: %s", uv_strerror(status));
+	}
+
+	req->base.completed = true;
+
+	/* Fire-and-forget mode: caller transferred buffer ownership via free_cb
+	 * and is not awaiting this req. Hand the buffer back via free_cb,
+	 * dispose the req inline, skip NOTIFY (no coroutine is parked on the
+	 * io event for this write). On status<0 the connection layer will see
+	 * the error on its next read attempt and tear the conn down. */
+	if (req->base.free_cb != NULL) {
+		zend_async_io_write_free_cb_t free_cb = req->base.free_cb;
+		void *buf = req->base.buf;
+		req->base.free_cb = NULL;
+		req->base.buf     = NULL;
+		free_cb(buf, &io->base);
+		if (req->base.exception != NULL) {
+			zend_object_release(req->base.exception);
+			req->base.exception = NULL;
+		}
+		pefree(req, 0);
+		IF_EXCEPTION_STOP_REACTOR;
+		return;
+	}
+
+	/* Awaiter gone mid-write — finish the deferred dispose; no one to NOTIFY. */
+	if (UNEXPECTED(req->uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING)) {
+		libuv_io_req_dispose(&req->base);
+		IF_EXCEPTION_STOP_REACTOR;
+		return;
+	}
+
+	/* Own the broadcast exception across the notify (see io_pipe_read_cb):
+	 * a consumer may free the req mid-broadcast while a sibling still uses it. */
+	zend_object *exc = req->base.exception;
+	if (exc != NULL) {
+		GC_ADDREF(exc);
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, exc);
+
+	if (exc != NULL) {
+		OBJ_RELEASE(exc);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* Vectored fire-and-forget completion. Releases every owned zend_string ref
+ * stored in the trailing slot array, then frees the request. No NOTIFY:
+ * writev is fire-and-forget by design (no caller awaits this req). On
+ * write error the connection layer surfaces the failure on its next read
+ * attempt and tears the conn down, just like ZEND_ASYNC_IO_WRITE_EX. */
+static void io_pipe_writev_cb(uv_write_t *write_request, int status)
+{
+	async_io_req_t *req = (async_io_req_t *) write_request->data;
+
+	/* Fire-and-forget: this callback always frees below, so DISPOSE_PENDING
+	 * needs no extra handling. */
+	req->uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	if (status == 0) {
+		req->base.transferred = (ssize_t) req->max_size;
+	} else {
+		req->base.transferred = -1;
+		req->base.exception = async_new_exception(
+				async_ce_input_output_exception, "Pipe writev error: %s", uv_strerror(status));
+	}
+	req->base.completed = true;
+
+	if (req->writev_nbufs > 0) {
+		/* ZSTR mode: release each owned zend_string. */
+		zend_string **slots = (zend_string **)((char *) req + sizeof(*req));
+		for (unsigned i = 0; i < req->writev_nbufs; i++) {
+			zend_string_release(slots[i]);
+		}
+		req->writev_nbufs = 0;
+	} else if (req->base.free_cb != NULL) {
+		/* IOV mode: one free_cb for the whole batch. */
+		zend_async_io_write_free_cb_t free_cb = req->base.free_cb;
+		void *user_data = req->base.buf;
+		req->base.free_cb = NULL;
+		req->base.buf     = NULL;
+		free_cb(user_data, req->io != NULL ? &req->io->base : NULL);
+	}
+
+	if (req->base.exception != NULL) {
+		zend_object_release(req->base.exception);
+		req->base.exception = NULL;
+	}
+	pefree(req, 0);
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+static void io_close_cb(uv_handle_t *pipe_handle)
+{
+	async_io_t *io = (async_io_t *) pipe_handle->data;
+	io->base.event.dispose(&io->base.event);
+}
+
+/* }}} */
+
+/* {{{ IO file callbacks */
+static void io_file_read_cb(uv_fs_t *fs_request)
+{
+	async_io_req_t *req = (async_io_req_t *) fs_request->data;
+	async_io_t *io = req->io;
+
+	req->uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	if (fs_request->result >= 0) {
+		req->base.transferred = (ssize_t) fs_request->result;
+		if (fs_request->result > 0) {
+			/* Update tracked offset from kernel position. */
+			const zend_off_t pos = zend_lseek(io->crt_fd, 0, SEEK_CUR);
+			if (pos >= 0) {
+				io->handle.file.offset = pos;
+			} else {
+				io->handle.file.offset += fs_request->result;
+			}
+		}
+	} else {
+		req->base.transferred = -1;
+		req->base.exception = async_new_exception(
+				async_ce_input_output_exception, "File read error: %s", uv_strerror((int) fs_request->result));
+	}
+
+	req->base.completed = true;
+	uv_fs_req_cleanup(fs_request);
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(&io->base.event);
+
+	/* Awaiter gone mid-read → finish the deferred dispose, else NOTIFY. */
+	if (UNEXPECTED(req->uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING)) {
+		libuv_io_req_dispose(&req->base);
+	} else {
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, req->base.exception);
+	}
+
+	io->base.event.dispose(&io->base.event); /* drop the op's io ref */
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+static void io_file_write_cb(uv_fs_t *fs_request)
+{
+	async_io_req_t *req = (async_io_req_t *) fs_request->data;
+	async_io_t *io = req->io;
+
+	req->uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	if (fs_request->result >= 0) {
+		req->base.transferred = (ssize_t) fs_request->result;
+
+#ifdef PHP_WIN32
+		/* When an explicit offset was passed to uv_fs_write (append mode),
+		 * WriteFile+OVERLAPPED does not advance the kernel file position,
+		 * so zend_lseek(SEEK_CUR) would return a stale value. */
+		if (io->base.state & ZEND_ASYNC_IO_APPEND) {
+			io->handle.file.offset += fs_request->result;
+		} else
+#endif
+		{
+			const zend_off_t pos = zend_lseek(io->crt_fd, 0, SEEK_CUR);
+			io->handle.file.offset = (pos >= 0) ? pos : io->handle.file.offset + fs_request->result;
+		}
+	} else {
+		req->base.transferred = -1;
+		req->base.exception = async_new_exception(
+				async_ce_input_output_exception, "File write error: %s", uv_strerror((int) fs_request->result));
+	}
+
+	req->base.completed = true;
+	uv_fs_req_cleanup(fs_request);
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(&io->base.event);
+
+	/* Hand off to the next queued file write so exactly one stays in
+	 * flight. A queued write that fails to even submit is completed with
+	 * its own exception and notified here; draining continues past it. */
+	bool dispatched = false;
+	while (io->write_q_head != NULL) {
+		async_io_req_t *next = io->write_q_head;
+		io->write_q_head = next->write_q_next;
+		if (io->write_q_head == NULL) {
+			io->write_q_tail = NULL;
+		}
+		next->write_q_next = NULL;
+		if (io_file_write_dispatch(io, next)) {
+			dispatched = true;
+			break;
+		}
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &next->base, next->base.exception);
+	}
+	if (!dispatched) {
+		io->file_write_in_flight = false;
+	}
+
+	/* Awaiter gone mid-write → finish the deferred dispose, else NOTIFY. */
+	if (UNEXPECTED(req->uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING)) {
+		libuv_io_req_dispose(&req->base);
+	} else {
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, req->base.exception);
+	}
+
+	io->base.event.dispose(&io->base.event); /* drop the op's io ref */
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+static void io_file_flush_cb(uv_fs_t *fs_request)
+{
+	async_io_req_t *req = (async_io_req_t *) fs_request->data;
+	async_io_t *io = req->io;
+
+	req->uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	if (fs_request->result == 0) {
+		req->base.result = 0;
+	} else {
+		req->base.result = -1;
+		req->base.exception = async_new_exception(
+				async_ce_input_output_exception, "File flush error: %s", uv_strerror((int) fs_request->result));
+	}
+
+	req->base.completed = true;
+	uv_fs_req_cleanup(fs_request);
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(&io->base.event);
+
+	/* Awaiter gone mid-flush → finish the deferred dispose, else NOTIFY. */
+	if (UNEXPECTED(req->uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING)) {
+		libuv_io_req_dispose(&req->base);
+	} else {
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, req->base.exception);
+	}
+
+	io->base.event.dispose(&io->base.event); /* drop the op's io ref */
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+static void io_file_stat_cb(uv_fs_t *fs_request)
+{
+	async_io_req_t *req = (async_io_req_t *) fs_request->data;
+	async_io_t *io = req->io;
+
+	req->uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	/* Abandoned: base.buf points into the gone awaiter's frame — don't write. */
+	const bool abandoned = (req->uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING) != 0;
+
+	if (fs_request->result == 0) {
+		req->base.result = 0;
+		/* Write stat data to caller's buffer, then clear ptr (not owned by req) */
+		if (EXPECTED(!abandoned)) {
+			uv_stat_to_zend_stat(&fs_request->statbuf, (zend_stat_t *) req->base.buf);
+		}
+		req->base.buf = NULL;
+	} else {
+		req->base.result = -1;
+		req->base.buf = NULL;
+		req->base.exception = async_new_exception(
+				async_ce_input_output_exception, "File stat error: %s", uv_strerror((int) fs_request->result));
+	}
+
+	req->base.completed = true;
+	uv_fs_req_cleanup(fs_request);
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(&io->base.event);
+
+	if (UNEXPECTED(abandoned)) {
+		libuv_io_req_dispose(&req->base);
+	} else {
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, req->base.exception);
+	}
+
+	io->base.event.dispose(&io->base.event); /* drop the op's io ref */
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ Sendfile + fs_open backends (zend_async_API v0.11) */
+
+/* Per-request state for zend_async_io_sendfile. Wraps async_io_req_t
+ * with the destination io plus the offset / remaining bookkeeping
+ * needed to loop uv_fs_sendfile on partial sends. */
+typedef struct {
+	async_io_req_t base;
+	async_io_t    *dst_io;
+	zend_off_t     offset;        /* -1 = read from current position */
+	size_t         remaining;
+	size_t         transferred;
+} async_sendfile_req_t;
+
+static void libuv_sendfile_req_dispose(zend_async_io_req_t *base_req)
+{
+	async_io_req_t *req = (async_io_req_t *) base_req;
+
+	/* Op in flight (uv_fs_sendfile / TransmitFile worker) — defer the free to
+	 * sendfile_complete; see the same rendezvous in libuv_io_req_dispose. */
+	if (UNEXPECTED(req->uv_flags & ASYNC_IO_REQ_F_UV_IN_FLIGHT)) {
+		req->uv_flags |= ASYNC_IO_REQ_F_DISPOSE_PENDING;
+		if (EXPECTED(ASYNC_G(reactor_started))) {
+			(void) uv_cancel((uv_req_t *) &req->fs_req);
+		}
+		return;
+	}
+
+	if (base_req->exception != NULL) {
+		zend_object_release(base_req->exception);
+		base_req->exception = NULL;
+	}
+	pefree(base_req, 0);
+}
+
+static void sendfile_complete(async_sendfile_req_t *req,
+                              const int error_code, const char *err_kind)
+{
+	async_io_t *src_io = req->base.io;
+	async_io_t *dst_io = req->dst_io;
+
+	if (error_code == 0) {
+		req->base.base.transferred = (ssize_t) req->transferred;
+	} else {
+		req->base.base.transferred =
+				req->transferred > 0 ? (ssize_t) req->transferred : -1;
+		if (req->base.base.exception == NULL && err_kind != NULL) {
+			req->base.base.exception = async_new_exception(
+					async_ce_input_output_exception, "%s: %s",
+					err_kind, uv_strerror(error_code));
+		}
+	}
+
+	req->base.base.completed = true;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(&src_io->base.event);
+
+	if (UNEXPECTED(req->base.uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING)) {
+		libuv_sendfile_req_dispose(&req->base.base);
+	} else {
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&src_io->base.event, &req->base.base,
+		                            req->base.base.exception);
+	}
+
+	/* Drop the src/dst io refs held across the op. */
+	src_io->base.event.dispose(&src_io->base.event);
+	dst_io->base.event.dispose(&dst_io->base.event);
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* uv_fs_sendfile may flush only part of `length` in one shot; resubmit
+ * until the full count lands on the wire or the kernel returns an
+ * error. */
+static void io_sendfile_zc_cb(uv_fs_t *fs_request)
+{
+	async_sendfile_req_t *req = (async_sendfile_req_t *) fs_request->data;
+	const ssize_t result = (ssize_t) fs_request->result;
+	uv_fs_req_cleanup(fs_request);
+
+	req->base.uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+
+	/* Awaiter abandoned the transfer — do not resubmit the remainder. */
+	if (UNEXPECTED(req->base.uv_flags & ASYNC_IO_REQ_F_DISPOSE_PENDING)) {
+		sendfile_complete(req, UV_ECANCELED, NULL);
+		return;
+	}
+
+	if (result < 0) {
+		sendfile_complete(req, (int) result, "Sendfile");
+		return;
+	}
+
+	req->transferred += (size_t) result;
+	if (req->offset >= 0) {
+		req->offset += result;
+	}
+
+	if (result == 0 || (size_t) result >= req->remaining) {
+		req->remaining = 0;
+		sendfile_complete(req, 0, NULL);
+		return;
+	}
+
+	req->remaining -= (size_t) result;
+
+	const int err = uv_fs_sendfile(UVLOOP, &req->base.fs_req,
+			req->dst_io->crt_fd, req->base.io->crt_fd,
+			req->offset, req->remaining, io_sendfile_zc_cb);
+	if (UNEXPECTED(err < 0)) {
+		sendfile_complete(req, err, "Sendfile resubmit");
+		return;
+	}
+	req->base.uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+}
+
+#ifdef PHP_WIN32
+/* {{{ Windows file→socket sendfile via TransmitFile
+ *
+ * uv_fs_sendfile() targets the destination through CRT _write(), which
+ * only works when the destination is a CRT file descriptor. A TCP
+ * destination is a Winsock SOCKET — a different Windows descriptor
+ * namespace entirely (HANDLE / SOCKET / CRT fd are three distinct
+ * tables) — so feeding the socket value to _write writes nowhere and the
+ * body is silently lost. POSIX hides this because it unifies every
+ * descriptor into one int that sendfile(2) accepts directly.
+ *
+ * Resolve it at the right layer: dispatch socket destinations to
+ * TransmitFile, the Win32 file→socket primitive (the real "sendfile to a
+ * socket"). It runs synchronously on a libuv threadpool worker — exactly
+ * how uv_fs_sendfile runs its own copy loop off-loop — so completion
+ * still arrives on the loop thread via the after-work callback and the
+ * existing sendfile_complete() notify path is reused unchanged. */
+
+/* TransmitFile's byte count is a DWORD; loop for larger files. 1 GiB per
+ * call stays well inside the limit and bounds worker occupancy per pass. */
+#define ASYNC_TRANSMITFILE_CHUNK_MAX (1u << 30)
+
+typedef struct {
+	uv_work_t              work;
+	async_sendfile_req_t *req;
+	SOCKET                sock;        /* destination Winsock socket */
+	HANDLE                file;        /* source file Win32 HANDLE */
+	zend_off_t            offset;      /* start offset; -1 = current position */
+	size_t                remaining;
+	size_t                transferred;
+	int                   uv_err;      /* 0 = ok, else a UV_* error code */
+} async_transmitfile_work_t;
+
+/* Resolve TransmitFile lazily via WSAIoctl — no mswsock.lib link needed,
+ * and the pointer is process-stable so the static cache's benign
+ * same-value race across workers is harmless. */
+static LPFN_TRANSMITFILE async_resolve_transmitfile(const SOCKET s)
+{
+	static LPFN_TRANSMITFILE cached = NULL;
+
+	if (cached != NULL) {
+		return cached;
+	}
+
+	GUID guid = WSAID_TRANSMITFILE;
+	LPFN_TRANSMITFILE fn = NULL;
+	DWORD bytes = 0;
+
+	if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid),
+				 &fn, sizeof(fn), &bytes, NULL, NULL) == 0) {
+		cached = fn;
+	}
+
+	return cached;
+}
+
+/* Worker thread: no PHP/Zend API here, only Win32 + the req's own bytes. */
+static void io_transmitfile_work_cb(uv_work_t *work)
+{
+	async_transmitfile_work_t *tw = (async_transmitfile_work_t *) work->data;
+
+	const LPFN_TRANSMITFILE transmit = async_resolve_transmitfile(tw->sock);
+
+	if (UNEXPECTED(transmit == NULL)) {
+		tw->uv_err = UV_ENOSYS;
+		return;
+	}
+
+	/* Position the file once; synchronous TransmitFile reads from and
+	 * advances the file pointer, so later loop passes continue in place. */
+	if (tw->offset >= 0) {
+		LARGE_INTEGER li;
+		li.QuadPart = (LONGLONG) tw->offset;
+
+		if (!SetFilePointerEx(tw->file, li, NULL, FILE_BEGIN)) {
+			tw->uv_err = uv_translate_sys_error(GetLastError());
+			return;
+		}
+	}
+
+	while (tw->remaining > 0) {
+		const DWORD n = (DWORD) (tw->remaining < ASYNC_TRANSMITFILE_CHUNK_MAX
+									 ? tw->remaining
+									 : ASYNC_TRANSMITFILE_CHUNK_MAX);
+
+		/* NULL OVERLAPPED on a (blocking) libuv socket → synchronous:
+		 * returns only once all n bytes are handed to the transport.
+		 * Stream sockets preserve send order, so the head written inline
+		 * before this op stays ahead of the body on the wire. */
+		if (!transmit(tw->sock, tw->file, n, 0, NULL, NULL, 0)) {
+			tw->uv_err = uv_translate_sys_error(WSAGetLastError());
+			return;
+		}
+
+		tw->transferred += n;
+		tw->remaining   -= n;
+	}
+}
+
+/* Loop thread: translate the worker outcome onto the shared completion. */
+static void io_transmitfile_after_cb(uv_work_t *work, const int status)
+{
+	async_transmitfile_work_t *tw = (async_transmitfile_work_t *) work->data;
+	async_sendfile_req_t *req = tw->req;
+
+	req->base.uv_flags &= ~ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	req->transferred = tw->transferred;
+
+	if (status == UV_ECANCELED) {
+		sendfile_complete(req, UV_ECANCELED, "Sendfile");
+	} else if (tw->uv_err != 0) {
+		sendfile_complete(req, tw->uv_err, "TransmitFile");
+	} else {
+		sendfile_complete(req, 0, NULL);
+	}
+
+	pefree(tw, 0);
+}
+/* }}} */
+#endif /* PHP_WIN32 */
+
+/* {{{ libuv_io_sendfile
+ *
+ * Pure zero-copy: bytes never enter user space. Caller is responsible
+ * for not invoking this on a transport that needs user-space
+ * encryption (e.g. OpenSSL without kTLS) — the API does NOT and
+ * cannot mediate that, because the alternative path (read + write)
+ * would also bypass user-space encryption when going through the
+ * generic uv_write. Such callers must use a transport-aware
+ * read+write loop themselves. */
+static zend_async_io_req_t *
+libuv_io_sendfile(zend_async_io_t *out_io_base, zend_async_io_t *in_io_base,
+                  const zend_off_t offset, const size_t length)
+{
+	async_io_t *out_io = (async_io_t *) out_io_base;
+	async_io_t *in_io  = (async_io_t *) in_io_base;
+
+	if (UNEXPECTED(out_io_base->state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot sendfile: destination IO closed");
+		return NULL;
+	}
+	if (UNEXPECTED(in_io_base->state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot sendfile: source IO closed");
+		return NULL;
+	}
+	if (UNEXPECTED(in_io_base->type != ZEND_ASYNC_IO_TYPE_FILE)) {
+		async_throw_error("Sendfile source must be a file IO handle");
+		return NULL;
+	}
+
+	async_sendfile_req_t *req = pecalloc(1, sizeof(async_sendfile_req_t), 0);
+	req->base.base.dispose = libuv_sendfile_req_dispose;
+	req->base.io     = in_io;
+	req->dst_io      = out_io;
+	req->offset      = offset;
+	req->remaining   = length;
+
+	if (length == 0) {
+		req->base.base.transferred = 0;
+		req->base.base.completed   = true;
+		return &req->base.base;
+	}
+
+#ifdef PHP_WIN32
+	/* Socket destination: uv_fs_sendfile's CRT _write() cannot reach a
+	 * Winsock SOCKET. Route through TransmitFile instead, using the proper
+	 * descriptors — the socket from descriptor.socket, the source as a
+	 * Win32 HANDLE via _get_osfhandle(crt_fd) — never the conflated
+	 * crt_fd-as-socket value. */
+	if (out_io->base.type == ZEND_ASYNC_IO_TYPE_TCP) {
+		const HANDLE file = (HANDLE) _get_osfhandle(in_io->crt_fd);
+
+		if (UNEXPECTED(file == INVALID_HANDLE_VALUE)) {
+			async_throw_error("Failed to start sendfile: source is not a valid file handle");
+			libuv_sendfile_req_dispose(&req->base.base);
+			return NULL;
+		}
+
+		async_transmitfile_work_t *tw = pecalloc(1, sizeof(*tw), 0);
+		tw->work.data  = tw;
+		tw->req        = req;
+		tw->sock       = (SOCKET) out_io->base.descriptor.socket;
+		tw->file       = file;
+		tw->offset     = offset;
+		tw->remaining  = length;
+
+		const int werr = uv_queue_work(UVLOOP, &tw->work, io_transmitfile_work_cb,
+									   io_transmitfile_after_cb);
+		if (UNEXPECTED(werr < 0)) {
+			pefree(tw, 0);
+			async_throw_error("Failed to start sendfile: %s", uv_strerror(werr));
+			libuv_sendfile_req_dispose(&req->base.base);
+			return NULL;
+		}
+
+		/* Pin both ios for the op; released in sendfile_complete. */
+		req->base.uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+		ZEND_ASYNC_EVENT_ADD_REF(&in_io->base.event);
+		ZEND_ASYNC_EVENT_ADD_REF(&out_io->base.event);
+		ZEND_ASYNC_INCREASE_EVENT_COUNT(&in_io->base.event);
+		return &req->base.base;
+	}
+#endif
+
+	req->base.fs_req.data = req;
+
+	const int err = uv_fs_sendfile(UVLOOP, &req->base.fs_req,
+			out_io->crt_fd, in_io->crt_fd,
+			offset, length, io_sendfile_zc_cb);
+	if (UNEXPECTED(err < 0)) {
+		async_throw_error("Failed to start sendfile: %s", uv_strerror(err));
+		libuv_sendfile_req_dispose(&req->base.base);
+		return NULL;
+	}
+
+	/* See the TransmitFile branch: ios pinned until sendfile_complete. */
+	req->base.uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	ZEND_ASYNC_EVENT_ADD_REF(&in_io->base.event);
+	ZEND_ASYNC_EVENT_ADD_REF(&out_io->base.event);
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&in_io->base.event);
+	return &req->base.base;
+}
+/* }}} */
+
+static zend_async_io_t *libuv_io_create(zend_file_descriptor_t fd,
+                                        zend_async_io_type type,
+                                        uint32_t state);
+
+/* fs_open: async open(2) via libuv's thread pool. Returns a pending
+ * io_t immediately — fd is filled in by the completion callback. The
+ * caller add_callback's on io->base.event for the ready/error
+ * notification.
+ *
+ * State on submit: type=FILE, state=0 (no READABLE/WRITABLE).
+ * On success completion: crt_fd set, state |= READABLE, NOTIFY result=NULL.
+ * On error completion: state |= CLOSED, NOTIFY result=NULL exception=non-NULL. */
+typedef struct {
+	uv_fs_t       fs_req;
+	async_io_t   *io;
+} libuv_fs_open_state_t;
+
+static void libuv_fs_open_cb(uv_fs_t *fs_request)
+{
+	libuv_fs_open_state_t *state = (libuv_fs_open_state_t *) fs_request->data;
+	async_io_t *io = state->io;
+	const ssize_t result = (ssize_t) fs_request->result;
+	uv_fs_req_cleanup(fs_request);
+
+	zend_object *exception = NULL;
+
+	if (result >= 0) {
+		io->crt_fd = (int) result;
+		io->base.descriptor.fd = (int) result;
+		/* fs_open opened the fd itself — close it on dispose. */
+		io->base.state |= ZEND_ASYNC_IO_READABLE | ZEND_ASYNC_IO_OWNS_FD;
+	} else {
+		io->base.state |= ZEND_ASYNC_IO_CLOSED | ZEND_ASYNC_IO_EOF;
+		exception = async_new_exception(
+				async_ce_input_output_exception, "Open error: %s",
+				uv_strerror((int) result));
+	}
+
+	pefree(state, 0);
+
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(&io->base.event);
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, NULL, exception);
+	if (exception != NULL) {
+		zend_object_release(exception);
+	}
+
+	/* Drop the open's io ref; if the caller abandoned the pending io, this
+	 * frees it here (and closes the fresh OWNS_FD fd) rather than dangling. */
+	io->base.event.dispose(&io->base.event);
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+static zend_async_io_t *
+libuv_fs_open(const char *path, const int flags, const int mode)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	/* Allocate a pending FILE io_t up front — fd unknown, state empty.
+	 * libuv_io_create handles the event-vtable wiring; we patch fd
+	 * and READABLE in the completion callback below. */
+	zend_async_io_t *io_base = libuv_io_create(
+			(zend_file_descriptor_t) -1, ZEND_ASYNC_IO_TYPE_FILE, 0);
+	if (UNEXPECTED(io_base == NULL)) {
+		return NULL;
+	}
+	async_io_t *io = (async_io_t *) io_base;
+
+	libuv_fs_open_state_t *state = pecalloc(1, sizeof(*state), 0);
+	state->io = io;
+	state->fs_req.data = state;
+
+	const int err = uv_fs_open(UVLOOP, &state->fs_req, path, flags, mode,
+			libuv_fs_open_cb);
+	if (UNEXPECTED(err < 0)) {
+		async_throw_error("Failed to start open: %s", uv_strerror(err));
+		pefree(state, 0);
+		io_base->event.dispose(&io_base->event);
+		return NULL;
+	}
+
+	/* Pin the pending io until libuv_fs_open_cb (caller may abandon it). */
+	ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&io->base.event);
+	return io_base;
+}
+/* }}} */
+
+/* {{{ libuv_io_create */
+static zend_async_io_t *
+libuv_io_create(const zend_file_descriptor_t fd, const zend_async_io_type type, const uint32_t state)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_io_t *io = pecalloc(1, sizeof(async_io_t), 0);
+
+	io->orig_fd = -1;
+
+#ifndef PHP_WIN32
+	/* Unix only: libuv asserts fd > STDERR_FILENO in uv__close().
+	 * Dup stdio fds so libuv can safely close the copy. */
+	zend_file_descriptor_t io_fd = fd;
+	if (ZEND_ASYNC_IO_IS_STREAM(type) && fd >= 0 && fd <= STDERR_FILENO) {
+		io_fd = dup(fd);
+		if (io_fd < 0) {
+			pefree(io, 0);
+			return NULL;
+		}
+		io->orig_fd = fd;
+	}
+#else
+	zend_file_descriptor_t io_fd = fd;
+#endif
+
+	/* Set descriptor based on type.
+	 * zend_file_descriptor_t is always a CRT fd (int) on all platforms. */
+	if (type == ZEND_ASYNC_IO_TYPE_TCP || type == ZEND_ASYNC_IO_TYPE_UDP) {
+		io->base.descriptor.socket = (zend_socket_t) io_fd;
+		io->crt_fd = io_fd;
+	} else {
+		io->base.descriptor.fd = io_fd;
+		io->crt_fd = io_fd;
+	}
+
+	io->base.type = type;
+	io->base.state = state;
+
+	io->base.event.ref_count = 1;
+	io->base.event.add_callback = libuv_add_callback;
+	io->base.event.del_callback = libuv_remove_callback;
+	io->base.event.start = libuv_io_event_start;
+	io->base.event.stop = libuv_io_event_stop;
+	io->base.event.dispose = libuv_io_event_dispose;
+	io->base.event.info = libuv_io_info;
+
+	if (type == ZEND_ASYNC_IO_TYPE_PIPE) {
+		int error = uv_pipe_init(UVLOOP, &io->handle.pipe, 0);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to initialize pipe handle: %s", uv_strerror(error));
+			pefree(io, 0);
+			return NULL;
+		}
+
+		error = uv_pipe_open(&io->handle.pipe, io->crt_fd);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to open pipe handle: %s", uv_strerror(error));
+			io->handle.pipe.data = io;
+			uv_close((uv_handle_t *) &io->handle.pipe, io_close_cb);
+			return NULL;
+		}
+
+		io->handle.pipe.data = io;
+	} else if (type == ZEND_ASYNC_IO_TYPE_TTY) {
+		const int readable = (state & ZEND_ASYNC_IO_READABLE) ? 1 : 0;
+		const int error = uv_tty_init(UVLOOP, &io->handle.tty, io->crt_fd, readable);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to initialize TTY handle: %s", uv_strerror(error));
+			pefree(io, 0);
+			return NULL;
+		}
+
+		io->handle.tty.data = io;
+	} else if (type == ZEND_ASYNC_IO_TYPE_TCP) {
+		int error = uv_tcp_init(UVLOOP, &io->handle.tcp);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to initialize TCP handle: %s", uv_strerror(error));
+			pefree(io, 0);
+			return NULL;
+		}
+
+		/* For TCP (and UDP) the caller passes the native socket value in
+		 * io_fd — a SOCKET on Windows, an int on POSIX — because zend_socket_t
+		 * is the kernel-level socket on both platforms. Do NOT run io_fd
+		 * through _get_osfhandle() on Windows: that would treat it as a
+		 * CRT fd, returning INVALID_HANDLE_VALUE for a real SOCKET and
+		 * making uv_tcp_open fail on every accepted connection. */
+		const uv_os_sock_t sock = (uv_os_sock_t) io_fd;
+		error = uv_tcp_open(&io->handle.tcp, sock);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to open TCP handle: %s", uv_strerror(error));
+			io->handle.tcp.data = io;
+			uv_close((uv_handle_t *) &io->handle.tcp, io_close_cb);
+			return NULL;
+		}
+
+		io->handle.tcp.data = io;
+	} else if (type == ZEND_ASYNC_IO_TYPE_UDP) {
+		const int error = uv_udp_init(UVLOOP, &io->handle.udp);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to initialize UDP handle: %s", uv_strerror(error));
+			pefree(io, 0);
+			return NULL;
+		}
+
+		io->handle.udp.data = io;
+	} else {
+		/* FILE type: initialise the tracked offset.
+		 * For append mode we need to know the current EOF so that
+		 * uv_fs_write can target it explicitly (on Windows _O_APPEND
+		 * is a CRT flag invisible to WriteFile).  After reading EOF
+		 * we restore the fd to 0 so that ftell() returns 0 on open,
+		 * matching POSIX O_APPEND semantics. */
+		if (state & ZEND_ASYNC_IO_APPEND) {
+			const zend_off_t eof = zend_lseek(io->crt_fd, 0, SEEK_END);
+			io->handle.file.offset = (eof >= 0) ? eof : 0;
+			zend_lseek(io->crt_fd, 0, SEEK_SET);
+		} else {
+			const zend_off_t pos = zend_lseek(io->crt_fd, 0, SEEK_CUR);
+			io->handle.file.offset = (pos >= 0) ? pos : 0;
+		}
+	}
+
+	zend_hash_index_add_new_ptr(&ASYNC_G(active_io_handles), async_ptr_to_index(io), io);
+
+	return &io->base;
+}
+
+/* }}} */
+
+#ifdef PHP_WIN32
+/* {{{ libuv_can_use_sync_io
+ * Returns true when there is at most one coroutine and no active events
+ * in the reactor, meaning async I/O would only add overhead with no
+ * concurrency benefit.  Used on Windows where libuv async I/O goes through
+ * a helper process, making synchronous calls much cheaper. */
+static inline bool libuv_can_use_sync_io(void)
+{
+	return zend_hash_num_elements(&ASYNC_G(coroutines)) <= 1 && !libuv_reactor_loop_alive();
+}
+#endif
+
+/* }}} */
+
+/* {{{ libuv_io_read */
+static zend_async_io_req_t *libuv_io_read(zend_async_io_t *io_base, char *buf, size_t max_size)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot read from closed IO handle");
+		return NULL;
+	}
+
+	/* _read() and uv_buf_t.len are 32-bit on Windows; cap to INT_MAX so the
+	 * caller's loop (e.g. _php_stream_write_buffer) can retry the remainder. */
+	if (max_size > INT_MAX) {
+		max_size = INT_MAX;
+	}
+
+	async_io_req_t *req = pecalloc(1, sizeof(async_io_req_t), 0);
+	req->base.dispose = libuv_io_req_dispose;
+	req->io = io;
+	req->max_size = max_size;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_EOF)) {
+		req->base.transferred = 0;
+		req->base.completed = true;
+		return &req->base;
+	}
+
+	if (buf != NULL) {
+		req->base.buf = buf;
+		req->buf_owned = false;
+	} else {
+		req->base.buf = pemalloc(max_size, 0);
+		req->buf_owned = true;
+	}
+
+	if (ZEND_ASYNC_IO_IS_STREAM(io->base.type)) {
+#ifdef PHP_WIN32
+		/* Sync fallback: on Windows libuv async I/O goes through a helper
+		 * process, so a direct blocking call is much cheaper when there is
+		 * at most one coroutine and no active reactor events. */
+		if (libuv_can_use_sync_io()) {
+			const int result = _read(io->crt_fd, req->base.buf, (unsigned int) max_size);
+
+			if (result > 0) {
+				req->base.transferred = result;
+			} else if (result == 0 || errno == EBADF) {
+				/* EBADF on pipes: treat as EOF (e.g. proc_open pipe
+				 * where child never writes to this descriptor). */
+				req->base.transferred = 0;
+				io->base.state |= ZEND_ASYNC_IO_EOF;
+			} else {
+				req->base.transferred = -1;
+				req->base.exception =
+						async_new_exception(async_ce_input_output_exception, "Stream read error: %s", strerror(errno));
+			}
+			req->base.completed = true;
+			return &req->base;
+		}
+#endif
+
+		io->active_req = req;
+
+		const int error = uv_read_start(&io->handle.stream, libuv_io_alloc_cb, io_pipe_read_cb);
+
+		if (UNEXPECTED(error < 0)) {
+			io->active_req = NULL;
+			async_throw_error("Failed to start pipe read: %s", uv_strerror(error));
+			libuv_io_req_dispose(&req->base);
+			return NULL;
+		}
+
+		return &req->base;
+	}
+
+	/* FILE path */
+#ifdef PHP_WIN32
+	if (libuv_can_use_sync_io()) {
+		/* Read at the current kernel position — do NOT seek to the tracked
+		 * offset, because dup'd fds share the kernel position and another
+		 * fd may have advanced it. */
+		const int result = _read(io->crt_fd, req->base.buf, (unsigned int) max_size);
+
+		if (result > 0) {
+			req->base.transferred = result;
+			const zend_off_t pos = zend_lseek(io->crt_fd, 0, SEEK_CUR);
+			io->handle.file.offset = (pos >= 0) ? pos : io->handle.file.offset + result;
+		} else if (result == 0) {
+			req->base.transferred = 0;
+		} else {
+			req->base.transferred = -1;
+			req->base.exception =
+					async_new_exception(async_ce_input_output_exception, "File read error: %s", strerror(errno));
+		}
+
+		req->base.completed = true;
+		return &req->base;
+	}
+#endif
+
+	const uv_buf_t read_buffer = uv_buf_init(req->base.buf, (unsigned int) max_size);
+	req->fs_req.data = req;
+
+	/* Use offset=-1 so libuv calls read() instead of pread().
+	 * This moves the kernel file offset, keeping dup'd fds in sync. */
+	const int error =
+			uv_fs_read(UVLOOP, &req->fs_req, io->crt_fd, &read_buffer, 1, -1, io_file_read_cb);
+
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to start file read: %s", uv_strerror(error));
+		libuv_io_req_dispose(&req->base);
+		return NULL;
+	}
+
+	/* Pin the io for the op: FILE ios have no uv_close rendezvous, so an owner
+	 * dispose could free the io while this callback still uses it. Released in
+	 * the cb. */
+	req->uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&io->base.event);
+	return &req->base;
+}
+
+/* }}} */
+
+/* {{{ io_file_write_dispatch
+ * Submit one queued/pending file-write request to libuv. Exactly one such
+ * request is in flight per handle at a time (io->file_write_in_flight), so
+ * the thread-pool writes never race the shared kernel file offset. Returns
+ * true when the write was submitted; false on a submit error, in which case
+ * the request is completed with an exception for its waiter to observe. */
+static bool io_file_write_dispatch(async_io_t *io, async_io_req_t *req)
+{
+	const size_t count = req->max_size;
+	const uv_buf_t write_buffer =
+			uv_buf_init((char *) req->base.buf, (unsigned int) (count > INT_MAX ? INT_MAX : count));
+	req->fs_req.data = req;
+
+	/* offset=-1 tells libuv to use write() instead of pwrite(), which
+	 * advances the kernel file offset — important for dup'd descriptors.
+	 * Serializing dispatch keeps that offset race-free across platforms.
+	 *
+	 * On Windows, WriteFile via libuv ignores CRT _O_APPEND, so we must
+	 * query the real EOF right before submitting the write request. This
+	 * is safe because the event loop is single-threaded. */
+#ifdef PHP_WIN32
+	int64_t offset = -1;
+	if (io->base.state & ZEND_ASYNC_IO_APPEND) {
+		const zend_off_t eof = zend_lseek(io->crt_fd, 0, SEEK_END);
+		offset = (eof >= 0) ? (int64_t) eof : (int64_t) io->handle.file.offset;
+	}
+#else
+	const int64_t offset = -1;
+#endif
+
+	const int error =
+			uv_fs_write(UVLOOP, &req->fs_req, io->crt_fd, &write_buffer, 1, offset, io_file_write_cb);
+
+	if (UNEXPECTED(error < 0)) {
+		req->base.transferred = -1;
+		req->base.completed   = true;
+		req->base.exception   = async_new_exception(
+				async_ce_input_output_exception, "Failed to start file write: %s", uv_strerror(error));
+		return false;
+	}
+
+	/* Pin the io for the duration of the fs op (see libuv_io_read). */
+	req->uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&io->base.event);
+	return true;
+}
+/* }}} */
+
+/* {{{ libuv_io_write */
+static zend_async_io_req_t *libuv_io_write(zend_async_io_t *io_base, const char *buf, const size_t count,
+                                           zend_async_io_write_free_cb_t free_cb)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot write to closed IO handle");
+		return NULL;
+	}
+
+	async_io_req_t *req = pecalloc(1, sizeof(async_io_req_t), 0);
+	req->base.dispose = libuv_io_req_dispose;
+	req->base.buf     = (char *) buf;
+	req->base.free_cb = free_cb;
+	req->io = io;
+	req->max_size = count;
+
+	if (ZEND_ASYNC_IO_IS_STREAM(io->base.type)) {
+#ifdef PHP_WIN32
+		/* Sync fallback: on Windows libuv async I/O goes through a helper
+		 * process, so a direct blocking call is much cheaper when there is
+		 * at most one coroutine and no active reactor events. */
+		if (libuv_can_use_sync_io()) {
+			const unsigned int write_size = (count > INT_MAX) ? (unsigned int) INT_MAX : (unsigned int) count;
+			const int result = _write(io->crt_fd, buf, write_size);
+
+			if (result >= 0) {
+				req->base.transferred = result;
+			} else {
+				req->base.transferred = -1;
+				req->base.exception = async_new_exception(
+						async_ce_input_output_exception, "Stream write error: %s", strerror(errno));
+			}
+			req->base.completed = true;
+			return &req->base;
+		}
+#endif
+
+		const uv_buf_t write_buffer = uv_buf_init((char *) buf, (unsigned int) (count > INT_MAX ? INT_MAX : count));
+		req->write_req.data = req;
+
+		const int error = uv_write(&req->write_req, &io->handle.stream, &write_buffer, 1, io_pipe_write_cb);
+
+		if (UNEXPECTED(error < 0)) {
+			async_throw_error("Failed to start stream write: %s", uv_strerror(error));
+			libuv_io_req_dispose(&req->base);
+			return NULL;
+		}
+
+		/* No io pin needed for stream writes: uv_close guarantees pending
+		 * write callbacks (UV_ECANCELED) run before io_close_cb frees the io. */
+		req->uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+		return &req->base;
+	}
+
+	/* FILE path */
+#ifdef PHP_WIN32
+	if (libuv_can_use_sync_io()) {
+		/* Write at the current kernel position — do NOT seek to the tracked
+		 * offset, because dup'd fds share the kernel position and another
+		 * fd may have advanced it.  _write() with _O_APPEND handles
+		 * append mode automatically. */
+		const unsigned int write_size = (count > INT_MAX) ? (unsigned int) INT_MAX : (unsigned int) count;
+		const int result = _write(io->crt_fd, buf, write_size);
+
+		if (result >= 0) {
+			req->base.transferred = result;
+			const zend_off_t pos = zend_lseek(io->crt_fd, 0, SEEK_CUR);
+			io->handle.file.offset = (pos >= 0) ? pos : io->handle.file.offset + result;
+		} else {
+			req->base.transferred = -1;
+			req->base.exception =
+					async_new_exception(async_ce_input_output_exception, "File write error: %s", strerror(errno));
+		}
+
+		req->base.completed = true;
+		return &req->base;
+	}
+#endif
+
+	/* Serialize file writes: only one uv_fs_write may be in flight per
+	 * handle. Several concurrent thread-pool writes with offset=-1 race
+	 * the shared kernel file offset and silently lose data on platforms
+	 * that do not serialize them in-kernel (macOS, Windows). A write that
+	 * arrives while another is in flight waits in the FIFO and is
+	 * dispatched by io_file_write_cb when the current one completes. */
+	if (io->file_write_in_flight) {
+		req->write_q_next = NULL;
+		if (io->write_q_tail != NULL) {
+			io->write_q_tail->write_q_next = req;
+		} else {
+			io->write_q_head = req;
+		}
+		io->write_q_tail = req;
+		return &req->base;
+	}
+
+	io->file_write_in_flight = true;
+	if (UNEXPECTED(!io_file_write_dispatch(io, req))) {
+		/* Submit failed: req is completed with its exception, and nothing
+		 * else is queued — clear the in-flight flag. The caller observes
+		 * the error through req->base.exception. */
+		io->file_write_in_flight = false;
+	}
+
+	return &req->base;
+}
+
+/* }}} */
+
+/* {{{ libuv_io_writev — vectored fire-and-forget write (dual-mode) */
+static zend_async_io_req_t *libuv_io_writev(zend_async_io_t *io_base,
+                                            const void *bufs, unsigned nbufs,
+                                            uint32_t flags,
+                                            zend_async_io_write_free_cb_t free_cb,
+                                            void *user_data)
+{
+	async_io_t *io = (async_io_t *) io_base;
+	const bool iov_mode = (flags == ZEND_ASYNC_IO_WRITEV_IOV);
+
+	if (UNEXPECTED(nbufs == 0)) {
+		if (iov_mode && free_cb != NULL) {
+			free_cb(user_data, io_base);
+		}
+		return NULL;
+	}
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)
+	    || UNEXPECTED(!ZEND_ASYNC_IO_IS_STREAM(io->base.type))) {
+		/* Caller already transferred ownership; release before bailing. */
+		if (iov_mode) {
+			if (free_cb != NULL) {
+				free_cb(user_data, io_base);
+			}
+		} else {
+			zend_string * const *zbufs = (zend_string * const *) bufs;
+			for (unsigned i = 0; i < nbufs; i++) {
+				zend_string_release(zbufs[i]);
+			}
+		}
+		async_throw_error(io->base.state & ZEND_ASYNC_IO_CLOSED
+				? "Cannot write to closed IO handle"
+				: "Vectored write only valid on stream IO");
+		return NULL;
+	}
+
+	/* ZSTR mode keeps trailing zend_string slots co-allocated with the req.
+	 * IOV mode keeps free_cb + user_data on the req base (writev_nbufs == 0). */
+	const size_t slots_bytes =
+			iov_mode ? 0 : (size_t) nbufs * sizeof(zend_string *);
+	async_io_req_t *req = pecalloc(1, sizeof(*req) + slots_bytes, 0);
+	req->base.dispose = libuv_io_req_dispose;
+	req->io = io;
+
+	zend_string **slots = NULL;
+
+	if (iov_mode) {
+		/* Store release state on base.free_cb / base.buf so dispose +
+		 * io_pipe_writev_cb fire it uniformly. */
+		req->base.free_cb = free_cb;
+		req->base.buf     = user_data;
+		req->writev_nbufs = 0;
+	} else {
+		slots = (zend_string **)((char *) req + sizeof(*req));
+		req->writev_nbufs = (uint16_t) nbufs;
+	}
+
+	/* uv_buf_t array lives only for the duration of uv_write — libuv copies
+	 * the pointers/lengths before returning. nbufs is small for HTTP. */
+	ALLOCA_FLAG(tmp_heap)
+	uv_buf_t *tmp = do_alloca((size_t) nbufs * sizeof(uv_buf_t), tmp_heap);
+	size_t total = 0;
+
+	if (iov_mode) {
+		const zend_async_buf_t *iov = (const zend_async_buf_t *) bufs;
+		for (unsigned i = 0; i < nbufs; i++) {
+			const size_t len = iov[i].len;
+			tmp[i] = uv_buf_init(iov[i].base,
+					(unsigned int)(len > UINT_MAX ? UINT_MAX : len));
+			total += len;
+		}
+	} else {
+		zend_string * const *zbufs = (zend_string * const *) bufs;
+		for (unsigned i = 0; i < nbufs; i++) {
+			slots[i] = zbufs[i];                         /* take ownership */
+			const size_t len = ZSTR_LEN(zbufs[i]);
+			tmp[i] = uv_buf_init(ZSTR_VAL(zbufs[i]),
+					(unsigned int)(len > UINT_MAX ? UINT_MAX : len));
+			total += len;
+		}
+	}
+
+	req->max_size = total;
+	req->write_req.data = req;
+
+	const int error = uv_write(&req->write_req, &io->handle.stream,
+			tmp, nbufs, io_pipe_writev_cb);
+	free_alloca(tmp, tmp_heap);
+
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to start vectored write: %s", uv_strerror(error));
+		/* dispose handles both modes uniformly (writev_nbufs branch for ZSTR,
+		 * free_cb branch for IOV). */
+		libuv_io_req_dispose(&req->base);
+		return NULL;
+	}
+
+	req->uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	return &req->base;
+}
+
+/* }}} */
+
+/* {{{ libuv_io_close */
+static bool libuv_io_close(zend_async_io_t *io_base)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (io->base.state & ZEND_ASYNC_IO_CLOSED) {
+		return true;
+	}
+
+	io->base.state |= ZEND_ASYNC_IO_CLOSED;
+
+	/* If the reactor is already shut down (e.g. bailout during memory
+	 * exhaustion followed by executor_globals_dtor), skip libuv calls. */
+	if (UNEXPECTED(!ASYNC_G(reactor_started))) {
+		goto close_orig_fd;
+	}
+
+	/* Wake parked subscribers — stream owner is about to free its abstract
+	 * state. Mark active_req io_closed so consumers skip stream-side access
+	 * after resume. See #144. */
+	if (io->base.event.callbacks.length > 0) {
+		zend_object *exc = async_new_exception(
+			async_ce_input_output_exception, "Stream was closed");
+		/* Detach + mark the in-flight req, but do NOT free it here — its
+		 * memory is owned elsewhere:
+		 *   - awaited one-shot read/recv: the parked coroutine frees it after
+		 *     the NOTIFY below wakes it (async_io_req_await contract);
+		 *   - multishot recv (persistent callback, no awaiter): the CONSUMER
+		 *     that submitted it owns disposal — e.g. http3_listener frees its
+		 *     recv_req on teardown.
+		 * Freeing here would double-free. */
+		if (io->active_req != NULL) {
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+				async_udp_req_t *ureq = (async_udp_req_t *) io->active_req;
+				ureq->base.io_closed   = true;
+				ureq->base.completed   = true;
+				ureq->base.transferred = 0;
+			} else {
+				io->active_req->base.io_closed   = true;
+				io->active_req->base.completed   = true;
+				io->active_req->base.transferred = 0;
+			}
+			io->active_req = NULL;
+		}
+		io->base.state |= ZEND_ASYNC_IO_EOF;
+		ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, NULL, exc);
+		OBJ_RELEASE(exc);
+	}
+
+	if (ZEND_ASYNC_IO_IS_STREAM(io->base.type)) {
+		uv_read_stop(&io->handle.stream);
+		io->handle.stream.data = io;
+		ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+		uv_close((uv_handle_t *) &io->handle.stream, io_close_cb);
+	} else if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+		io->handle.udp.data = io;
+		ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+		uv_close((uv_handle_t *) &io->handle.udp, io_close_cb);
+	} else if (io->base.type == ZEND_ASYNC_IO_TYPE_FILE && io->crt_fd >= 0
+			&& (io->base.state & ZEND_ASYNC_IO_OWNS_FD)) {
+		/* FILE type has no uv_handle_t to uv_close. Only close crt_fd
+		 * when the reactor owns it (set by libuv_fs_open). For io_create
+		 * the fd belongs to the caller (e.g. plain_wrapper's data->fd),
+		 * which has its own close path — closing here would yank the fd
+		 * out from under it (breaks proc_open's PHP_STREAM_CAST_RELEASE
+		 * extract-and-dup path).
+		 *
+		 * close(2) on a regular file is a no-I/O syscall. uv_fs_close
+		 * with sync mode (NULL cb) goes through the same path on POSIX
+		 * and lets libuv translate any HANDLE-vs-fd quirk on Windows. */
+		uv_fs_t close_req;
+		uv_fs_close(NULL, &close_req, io->crt_fd, NULL);
+		uv_fs_req_cleanup(&close_req);
+		io->crt_fd = -1;
+	}
+
+close_orig_fd:
+	/* Close the original stdio fd that was dup'd in libuv_io_create,
+	 * unless PRESERVE_FD is set (e.g. stdout/stderr kept open for shutdown output). */
+	if (io->orig_fd >= 0 && !(io->base.state & ZEND_ASYNC_IO_PRESERVE_FD)) {
+#ifdef PHP_WIN32
+		_close(io->orig_fd);
+#else
+		close(io->orig_fd);
+#endif
+	}
+	io->orig_fd = -1;
+
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_io_await */
+static int libuv_io_await(zend_async_io_t *io_base, const uint32_t events, struct timeval *timeout)
+{
+	const async_io_t *io = (const async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		return -1;
+	}
+
+	/* Files are always ready for I/O (actual async happens in thread pool) */
+	/* Pipes: full poll-based await to be implemented later */
+	return 0;
+}
+
+/* }}} */
+
+/* {{{ libuv_io_flush */
+static zend_async_io_req_t *libuv_io_flush(zend_async_io_t *io_base)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot flush closed IO handle");
+		return NULL;
+	}
+
+	/* Pipes and TTYs have no disk buffer to flush — return instant success */
+	if (ZEND_ASYNC_IO_IS_STREAM(io->base.type)) {
+		async_io_req_t *req = pecalloc(1, sizeof(async_io_req_t), 0);
+		req->base.dispose = libuv_io_req_dispose;
+		req->io = io;
+		req->base.result = 0;
+		req->base.completed = true;
+		return &req->base;
+	}
+
+	async_io_req_t *req = pecalloc(1, sizeof(async_io_req_t), 0);
+	req->base.dispose = libuv_io_req_dispose;
+	req->io = io;
+	req->fs_req.data = req;
+
+	const int error = uv_fs_fsync(UVLOOP, &req->fs_req, io->crt_fd, io_file_flush_cb);
+
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to start file flush: %s", uv_strerror(error));
+		libuv_io_req_dispose(&req->base);
+		return NULL;
+	}
+
+	/* Pin the io for the duration of the fs op (see libuv_io_read). */
+	req->uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&io->base.event);
+	return &req->base;
+}
+
+/* }}} */
+
+/* {{{ libuv_io_seek */
+static zend_off_t libuv_io_seek(zend_async_io_t *io_base, const zend_off_t offset, const int whence)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (io->base.type != ZEND_ASYNC_IO_TYPE_FILE) {
+		return (zend_off_t)-1;
+	}
+
+	io->base.state &= ~ZEND_ASYNC_IO_EOF;
+
+	const zend_off_t result = zend_lseek(io->crt_fd, offset, whence);
+
+	/* For append-mode files the write offset is managed exclusively
+	 * by write completions (always EOF); seeks only reposition reads.
+	 * Updating the write offset here would corrupt subsequent appends
+	 * (e.g. after fseek(0) the next write would go to position 0). */
+	if (EXPECTED(!(io->base.state & ZEND_ASYNC_IO_APPEND))) {
+		io->handle.file.offset = result;
+	}
+
+	return result;
+}
+
+/* }}} */
+
+/* {{{ uv_stat_to_zend_stat */
+static void uv_stat_to_zend_stat(const uv_stat_t *uv_statbuf, zend_stat_t *zend_statbuf)
+{
+	memset(zend_statbuf, 0, sizeof(zend_stat_t));
+	zend_statbuf->st_dev = (dev_t) uv_statbuf->st_dev;
+	zend_statbuf->st_ino = (ino_t) uv_statbuf->st_ino;
+	zend_statbuf->st_mode = (unsigned short) uv_statbuf->st_mode;
+	zend_statbuf->st_nlink = (short) uv_statbuf->st_nlink;
+	zend_statbuf->st_uid = (short) uv_statbuf->st_uid;
+	zend_statbuf->st_gid = (short) uv_statbuf->st_gid;
+	zend_statbuf->st_rdev = (dev_t) uv_statbuf->st_rdev;
+	zend_statbuf->st_size = (zend_off_t) uv_statbuf->st_size;
+#ifdef PHP_WIN32
+	zend_statbuf->st_atime = (time_t) uv_statbuf->st_atim.tv_sec;
+	zend_statbuf->st_mtime = (time_t) uv_statbuf->st_mtim.tv_sec;
+	zend_statbuf->st_ctime = (time_t) uv_statbuf->st_ctim.tv_sec;
+#else
+	zend_statbuf->st_atime = (time_t) uv_statbuf->st_atim.tv_sec;
+	zend_statbuf->st_mtime = (time_t) uv_statbuf->st_mtim.tv_sec;
+	zend_statbuf->st_ctime = (time_t) uv_statbuf->st_ctim.tv_sec;
+	zend_statbuf->st_blksize = (blksize_t) uv_statbuf->st_blksize;
+	zend_statbuf->st_blocks = (blkcnt_t) uv_statbuf->st_blocks;
+#endif
+}
+
+/* }}} */
+
+/* {{{ libuv_io_stat */
+static zend_async_io_req_t *libuv_io_stat(zend_async_io_t *io_base, zend_stat_t *stat_buffer)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot stat closed IO handle");
+		return NULL;
+	}
+
+	/* Pipes and TTYs: synchronous fstat — return instant result */
+	if (ZEND_ASYNC_IO_IS_STREAM(io->base.type)) {
+		async_io_req_t *req = pecalloc(1, sizeof(async_io_req_t), 0);
+		req->base.dispose = libuv_io_req_dispose;
+		req->io = io;
+		req->base.result = zend_fstat(io->crt_fd, stat_buffer);
+		req->base.completed = true;
+		if (UNEXPECTED(req->base.result != 0)) {
+			req->base.exception = async_new_exception(async_ce_input_output_exception, "Pipe stat error: fstat failed");
+		}
+		return &req->base;
+	}
+
+	async_io_req_t *req = pecalloc(1, sizeof(async_io_req_t), 0);
+	req->base.dispose = libuv_io_req_dispose;
+	req->io = io;
+	req->base.buf = (char *) stat_buffer;
+	req->fs_req.data = req;
+
+	const int error = uv_fs_fstat(UVLOOP, &req->fs_req, io->crt_fd, io_file_stat_cb);
+
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to start file stat: %s", uv_strerror(error));
+		req->base.buf = NULL;
+		libuv_io_req_dispose(&req->base);
+		return NULL;
+	}
+
+	/* Pin the io for the duration of the fs op (see libuv_io_read). */
+	req->uv_flags |= ASYNC_IO_REQ_F_UV_IN_FLIGHT;
+	ZEND_ASYNC_EVENT_ADD_REF(&io->base.event);
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(&io->base.event);
+	return &req->base;
+}
+
+/* }}} */
+
+/////////////////////////////////////////////////////////////////////////////////
+/// Socket Listening API
+/////////////////////////////////////////////////////////////////////////////////
+
+typedef struct
+{
+	zend_async_listen_event_t event;
+	/* AF_UNIX listeners bind a uv_pipe_t, TCP listeners a uv_tcp_t. Both are
+	 * uv_stream_t subtypes, so uv_listen / uv_accept / on_connection_event
+	 * treat them uniformly — only init, bind and getsockname differ. */
+	union {
+		uv_tcp_t  tcp;
+		uv_pipe_t pipe;
+	} uv_handle;
+	bool is_unix;
+} async_listen_event_t;
+
+/* {{{ on_connection_event */
+static void on_connection_event(uv_stream_t *server, int status)
+{
+	async_listen_event_t *listen_event = server->data;
+#ifdef PHP_WIN32
+	zend_socket_t client_socket = INVALID_SOCKET;
+#else
+	zend_socket_t client_socket = -1;
+#endif
+	zend_object *exception = NULL;
+
+	if (status < 0) {
+		exception = async_new_exception(
+				async_ce_input_output_exception, "Connection accept error: %s", uv_strerror(status));
+	} else {
+		/* The handle must outlive the uv_close callback that fires on a
+		 * later loop tick — a stack-allocated handle here dangles in libuv's
+		 * closing queue and crashes uv__finish_close at reactor shutdown.
+		 * uv_accept requires the client handle be the same stream type as
+		 * the server, so AF_UNIX listeners init a uv_pipe_t. */
+		const bool is_unix = listen_event->is_unix;
+		uv_handle_t *client = pemalloc(is_unix ? sizeof(uv_pipe_t) : sizeof(uv_tcp_t), 0);
+		int result = is_unix ? uv_pipe_init(UVLOOP, (uv_pipe_t *) client, 0)
+							  : uv_tcp_init(UVLOOP, (uv_tcp_t *) client);
+
+		if (result == 0) {
+			result = uv_accept(server, (uv_stream_t *) client);
+			if (result == 0) {
+				uv_os_fd_t fd;
+				result = uv_fileno(client, &fd);
+				if (result == 0) {
+					/* Dup the fd so the accepted socket survives uv_close
+					 * of the internal handle below. The consumer owns the
+					 * dup'd fd and closes it when done. */
+#ifdef PHP_WIN32
+					WSAPROTOCOL_INFOW info;
+					if (WSADuplicateSocketW((SOCKET) fd, GetCurrentProcessId(), &info) == 0) {
+						client_socket = WSASocketW(info.iAddressFamily, info.iSocketType,
+								info.iProtocol, &info, 0, WSA_FLAG_OVERLAPPED);
+					}
+					if (client_socket == INVALID_SOCKET) {
+						result = UV_EIO;
+					}
+#else
+					client_socket = (zend_socket_t) dup((int) fd);
+					if (client_socket < 0) {
+						result = UV_EIO;
+					}
+#endif
+				}
+			}
+		}
+
+		if (result < 0) {
+			exception = async_new_exception(
+					async_ce_input_output_exception, "Failed to accept connection: %s", uv_strerror(result));
+		}
+
+		/* Always close the uv handle; the close callback pefrees it via
+		 * handle->data. uv_close is safe on a handle that reached
+		 * uv_tcp_init / uv_pipe_init but not uv_accept. */
+		client->data = client;
+		uv_close(client, libuv_close_handle_cb);
+	}
+
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&listen_event->event.base, &client_socket, exception);
+
+	if (exception != NULL) {
+		zend_object_release(exception);
+	}
+
+	IF_EXCEPTION_STOP_REACTOR;
+}
+
+/* }}} */
+
+/* {{{ libuv_listen_start */
+static bool libuv_listen_start(zend_async_event_t *event)
+{
+	EVENT_START_PROLOGUE(event);
+
+	async_listen_event_t *listen_event = (async_listen_event_t *) (event);
+
+	const int error =
+			uv_listen((uv_stream_t *) &listen_event->uv_handle, listen_event->event.backlog, on_connection_event);
+
+	if (error < 0) {
+		async_throw_error("Failed to start listening: %s", uv_strerror(error));
+		return false;
+	}
+
+	event->loop_ref_count++;
+	ZEND_ASYNC_INCREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_listen_stop */
+static bool libuv_listen_stop(zend_async_event_t *event)
+{
+	EVENT_STOP_PROLOGUE(event);
+
+	// uv_listen doesn't have a stop function, we close the handle
+	event->loop_ref_count = 0;
+	ZEND_ASYNC_DECREASE_EVENT_COUNT(event);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_listen_dispose */
+static bool libuv_listen_dispose(zend_async_event_t *event)
+{
+	if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
+		ZEND_ASYNC_EVENT_DEL_REF(event);
+		return true;
+	}
+
+	if (event->loop_ref_count > 0) {
+		event->loop_ref_count = 1;
+		event->stop(event);
+	}
+
+	zend_async_callbacks_free(event);
+
+	async_listen_event_t *listen_event = (async_listen_event_t *) (event);
+
+	if (listen_event->event.host) {
+		efree((void *) listen_event->event.host);
+		listen_event->event.host = NULL;
+	}
+
+	uv_close((uv_handle_t *) &listen_event->uv_handle, libuv_close_handle_cb);
+	return true;
+}
+
+/* }}} */
+
+/* {{{ libuv_listen_get_local_address */
+static int
+libuv_listen_get_local_address(zend_async_listen_event_t *listen_event, char *host, size_t host_len, int *port)
+{
+	async_listen_event_t *ev = (async_listen_event_t *) listen_event;
+
+	/* AF_UNIX has no IP/port — report the bound filesystem path as host. */
+	if (ev->is_unix) {
+		if (port != NULL) {
+			*port = 0;
+		}
+		if (host != NULL && host_len > 0) {
+			/* uv_pipe_getsockname does not null-terminate; reserve one byte
+			 * and terminate at the returned length (UV_ENOBUFS if too long). */
+			size_t len = host_len - 1;
+			int rc = uv_pipe_getsockname(&ev->uv_handle.pipe, host, &len);
+			if (rc < 0) {
+				return rc;
+			}
+			host[len] = '\0';
+		}
+		return 0;
+	}
+
+	struct sockaddr_storage addr;
+	int addr_len = sizeof(addr);
+
+	int result = uv_tcp_getsockname(
+			&ev->uv_handle.tcp, (struct sockaddr *) &addr, &addr_len);
+
+	if (result < 0) {
+		return result;
+	}
+
+	if (addr.ss_family == AF_INET) {
+		struct sockaddr_in *addr_in = (struct sockaddr_in *) &addr;
+		*port = ntohs(addr_in->sin_port);
+		if (host && host_len > 0) {
+			uv_ip4_name(addr_in, host, host_len);
+		}
+	} else if (addr.ss_family == AF_INET6) {
+		struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &addr;
+		*port = ntohs(addr_in6->sin6_port);
+		if (host && host_len > 0) {
+			uv_ip6_name(addr_in6, host, host_len);
+		}
+	} else {
+		return -1;
+	}
+
+	return 0;
+}
+
+/* }}} */
+
+/* {{{ libuv_socket_listen */
+zend_async_listen_event_t *libuv_socket_listen(const char *host, int port, int backlog, uint32_t flags, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	const bool is_unix = (flags & ZEND_ASYNC_LISTEN_F_UNIX) != 0;
+
+	async_listen_event_t *listen_event =
+			pecalloc(1, extra_size != 0 ? sizeof(async_listen_event_t) + extra_size : sizeof(async_listen_event_t), 0);
+	listen_event->is_unix = is_unix;
+
+	int error;
+
+	if (is_unix) {
+		/* AF_UNIX: host is a filesystem path, port is ignored. libuv drives
+		 * unix-domain sockets through uv_pipe_t. The caller owns stale-socket
+		 * cleanup and unlinking the path on teardown — libuv does neither. */
+		error = uv_pipe_init(UVLOOP, &listen_event->uv_handle.pipe, 0);
+		if (error < 0) {
+			async_throw_error("Failed to initialize pipe handle: %s", uv_strerror(error));
+			pefree(listen_event, 0);
+			return NULL;
+		}
+
+		error = uv_pipe_bind(&listen_event->uv_handle.pipe, host);
+		if (error < 0) {
+			async_throw_error("Failed to bind AF_UNIX socket %s: %s", host, uv_strerror(error));
+			((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+			uv_close((uv_handle_t *) &listen_event->uv_handle, libuv_close_handle_cb);
+			return NULL;
+		}
+	} else {
+		error = uv_tcp_init(UVLOOP, &listen_event->uv_handle.tcp);
+		if (error < 0) {
+			async_throw_error("Failed to initialize TCP handle: %s", uv_strerror(error));
+			pefree(listen_event, 0);
+			return NULL;
+		}
+
+		// Set socket options
+		uv_tcp_nodelay(&listen_event->uv_handle.tcp, 1);
+		uv_tcp_simultaneous_accepts(&listen_event->uv_handle.tcp, 1);
+
+		// Bind to address
+		struct sockaddr_storage addr;
+		if (strchr(host, ':') != NULL) {
+			// IPv6
+			error = uv_ip6_addr(host, port, (struct sockaddr_in6 *) &addr);
+		} else {
+			// IPv4
+			error = uv_ip4_addr(host, port, (struct sockaddr_in *) &addr);
+		}
+
+		if (error < 0) {
+			async_throw_error("Failed to parse address %s:%d: %s", host, port, uv_strerror(error));
+			/* close_cb frees listen_event via handle->data; freeing here would UAF on
+			 * the next loop tick when libuv accesses the closing handle. */
+			((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+			uv_close((uv_handle_t *) &listen_event->uv_handle, libuv_close_handle_cb);
+			return NULL;
+		}
+
+		unsigned int bind_flags = 0;
+		/* UV_TCP_REUSEPORT is an enum value (not a #define), so #ifdef can't
+		 * detect it — gate on libuv version instead. Added in libuv 1.49.0. */
+#if UV_VERSION_HEX >= ((1 << 16) | (49 << 8))
+		if (flags & ZEND_ASYNC_LISTEN_F_REUSEPORT) {
+			bind_flags |= UV_TCP_REUSEPORT;
+		}
+#endif
+		if (flags & ZEND_ASYNC_LISTEN_F_IPV6ONLY) {
+			bind_flags |= UV_TCP_IPV6ONLY;
+		}
+
+		error = uv_tcp_bind(&listen_event->uv_handle.tcp, (struct sockaddr *) &addr, bind_flags);
+		if (error < 0) {
+			async_throw_error("Failed to bind to %s:%d: %s", host, port, uv_strerror(error));
+			((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+			uv_close((uv_handle_t *) &listen_event->uv_handle, libuv_close_handle_cb);
+			return NULL;
+		}
+	}
+
+	// Get actual socket fd
+	uv_os_fd_t fd;
+	error = uv_fileno((uv_handle_t *) &listen_event->uv_handle, &fd);
+	if (error < 0) {
+		async_throw_error("Failed to get socket descriptor: %s", uv_strerror(error));
+		((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+		uv_close((uv_handle_t *) &listen_event->uv_handle, libuv_close_handle_cb);
+		return NULL;
+	}
+
+	// Link the handle to the loop
+	((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+	listen_event->event.host = estrdup(host);
+	listen_event->event.port = port;
+	listen_event->event.backlog = backlog;
+	listen_event->event.socket_fd = (zend_socket_t) fd;
+	listen_event->event.base.extra_offset = sizeof(async_listen_event_t);
+	listen_event->event.base.ref_count = 1;
+
+	// Initialize the event methods
+	listen_event->event.base.add_callback = libuv_add_callback;
+	listen_event->event.base.del_callback = libuv_remove_callback;
+	listen_event->event.base.start = libuv_listen_start;
+	listen_event->event.base.stop = libuv_listen_stop;
+	listen_event->event.base.dispose = libuv_listen_dispose;
+	listen_event->event.base.info = libuv_listen_info;
+	listen_event->event.get_local_address = libuv_listen_get_local_address;
+
+	return &listen_event->event;
+}
+
+/* }}} */
+
+/* Portable close of a raw socket fd handed to libuv_socket_listen_fd. */
+static void close_listen_fd(zend_socket_t fd)
+{
+#ifdef PHP_WIN32
+	closesocket(fd);
+#else
+	close(fd);
+#endif
+}
+
+/* {{{ libuv_socket_listen_fd */
+zend_async_listen_event_t *libuv_socket_listen_fd(zend_socket_t fd, int backlog, uint32_t flags, size_t extra_size)
+{
+	/* Contract: this call takes ownership of fd. Close it on every failure
+	 * path so the caller never has to track it after handing it over. */
+	if (UNEXPECTED(ASYNC_G(reactor_started) == false)) {
+		libuv_reactor_startup();
+		if (UNEXPECTED(EG(exception) != NULL)) {
+			close_listen_fd(fd);
+			return NULL;
+		}
+	}
+
+	const bool is_unix = (flags & ZEND_ASYNC_LISTEN_F_UNIX) != 0;
+
+	async_listen_event_t *listen_event =
+			pecalloc(1, extra_size != 0 ? sizeof(async_listen_event_t) + extra_size : sizeof(async_listen_event_t), 0);
+	listen_event->is_unix = is_unix;
+
+	int error = is_unix ? uv_pipe_init(UVLOOP, &listen_event->uv_handle.pipe, 0)
+						: uv_tcp_init(UVLOOP, &listen_event->uv_handle.tcp);
+	if (error < 0) {
+		async_throw_error("Failed to initialize handle: %s", uv_strerror(error));
+		pefree(listen_event, 0);
+		close_listen_fd(fd);
+		return NULL;
+	}
+
+	/* Adopt the pre-bound, already-listening fd. On success the uv handle
+	 * owns it; on failure it does not, so we close it ourselves. */
+	error = is_unix ? uv_pipe_open(&listen_event->uv_handle.pipe, fd)
+					: uv_tcp_open(&listen_event->uv_handle.tcp, (uv_os_sock_t) fd);
+	if (error < 0) {
+		async_throw_error("Failed to adopt listening socket fd: %s", uv_strerror(error));
+		close_listen_fd(fd);
+		((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+		uv_close((uv_handle_t *) &listen_event->uv_handle, libuv_close_handle_cb);
+		return NULL;
+	}
+
+	((uv_handle_t *) &listen_event->uv_handle)->data = listen_event;
+	listen_event->event.host = NULL;  /* fd-adopt path carries no address string */
+	listen_event->event.port = 0;
+	listen_event->event.backlog = backlog;
+	listen_event->event.socket_fd = fd;
+	listen_event->event.base.extra_offset = sizeof(async_listen_event_t);
+	listen_event->event.base.ref_count = 1;
+
+	listen_event->event.base.add_callback = libuv_add_callback;
+	listen_event->event.base.del_callback = libuv_remove_callback;
+	listen_event->event.base.start = libuv_listen_start;
+	listen_event->event.base.stop = libuv_listen_stop;
+	listen_event->event.base.dispose = libuv_listen_dispose;
+	listen_event->event.base.info = libuv_listen_info;
+	listen_event->event.get_local_address = libuv_listen_get_local_address;
+
+	return &listen_event->event;
+}
+
+/* }}} */
+
+/* {{{ UDP callbacks and functions */
+
+static void udp_send_cb(uv_udp_send_t *send_req, int status)
+{
+	async_udp_req_t *req = (async_udp_req_t *) send_req->data;
+
+	req->base.flags |= ZEND_ASYNC_UDP_REQ_F_CALLBACK_DONE;
+
+	/* Caller did fire-and-forget — invoked dispose() while we were in flight.
+	 * They have already torn down their callbacks and dropped the req
+	 * pointer; finish the deferred free here. udp_req_dispose now sees
+	 * CALLBACK_DONE and takes the normal free path. */
+	if (req->base.flags & ZEND_ASYNC_UDP_REQ_F_DISPOSE_PENDING) {
+		req->base.dispose(&req->base);
+		return;
+	}
+
+	if (status < 0) {
+		req->base.exception = async_throw_input_output("UDP send failed: %s", uv_strerror(status));
+	} else {
+		req->base.transferred = (ssize_t) req->max_size;
+	}
+
+	req->base.completed = true;
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&req->io->base.event, &req->base, req->base.exception);
+}
+
+static void udp_recv_alloc_cb(uv_handle_t *udp_handle, size_t suggested_size, uv_buf_t *output)
+{
+	const async_io_t *io = (async_io_t *) udp_handle->data;
+	async_udp_req_t *req = (async_udp_req_t *) io->active_req;
+
+	if (UNEXPECTED(req == NULL || req->base.buf == NULL)) {
+		output->base = NULL;
+		output->len = 0;
+		return;
+	}
+
+	output->base = req->base.buf;
+	output->len = (unsigned int) req->max_size;
+}
+
+static void
+udp_recv_cb(uv_udp_t *udp_handle, ssize_t nread, const uv_buf_t *buf, const struct sockaddr *addr, unsigned flags)
+{
+	async_io_t *io = (async_io_t *) udp_handle->data;
+	async_udp_req_t *req = (async_udp_req_t *) io->active_req;
+
+	if (UNEXPECTED(req == NULL)) {
+		return;
+	}
+
+	const bool multishot = ZEND_ASYNC_IO_IS_MULTISHOT(&io->base);
+	const bool terminal = (nread < 0);
+
+	/* One-shot semantics: stop the UDP reader after the first completion.
+	 * Multishot: stay armed until the caller closes the IO; errors are still
+	 * terminal and tear the operation down. */
+	if (!multishot || terminal) {
+		uv_udp_recv_stop(udp_handle);
+		io->active_req = NULL;
+	}
+
+	if (nread < 0) {
+		req->base.exception = async_throw_input_output("UDP recv failed: %s", uv_strerror((int) nread));
+	} else if (nread == 0) {
+		/* Empty datagram or EAGAIN */
+		return;
+	} else {
+		req->base.transferred = nread;
+		if (addr != NULL) {
+			memcpy(&req->base.addr, addr, sizeof(struct sockaddr_storage));
+			req->base.addr_len =
+					(addr->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+		}
+	}
+
+	req->base.completed = !multishot || terminal;
+	ZEND_ASYNC_CALLBACKS_NOTIFY(&io->base.event, &req->base, req->base.exception);
+}
+
+static void udp_req_dispose(zend_async_udp_req_t *base_req)
+{
+	async_udp_req_t *req = (async_udp_req_t *) base_req;
+
+	/* Recv abandoned before any datagram arrived is still armed as
+	 * io->active_req (udp_recv_cb detaches only on delivery/terminal): stop
+	 * and detach, like the armed-read case in libuv_io_req_dispose. */
+	if (req->io != NULL && req->io->active_req == (async_io_req_t *) req) {
+		async_io_t *io = req->io;
+		if (!(io->base.state & ZEND_ASYNC_IO_CLOSED)
+				&& EXPECTED(ASYNC_G(reactor_started))) {
+			uv_udp_recv_stop(&io->handle.udp);
+		}
+		io->active_req = NULL;
+	}
+
+	/* Sendto path with the send callback still in flight: defer the free
+	 * until udp_send_cb fires. uv_udp_send is not cancelable (kernel owns
+	 * the datagram once queued), so a fire-and-forget caller must let the
+	 * in-flight callback complete before this memory is reclaimed. The
+	 * callback re-enters dispose after setting CALLBACK_DONE — at that
+	 * point we take the free path below. Mirrors the rendezvous used by
+	 * libuv_dns_nameinfo_dispose.
+	 *
+	 * Discriminator: libuv_udp_sendto sets send_req.data = req. Recv reqs
+	 * leave it NULL (pecalloc-zeroed) and rely on io->active_req detach
+	 * (handled by udp_recv_cb on terminal) for safety. */
+	if (req->send_req.data == req
+	        && !(req->base.flags & ZEND_ASYNC_UDP_REQ_F_CALLBACK_DONE)
+	        && !req->base.completed) {
+		req->base.flags |= ZEND_ASYNC_UDP_REQ_F_DISPOSE_PENDING;
+		return;
+	}
+
+	if (req->base.buf != NULL) {
+		pefree(req->base.buf, 0);
+	}
+
+	if (req->base.exception != NULL) {
+		zend_object_release(req->base.exception);
+	}
+
+	pefree(req, 0);
+}
+
+static zend_async_udp_req_t *libuv_udp_sendto(
+		zend_async_io_t *io_base, const char *buf, size_t count, const struct sockaddr *addr, socklen_t addr_len)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot send to closed UDP socket");
+		return NULL;
+	}
+
+	if (UNEXPECTED(io->base.type != ZEND_ASYNC_IO_TYPE_UDP)) {
+		async_throw_error("IO handle is not UDP type");
+		return NULL;
+	}
+
+	async_udp_req_t *req = pecalloc(1, sizeof(async_udp_req_t), 0);
+	req->base.dispose = udp_req_dispose;
+	req->io = io;
+	req->max_size = count;
+
+	/* Copy address to request */
+	memcpy(&req->base.addr, addr, addr_len);
+	req->base.addr_len = addr_len;
+
+	/* Prepare buffer */
+	uv_buf_t uv_buf = uv_buf_init((char *) buf, (unsigned int) count);
+
+	req->send_req.data = req;
+	const int error = uv_udp_send(&req->send_req, &io->handle.udp, &uv_buf, 1, addr, udp_send_cb);
+
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to start UDP send: %s", uv_strerror(error));
+		udp_req_dispose(&req->base);
+		return NULL;
+	}
+
+	return &req->base;
+}
+
+/* Synchronous best-effort UDP send. Wraps uv_udp_try_send → which
+ * itself wraps a single sendmsg() on the underlying fd. No request
+ * struct, no allocation, no callback — caller gets the result inline.
+ *
+ * Returns: bytes sent (almost always == count for UDP, since UDP is
+ * all-or-nothing per datagram), -EAGAIN when the kernel buffer is
+ * full and would block, or -errno on hard failure. */
+static ssize_t libuv_udp_try_send(
+		zend_async_io_t *io_base, const char *buf, size_t count,
+		const struct sockaddr *addr, socklen_t addr_len)
+{
+	(void) addr_len;
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		return -EBADF;
+	}
+	if (UNEXPECTED(io->base.type != ZEND_ASYNC_IO_TYPE_UDP)) {
+		return -ENOTSOCK;
+	}
+
+	uv_buf_t uv_buf = uv_buf_init((char *) buf, (unsigned int) count);
+	int rv = uv_udp_try_send(&io->handle.udp, &uv_buf, 1, addr);
+	if (rv >= 0) {
+		return (ssize_t) rv;
+	}
+	/* libuv returns its own negative-errno-like codes (UV_EAGAIN, etc.)
+	 * Most map 1:1 to POSIX errno; the caller cares about EAGAIN
+	 * specifically (back off + retry), other errors are terminal. */
+	if (rv == UV_EAGAIN) {
+		return -EAGAIN;
+	}
+	return (ssize_t) rv;
+}
+
+static zend_async_udp_req_t *libuv_udp_recvfrom(zend_async_io_t *io_base, size_t max_size)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (UNEXPECTED(io->base.state & ZEND_ASYNC_IO_CLOSED)) {
+		async_throw_error("Cannot receive from closed UDP socket");
+		return NULL;
+	}
+
+	if (UNEXPECTED(io->base.type != ZEND_ASYNC_IO_TYPE_UDP)) {
+		async_throw_error("IO handle is not UDP type");
+		return NULL;
+	}
+
+	async_udp_req_t *req = pecalloc(1, sizeof(async_udp_req_t), 0);
+	req->base.dispose = udp_req_dispose;
+	req->io = io;
+	req->max_size = max_size;
+	req->base.buf = pemalloc(max_size, 0);
+
+	io->active_req = (async_io_req_t *) req;
+
+	const int error = uv_udp_recv_start(&io->handle.udp, udp_recv_alloc_cb, udp_recv_cb);
+
+	if (UNEXPECTED(error < 0)) {
+		io->active_req = NULL;
+		async_throw_error("Failed to start UDP recv: %s", uv_strerror(error));
+		udp_req_dispose(&req->base);
+		return NULL;
+	}
+
+	return &req->base;
+}
+
+static int libuv_io_set_option(zend_async_io_t *io_base, zend_async_socket_option_t option, int value)
+{
+	async_io_t *io = (async_io_t *) io_base;
+	int result = 0;
+
+	switch (option) {
+		case ZEND_ASYNC_SOCKET_OPT_BROADCAST:
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+				result = uv_udp_set_broadcast(&io->handle.udp, value);
+			}
+			break;
+		case ZEND_ASYNC_SOCKET_OPT_MULTICAST_LOOP:
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+				result = uv_udp_set_multicast_loop(&io->handle.udp, value);
+			}
+			break;
+		case ZEND_ASYNC_SOCKET_OPT_MULTICAST_TTL:
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+				result = uv_udp_set_multicast_ttl(&io->handle.udp, value);
+			}
+			break;
+		case ZEND_ASYNC_SOCKET_OPT_TTL:
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_UDP) {
+				result = uv_udp_set_ttl(&io->handle.udp, value);
+			}
+			break;
+		case ZEND_ASYNC_SOCKET_OPT_NODELAY:
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_TCP) {
+				result = uv_tcp_nodelay(&io->handle.tcp, value);
+			}
+			break;
+		case ZEND_ASYNC_SOCKET_OPT_KEEPALIVE:
+			if (io->base.type == ZEND_ASYNC_IO_TYPE_TCP) {
+				result = uv_tcp_keepalive(&io->handle.tcp, value, 60);
+			}
+			break;
+		default:
+			return -1;
+	}
+
+	return result;
+}
+
+static int
+libuv_udp_set_membership(zend_async_io_t *io_base, const char *multicast_addr, const char *interface_addr, bool join)
+{
+	async_io_t *io = (async_io_t *) io_base;
+
+	if (io->base.type != ZEND_ASYNC_IO_TYPE_UDP) {
+		return -1;
+	}
+
+	uv_membership membership = join ? UV_JOIN_GROUP : UV_LEAVE_GROUP;
+	return uv_udp_set_membership(&io->handle.udp, multicast_addr, interface_addr, membership);
+}
+
+/* }}} */
+
+/* {{{ libuv_udp_bind — create a UDP socket and bind it to host:port.
+ *
+ * Needed by HTTP/3 listeners: one datagram socket serves N QUIC connections
+ * demultiplexed by DCID in user space. Mirrors the shape of libuv_socket_listen
+ * but for UDP — no accept(), the caller drives the reactor with recvfrom().
+ * Flags are ZEND_ASYNC_UDP_F_*; unknown bits silently ignored. */
+static zend_async_io_t *libuv_udp_bind(const char *host, int port, uint32_t flags, size_t extra_size)
+{
+	START_REACTOR_OR_RETURN_NULL;
+
+	async_io_t *io = pecalloc(1,
+			extra_size != 0 ? sizeof(async_io_t) + extra_size : sizeof(async_io_t), 0);
+
+	io->orig_fd = -1;
+	io->crt_fd = -1;
+	io->base.type = ZEND_ASYNC_IO_TYPE_UDP;
+	io->base.state = ZEND_ASYNC_IO_READABLE | ZEND_ASYNC_IO_WRITABLE;
+	io->base.event.ref_count = 1;
+	io->base.event.add_callback = libuv_add_callback;
+	io->base.event.del_callback = libuv_remove_callback;
+	io->base.event.start = libuv_io_event_start;
+	io->base.event.stop = libuv_io_event_stop;
+	io->base.event.dispose = libuv_io_event_dispose;
+	io->base.event.info = libuv_io_info;
+
+	int error = uv_udp_init(UVLOOP, &io->handle.udp);
+	if (UNEXPECTED(error < 0)) {
+		async_throw_error("Failed to initialize UDP handle: %s", uv_strerror(error));
+		pefree(io, 0);
+		return NULL;
+	}
+	io->handle.udp.data = io;
+
+	struct sockaddr_storage addr;
+	if (strchr(host, ':') != NULL) {
+		error = uv_ip6_addr(host, port, (struct sockaddr_in6 *) &addr);
+	} else {
+		error = uv_ip4_addr(host, port, (struct sockaddr_in *) &addr);
+	}
+	if (error < 0) {
+		async_throw_error("Failed to parse UDP address %s:%d: %s", host, port, uv_strerror(error));
+		uv_close((uv_handle_t *) &io->handle.udp, libuv_close_handle_cb);
+		return NULL;
+	}
+
+	unsigned int bind_flags = 0;
+	/* UV_UDP_REUSEPORT was added in libuv 1.49 as an enum value (not #define),
+	 * so gate on version rather than #ifdef. */
+#if UV_VERSION_HEX >= ((1 << 16) | (49 << 8))
+	if (flags & ZEND_ASYNC_UDP_F_REUSEPORT) {
+		bind_flags |= UV_UDP_REUSEPORT;
+	}
+#endif
+	if (flags & ZEND_ASYNC_UDP_F_IPV6ONLY) {
+		bind_flags |= UV_UDP_IPV6ONLY;
+	}
+	/* ZEND_ASYNC_UDP_F_RECV_GSO has no libuv flag; propagate via a per-recv
+	 * socket option once the handle is bound. Silently ignored on platforms
+	 * where UDP_GRO is unavailable. */
+
+	error = uv_udp_bind(&io->handle.udp, (struct sockaddr *) &addr, bind_flags);
+	if (error < 0) {
+		async_throw_error("Failed to bind UDP socket to %s:%d: %s", host, port, uv_strerror(error));
+		uv_close((uv_handle_t *) &io->handle.udp, libuv_close_handle_cb);
+		return NULL;
+	}
+
+	uv_os_fd_t fd;
+	error = uv_fileno((uv_handle_t *) &io->handle.udp, &fd);
+	if (error < 0) {
+		async_throw_error("Failed to resolve UDP socket descriptor: %s", uv_strerror(error));
+		uv_close((uv_handle_t *) &io->handle.udp, libuv_close_handle_cb);
+		return NULL;
+	}
+	io->base.descriptor.socket = (zend_socket_t) (uintptr_t) fd;
+	io->crt_fd = (int) (uintptr_t) fd;
+
+	zend_hash_index_add_new_ptr(&ASYNC_G(active_io_handles), async_ptr_to_index(io), io);
+
+	return &io->base;
+}
+
+/* }}} */
+
+/* uv_available_parallelism was added in libuv 1.44. On older libuv, fall back
+ * to uv_cpu_info()->count, which is just nproc — doesn't honour cgroup quotas
+ * but is the best we can do without the new API. Always returns >= 1. */
+static unsigned int libuv_available_parallelism(void)
+{
+#if UV_VERSION_HEX >= ((1 << 16) | (44 << 8))
+	return uv_available_parallelism();
+#else
+	uv_cpu_info_t *info = NULL;
+	int count = 0;
+	if (uv_cpu_info(&info, &count) == 0) {
+		uv_free_cpu_info(info, count);
+		if (count > 0) {
+			return (unsigned int) count;
+		}
+	}
+	return 1;
+#endif
+}
+
+void async_libuv_reactor_register(void)
+{
+#ifdef ZEND_SIGNALS
+	zend_async_sigaction_fn = libuv_zend_sigaction;
+#endif
+
+	zend_async_reactor_register(LIBUV_REACTOR_NAME,
+								false,
+								libuv_reactor_startup,
+								libuv_reactor_shutdown,
+								libuv_reactor_execute,
+								libuv_reactor_loop_alive,
+								libuv_reactor_quiesce,
+								libuv_new_socket_event,
+								libuv_new_poll_event,
+								libuv_new_poll_proxy_event,
+								libuv_new_timer_event,
+								libuv_timer_rearm,
+								libuv_new_signal_event,
+								libuv_new_process_event,
+								libuv_new_thread_event,
+								libuv_new_filesystem_event,
+								libuv_getnameinfo,
+								libuv_getaddrinfo,
+								libuv_freeaddrinfo,
+								libuv_new_exec_event,
+								libuv_exec,
+								libuv_new_trigger_event,
+								libuv_available_parallelism,
+								libuv_now);
+
+	zend_async_socket_listening_register(LIBUV_REACTOR_NAME, false, libuv_socket_listen, libuv_socket_listen_fd);
+
+	zend_async_io_register(LIBUV_REACTOR_NAME,
+						   false,
+						   libuv_io_create,
+						   libuv_io_read,
+						   libuv_io_write,
+						   libuv_io_writev,
+						   libuv_io_close,
+						   libuv_io_await,
+						   libuv_io_flush,
+						   libuv_io_stat,
+						   libuv_io_seek,
+						   libuv_io_sendfile,
+						   libuv_fs_open,
+						   libuv_udp_sendto,
+						   libuv_udp_try_send,
+						   libuv_udp_recvfrom,
+						   libuv_io_set_option,
+						   libuv_udp_set_membership,
+						   libuv_udp_bind);
+
+	zend_async_thread_pool_register(LIBUV_REACTOR_NAME, false,
+			libuv_new_task, libuv_queue_task,
+			async_thread_pool_create, libuv_start_thread,
+			async_thread_transfer_zval_ctx, async_thread_load_zval_ctx,
+			async_thread_transfer_zval, async_thread_load_zval,
+			async_thread_release_transferred_zval,
+			async_thread_xlat_put_ctx, async_thread_defer_release_ctx);
+}

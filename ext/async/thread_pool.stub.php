@@ -1,0 +1,107 @@
+<?php
+
+/** @generate-class-entries */
+
+namespace Async;
+
+/**
+ * ThreadPool manages a fixed set of reusable worker threads.
+ * Tasks are submitted and distributed to workers via an internal channel.
+ * The pool can be transferred between threads (shared persistent memory).
+ *
+ * @strict-properties
+ * @not-serializable
+ */
+final class ThreadPool
+{
+    /**
+     * @param int $workers Number of worker threads. `0` (default) = auto-detect
+     *                     from available CPU parallelism (Async\available_parallelism()).
+     * @param int $queueSize Maximum pending task queue size (default: workers * 4).
+     * @param \Closure|null $bootloader Optional closure executed once per worker
+     *                                  thread on startup, before any task runs.
+     *                                  Typical use: require an autoloader.
+     *                                  If it throws, the pool is failed: the task
+     *                                  channel is closed and all pending submissions
+     *                                  are rejected with CancellationException.
+     * @param bool $coroutine When true, each submitted task runs inside a coroutine
+     *                        in the worker's scheduler instead of being called
+     *                        synchronously. Enables `await`, channels, and IO inside
+     *                        tasks without blocking the worker thread.
+     * @param int $concurrency Max concurrent task-coroutines per worker (only
+     *                         meaningful when `coroutine: true`). `0` (default) =
+     *                         unlimited. Total pool concurrency = workers × concurrency.
+     */
+    public function __construct(int $workers = 0, int $queueSize = 0, ?\Closure $bootloader = null, bool $coroutine = false, int $concurrency = 0) {}
+
+    /**
+     * Submit a task for execution. Returns a Future that resolves
+     * with the task's return value or rejects with its exception.
+     */
+    public function submit(callable $task, mixed ...$args): Future {}
+
+    /**
+     * Apply a callable to each item in parallel across worker threads.
+     * Returns an array of results in the same order as the input.
+     */
+    public function map(array $items, callable $task): array {}
+
+    /**
+     * Close the pool — reject new submissions but let running tasks finish.
+     */
+    public function close(): void {}
+
+    /**
+     * Cancel all pending tasks and stop workers.
+     */
+    public function cancel(): void {}
+
+    /**
+     * Whether the pool is closed (no new submissions accepted).
+     */
+    public function isClosed(): bool {}
+
+    /**
+     * Number of tasks waiting in the queue.
+     */
+    public function getPendingCount(): int {}
+
+    /**
+     * Number of tasks currently being executed by workers.
+     */
+    public function getRunningCount(): int {}
+
+    /**
+     * Number of tasks that have completed (successfully or with exception)
+     * since the pool was created. Monotonically increasing.
+     */
+    public function getCompletedCount(): int {}
+
+    /**
+     * Number of worker threads.
+     */
+    public function getWorkerCount(): int {}
+
+    /**
+     * Reload the pool's workers in place (rolling blue-green): fresh worker
+     * threads start on a new task channel and re-run the bootloader — so code
+     * changes picked up by opcache take effect — while the old workers finish
+     * their in-flight tasks and exit. New submissions go to the fresh workers;
+     * the pool never stops accepting. Replacements are spawned one-for-one as
+     * old workers drain, so the worker count stays ~N (no 2N spike).
+     *
+     * Must be called from within a coroutine — it suspends until the old
+     * cohort has drained.
+     *
+     * Overlapping calls serialize and coalesce: a call made while a reload is
+     * already in progress waits it out, then a single follow-up reload rotates
+     * the whole cohort once more for every caller queued behind it. When your
+     * reload() returns, no live worker predates your call.
+     */
+    public function reload(): void {}
+}
+
+/**
+ * Exception thrown by ThreadPool operations.
+ */
+class ThreadPoolException extends \Exception {}
