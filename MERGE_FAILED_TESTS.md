@@ -57,5 +57,18 @@
 - **#3 openssl session_resumption_serialize_session** — root cause: test hard-codes `object(Openssl\Session)#9`, true-async bumps the zend-object counter by +2 at process start (scheduler context, main scope, {main} coroutine), so the unserialized Session lands at `#11`. `%a` for PEM/binary contents already matches fine. Fixed by patching the literal to `#%d` (in line with PHPT conventions for object-id matching). ✓ PASS.
 - **#1 fiber suspend-in-force-close** — still failing. Test also exists on `true-async` branch verbatim. Master's only fiber-related changes in this merge are mechanical (`XtOffsetOf` removal). High likelihood this is **pre-existing on true-async** (not introduced by the merge); needs separate investigation in async fiber-shutdown integration.
 
+## Re-validation 2026-07-24 — macOS NTS, `feat/true-async` @ merge `621245ebae` + ext/async 0.7.9 (`aba1c9b1d6`)
+
+**Build:** macOS arm64, NTS, TrueAsync ABI v0.23.0 (`--enable-async --without-iconv --with-openssl`; no pcntl/sockets/curl/ZTS).
+**Suites:** `ext/async` + `Zend/tests/fibers` — 1313 tests; 903 passed, 3 failed, 407 skipped (202 ZTS-required, rest missing-ext).
+
+- **#1 fiber `suspend-in-force-close-fiber-after-shutdown.phpt` → PASS** (siblings pass too). Does not reproduce on this build; the baseline failure was ZTS+ASAN/WSL2-specific or fixed by ext/async 0.7.9. Not a merge regression.
+- All 3 failures environmental, deterministic under serial re-run, none in baseline:
+  - `ext/async/tests/dns/010-dns_cancellation.phpt` — Herd/Valet `/etc/resolver/test` resolves `*.test` → 127.0.0.1, so the expected NXDOMAIN never happens.
+  - `ext/async/tests/signal/005…` + `007…` — tests use `SIGUSR1`/`SIGUSR2` constants (defined by pcntl, not built); SKIPIF only checks `posix_kill`. Upstreamable SKIPIF gap.
+- **Robustness observation (candidate upstream bug):** signal/007's timed-out process **survives run-tests' SIGTERM** (orphans lived 17–19 min holding the output pipe; needed SIGKILL). A fatal error while signal Futures are pending appears to leave shutdown unable to honor SIGTERM.
+
 ## Remaining work
-- Verify #1 fiber on baseline `true-async-stable` to confirm pre-existing vs regression (requires branch switch + rebuild).
+- ~~Verify #1 fiber on baseline `true-async-stable`~~ — moot: passes on the merged build (2026-07-24 re-validation above).
+- Optional: rebuild with `--enable-pcntl` (+sockets/curl) to genuinely exercise the signal tests and shrink the 407-skip pool.
+- Optional upstream reports to php-async: signal SKIPIF gap; SIGTERM-immune hang after fatal with pending signal Futures.
